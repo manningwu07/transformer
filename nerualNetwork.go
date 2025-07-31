@@ -6,7 +6,6 @@ import (
 	"image/png"
 	"math"
 	"os"
-
 	"gonum.org/v1/gonum/mat"
 	"gonum.org/v1/gonum/stat/distuv"
 )
@@ -69,6 +68,7 @@ func (net *Network) Train(inputData []float64, targetData []float64) {
 		scale(net.learningRate,
 			multiply(outputErrors, sigmoidPrime(finalOutputs)))).(*mat.Dense)
 
+			
 	net.hiddenWeights = add(net.hiddenWeights,
 		scale(net.learningRate,
 			dot(multiply(hiddenErrors, sigmoidPrime(hiddenOutputs)),
@@ -161,6 +161,7 @@ func dataFromImage(filePath string) (pixels []float64) {
 	pixels = make([]float64, len(gray.Pix))
 	// populate the pixel array subtract Pix from 255 because that's how
 	// the MNIST database was trained (in reverse)
+	// Used to feature scale the data
 	for i := 0; i < len(gray.Pix); i++ {
 		pixels[i] = (float64(255-gray.Pix[i]) / 255.0 * 0.999) + 0.001
 	}

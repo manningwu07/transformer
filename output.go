@@ -3,44 +3,33 @@ package main
 import (
 	"bufio"
 	"encoding/csv"
-	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
-	"strings"
+
+	"gonum.org/v1/gonum/mat"
 )
 
-// asciiPlot draws a crude vertical bar chart of values (0..1).
-func asciiPlot(values []float64) {
-  const height = 10               // number of text rows
-  n := len(values)
-  if n == 0 {
-    fmt.Println("no data to plot")
-    return
-  }
-  // for each “row” from top (height) down to 1
-  for row := height; row >= 1; row-- {
-    threshold := float64(row) / float64(height)
-    for _, v := range values {
-      if v >= threshold {
-        fmt.Print("█") // filled block
-      } else {
-        fmt.Print(" ")
-      }
-    }
-    fmt.Println()
-  }
-  // x-axis
-  fmt.Println(strings.Repeat("─", n))
-  // optional: print epoch indices every 5 chars
-  for i := range values {
-    if i%5 == 0 {
-      fmt.Print(strconv.Itoa(i % 10))
-    } else {
-      fmt.Print(" ")
-    }
-  }
-  fmt.Println()
+func (net Network) CalculateLoss(inputData []float64, targetData []float64) float64 {
+	// Forward propagation
+	inputs := mat.NewDense(len(inputData), 1, inputData)
+	hiddenInputs := add(dot(net.hiddenWeights, inputs), net.hiddenBias)
+	hiddenOutputs := apply(sigmoid, hiddenInputs)
+	finalInputs := add(dot(net.outputWeights, hiddenOutputs), net.outputBias)
+	finalOutputs := apply(sigmoid, finalInputs)
+
+	// Calculate loss
+	targets := mat.NewDense(len(targetData), 1, targetData)
+	outputErrors := subtract(targets, finalOutputs)
+	
+	// MSE = 1/N * sum(errors^2)
+	sumOfSquares := 0.0
+	r, _ := outputErrors.Dims()
+	for i := 0; i < r; i++ {
+		sumOfSquares += math.Pow(outputErrors.At(i, 0), 2)
+	}
+	return sumOfSquares / float64(r)
 }
 
 
