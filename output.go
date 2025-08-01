@@ -7,7 +7,6 @@ import (
 	"math"
 	"os"
 	"strconv"
-
 	"gonum.org/v1/gonum/mat"
 )
 
@@ -31,7 +30,6 @@ func (net Network) CalculateLoss(inputData []float64, targetData []float64) floa
 	}
 	return sumOfSquares / float64(r)
 }
-
 
 func evaluateAccuracy(net *Network) int {
 	checkFile, _ := os.Open("mnist_dataset/mnist_test.csv")
