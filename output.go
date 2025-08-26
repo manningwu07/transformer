@@ -1,69 +1,166 @@
 package main
 
 import (
-	"bufio"
-	"encoding/csv"
-	"io"
-	"math"
+	"bytes"
+	"encoding/gob"
+	"fmt"
 	"os"
-	"strconv"
+
 	"gonum.org/v1/gonum/mat"
 )
 
-func (net Network) CalculateLoss(inputData []float64, targetData []float64) float64 {
-	// Forward propagation
-	inputs := mat.NewDense(len(inputData), 1, inputData)
-	hiddenInputs := add(dot(net.hiddenWeights, inputs), net.hiddenBias)
-	hiddenOutputs := apply(sigmoid, hiddenInputs)
-	finalInputs := add(dot(net.outputWeights, hiddenOutputs), net.outputBias)
-	finalOutputs := apply(sigmoid, finalInputs)
-
-	// Calculate loss
-	targets := mat.NewDense(len(targetData), 1, targetData)
-	outputErrors := subtract(targets, finalOutputs)
-	
-	// MSE = 1/N * sum(errors^2)
-	sumOfSquares := 0.0
-	r, _ := outputErrors.Dims()
-	for i := 0; i < r; i++ {
-		sumOfSquares += math.Pow(outputErrors.At(i, 0), 2)
-	}
-	return sumOfSquares / float64(r)
+// PrintMatrix prints a Gonum matrix in a compact form.
+func PrintMatrix(m mat.Matrix, name string) {
+	r, c := m.Dims()
+	fmt.Printf("Matrix %s (%dx%d):\n", name, r, c)
+	fa := mat.Formatted(m, mat.Prefix("  "), mat.Squeeze())
+	fmt.Printf("%v\n", fa)
 }
 
-func evaluateAccuracy(net *Network) int {
-	checkFile, _ := os.Open("mnist_dataset/mnist_test.csv")
-	defer checkFile.Close()
+// RowSums returns per-row sums for a mat.Dense.
+func RowSums(m *mat.Dense) []float64 {
+	r, c := m.Dims()
+	out := make([]float64, r)
+	for i := 0; i < r; i++ {
+		sum := 0.0
+		for j := 0; j < c; j++ {
+			sum += m.At(i, j)
+		}
+		out[i] = sum
+	}
+	return out
+}
 
-	score := 0
-	r := csv.NewReader(bufio.NewReader(checkFile))
-	for {
-		record, err := r.Read()
-		if err == io.EOF {
-			break
+// SaveTransformer persists a Transformer to disk using gob.
+// It serializes only the numeric weight data (not function pointers).
+// filename should be a path to create/overwrite.
+func SaveTransformer(gpt *Transformer, filename string) error {
+	// Build a serializable container
+	type blockData struct {
+		WqData []float64
+		WqR, WqC int
+
+		WkData []float64
+		WkR, WkC int
+
+		WvData []float64
+		WvR, WvC int
+
+		WoData []float64
+		WoR, WoC int
+	}
+
+	data := struct {
+		Layers int
+		Blocks []blockData
+	}{}
+
+	data.Layers = len(gpt.blocks)
+	data.Blocks = make([]blockData, len(gpt.blocks))
+
+	for i, b := range gpt.blocks {
+		// Wquery
+		if b.attn.Wquery != nil {
+			r, c := b.attn.Wquery.Dims()
+			data.Blocks[i].WqR = r
+			data.Blocks[i].WqC = c
+			raw := mat.DenseCopyOf(b.attn.Wquery).RawMatrix()
+			data.Blocks[i].WqData = make([]float64, len(raw.Data))
+			copy(data.Blocks[i].WqData, raw.Data)
 		}
-		inputs := make([]float64, net.inputs)
-		for i := range inputs {
-			if i == 0 {
-				inputs[i] = 1.0
-			}
-			x, _ := strconv.ParseFloat(record[i], 64)
-			inputs[i] = (x / 255.0 * 0.999) + 0.001
+		// Wkey
+		if b.attn.Wkey != nil {
+			r, c := b.attn.Wkey.Dims()
+			data.Blocks[i].WkR = r
+			data.Blocks[i].WkC = c
+			raw := mat.DenseCopyOf(b.attn.Wkey).RawMatrix()
+			data.Blocks[i].WkData = make([]float64, len(raw.Data))
+			copy(data.Blocks[i].WkData, raw.Data)
 		}
-		outputs := net.Predict(inputs)
-		best := 0
-		highest := 0.0
-		for i := 0; i < net.outputs; i++ {
-			if outputs.At(i, 0) > highest {
-				best = i
-				highest = outputs.At(i, 0)
-			}
+		// Wvalue
+		if b.attn.Wvalue != nil {
+			r, c := b.attn.Wvalue.Dims()
+			data.Blocks[i].WvR = r
+			data.Blocks[i].WvC = c
+			raw := mat.DenseCopyOf(b.attn.Wvalue).RawMatrix()
+			data.Blocks[i].WvData = make([]float64, len(raw.Data))
+			copy(data.Blocks[i].WvData, raw.Data)
 		}
-		target, _ := strconv.Atoi(record[0])
-		if best == target {
-			score++
+		// Woutput
+		if b.attn.Woutput != nil {
+			r, c := b.attn.Woutput.Dims()
+			data.Blocks[i].WoR = r
+			data.Blocks[i].WoC = c
+			raw := mat.DenseCopyOf(b.attn.Woutput).RawMatrix()
+			data.Blocks[i].WoData = make([]float64, len(raw.Data))
+			copy(data.Blocks[i].WoData, raw.Data)
 		}
 	}
 
-	return score
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(data); err != nil {
+		return err
+	}
+
+	return os.WriteFile(filename, buf.Bytes(), 0644)
+}
+
+// LoadTransformer loads a Transformer saved by SaveTransformer into the provided gpt.
+// It will overwrite the attention weight matrices on gpt.blocks (creates matrices if nil).
+func LoadTransformer(gpt *Transformer, filename string) error {
+	rawBytes, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+	buf := bytes.NewBuffer(rawBytes)
+	dec := gob.NewDecoder(buf)
+
+	type blockData struct {
+		WqData []float64
+		WqR, WqC int
+
+		WkData []float64
+		WkR, WkC int
+
+		WvData []float64
+		WvR, WvC int
+
+		WoData []float64
+		WoR, WoC int
+	}
+
+	data := struct {
+		Layers int
+		Blocks []blockData
+	}{}
+
+	if err := dec.Decode(&data); err != nil {
+		return err
+	}
+
+	// If sizes mismatch, be conservative: only load up to min(len(gpt.blocks), data.Layers)
+	n := len(gpt.blocks)
+	if data.Layers < n {
+		n = data.Layers
+	}
+
+	for i := 0; i < n; i++ {
+		b := &gpt.blocks[i]
+
+		if len(data.Blocks[i].WqData) > 0 {
+			b.attn.Wquery = mat.NewDense(data.Blocks[i].WqR, data.Blocks[i].WqC, data.Blocks[i].WqData)
+		}
+		if len(data.Blocks[i].WkData) > 0 {
+			b.attn.Wkey = mat.NewDense(data.Blocks[i].WkR, data.Blocks[i].WkC, data.Blocks[i].WkData)
+		}
+		if len(data.Blocks[i].WvData) > 0 {
+			b.attn.Wvalue = mat.NewDense(data.Blocks[i].WvR, data.Blocks[i].WvC, data.Blocks[i].WvData)
+		}
+		if len(data.Blocks[i].WoData) > 0 {
+			b.attn.Woutput = mat.NewDense(data.Blocks[i].WoR, data.Blocks[i].WoC, data.Blocks[i].WoData)
+		}
+	}
+
+	return nil
 }
