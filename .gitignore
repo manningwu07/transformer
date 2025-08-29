@@ -4,5 +4,11 @@
 /data/processed/*.bin
 /data/tokenized/
 /models/
+
+# venv
 /.venv/
 *.tar.gz
+
+# modal
+
+/modal/
