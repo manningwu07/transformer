@@ -1,6 +1,12 @@
 package main
 
 import (
+	// "encoding/csv"
+	// "os"
+	// "strconv"
+	// "time"
+	// "gonum.org/v1/gonum/mat"
+
 	"fmt"
 	"math/rand"
 )
@@ -8,6 +14,126 @@ import (
 // Keep transformer.go unchanged. We define layers here
 // because transformer.go references it.
 var layers = 2
+
+// func main() {
+// 	rand.Seed(time.Now().UTC().UnixNano())
+// 	t1 := time.Now()
+
+// 	// --- Mini-Batch SGD and Early Stopping Variables ---
+// 	// Load all training data into memory once to avoid slow file I/O in each epoch.
+
+// 	gpt := CreateGPT(8, 8, 8, 0.10, 0.10)
+// 	trainingData, err := loadTrainingData(gpt)
+// 	if err != nil {
+// 		fmt.Println(err)
+// 		return
+// 	}
+// 	fmt.Printf("Finished loading %d training records.\n", len(trainingData))
+
+// 	// Early stopping parameters
+// 	const upperBound = 500
+// 	const patience = 20
+// 	const epsilon = 1e-6
+// 	const batchSize = 512
+
+// 	var bestAccuracy float64 = 0.0
+// 	var noImprovementCount int
+// 	var bestModel Transformer
+// 	// --- End Mini-Batch SGD and Early Stopping Variables ---
+
+// 	// Create or truncate the log file
+// 	logFile, err := os.Create("training_log.csv")
+// 	if err != nil {
+// 		fmt.Println("Error creating log file:", err)
+// 		return
+// 	}
+// 	defer logFile.Close()
+// 	logWriter := csv.NewWriter(logFile)
+// 	logWriter.Write([]string{"epoch", "accuracy", "loss"})
+// 	defer logWriter.Flush()
+
+// 	// The main training loop now uses a dynamic condition instead of a fixed epoch count.
+// 	for e := 0; e < upperBound; e++ {
+// 		var totalLoss float64
+// 		var totalRecords float64
+
+// 		// Randomly shuffle the training data at the beginning of each epoch.
+// 		// This is a key step for mini-batch SGD.
+// 		rand.Shuffle(len(trainingData), func(i, j int) {
+// 			trainingData[i], trainingData[j] = trainingData[j], trainingData[i]
+// 		})
+
+// 		// Use a mini-batch of 1024 of the shuffled data for training in this epoch.
+// 		miniBatch := trainingData[:batchSize]
+
+// 		// Iterate through the mini-batch
+// 		for _, record := range miniBatch {
+// 			// Forward pass
+// 			X := mat.NewDense(len(record.inputs), 1, record.inputs)
+// 			for i := 0; i < layers; i++ {
+// 				X = gpt.blocks[i].Forward(X)
+// 			}
+
+// 			// Loss + gradient
+// 			target := mat.NewDense(len(record.targets), 1, record.targets)
+// 			loss, grad := CrossEntropyWithGrad(X, target)
+
+// 			totalLoss += loss
+// 			totalRecords++
+
+// 			// Backward pass (reverse order)
+// 			for i := layers - 1; i >= 0; i-- {
+// 				grad = gpt.blocks[i].Backward(grad)
+// 			}
+// 		}
+
+// 		// Calculate average loss for the epoch
+// 		avgLoss := totalLoss / totalRecords
+
+// 		// Evaluate accuracy on the test set
+// 		correct := evaluateAccuracy(gpt)
+// 		accuracy := float64(correct) / 10000.0
+
+// 		// Log the epoch's metrics to the CSV file
+// 		logWriter.Write([]string{
+// 			strconv.Itoa(e + 1),
+// 			strconv.FormatFloat(accuracy, 'f', 4, 64),
+// 			strconv.FormatFloat(avgLoss, 'f', 4, 64),
+// 		})
+
+// 		fmt.Printf("Epoch %d - Accuracy: %.4f, Loss: %.4f\n", e+1, accuracy, avgLoss)
+
+// 		// --- Early stopping logic based on loss improvement and accuracy checkpointing ---
+// 		// Check if the current accuracy is the best we've seen so far.
+// 		if accuracy > bestAccuracy && e > 5 { // Second condition is to prevent the gpt from being cloned during the beginning
+// 			bestAccuracy = accuracy
+// 			bestModel = gpt
+// 			noImprovementCount = 0
+// 		} else {
+// 			noImprovementCount++
+// 		}
+
+// 		// The loop now breaks if we've seen enough epochs without a new best accuracy.
+// 		if noImprovementCount >= patience {
+// 			fmt.Println("\nStopping training early due to lack of improvement in accuracy.")
+// 			break
+// 		}
+// 		// If the loss func is too small, stop training.
+// 		if avgLoss < epsilon {
+// 			fmt.Println("\nStopping training early due to loss being too small.")
+// 			break
+// 		}
+
+// 		// --- End Early Stopping Logic ---
+// 	}
+
+// 	elapsed := time.Since(t1)
+// 	fmt.Printf("\nTime taken to train: %s\n", elapsed)
+
+// 	// After the training loop, save the best-performing model that was found.
+// 	save(bestModel)
+// 	fmt.Println("Saved the best performing model.")
+// }
 
 func main() {
 	// Deterministic
@@ -20,7 +146,7 @@ func main() {
 	gpt := CreateGPT(d, d, d, attnLR, mlpLR)
 
 	x := vector([]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8})
-	target := oneHot(d,  3)
+	target := oneHot(d, 3)
 
 	// First forward
 	logits := forwardThrough(gpt, x)
@@ -28,8 +154,10 @@ func main() {
 	fmt.Printf("Initial loss: %.6f\n", loss0)
 
 	// Inspect attention weights of block 0 (row sums should be ~1)
-	if A := gpt.blocks[0].attn.A; A != nil {
-		fmt.Printf("Block 0 attention row sums: %v\n", rowSums(A))
+	for i := 0; i < d; i++ {
+		if A := gpt.blocks[0].attn.A; A != nil {
+			fmt.Printf("Block 0 attention row sums: %v\n", rowSums(A[i]))
+		}
 	}
 
 	// One backward step through all layers
