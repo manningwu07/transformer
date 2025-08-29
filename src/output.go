@@ -9,6 +9,51 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
+// Predict takes an English input string, tokenizes it, embeds it,
+// runs it through the Transformer, and returns the top-1 predicted
+// Chinese tokens (as strings).
+func (gpt *Transformer) Predict(input string, maxLen int) []string {
+    if embEN == nil || embZH == nil {
+        panic("embeddings not initialized; call loadTrainingSet first")
+    }
+
+    // Tokenize English input
+    enTokens := tokenizeEN(input)
+    if len(enTokens) == 0 {
+        return []string{}
+    }
+
+    outputs := []string{}
+
+    // For each input token, predict one Chinese token
+    for _, tok := range enTokens {
+        enID := vocabLookup(enVocab, tok)
+        X := embed(embEN, enID)
+
+        // Forward through all layers
+        for l := 0; l < layers; l++ {
+            X = gpt.blocks[l].Forward(X)
+        }
+
+        // Unembed into ZH vocab logits
+        logits := UnembedZH(X)
+
+        // Softmax -> probabilities
+        probs := ColVectorSoftmax(logits)
+
+        // Argmax
+        predID := argmaxVec(probs)
+        predTok := zhVocab.IDToToken[predID]
+        outputs = append(outputs, predTok)
+
+        if len(outputs) >= maxLen {
+            break
+        }
+    }
+
+    return outputs
+}
+
 // PrintMatrix prints a Gonum matrix in a compact form.
 func PrintMatrix(m mat.Matrix, name string) {
 	r, c := m.Dims()
