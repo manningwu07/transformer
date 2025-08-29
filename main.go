@@ -20,7 +20,7 @@ func main() {
 	gpt := CreateGPT(d, d, d, attnLR, mlpLR)
 
 	x := vector([]float64{0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8})
-	target := oneHot(d, 3)
+	target := oneHot(d,  3)
 
 	// First forward
 	logits := forwardThrough(gpt, x)
