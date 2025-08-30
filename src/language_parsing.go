@@ -20,40 +20,6 @@ type TrainingRecord struct {
 	Targets *mat.Dense
 }
 
-// DummyDataset creates N synthetic training records for testing.
-// Each input and target are column vectors of length dim.
-// Targets are one-hot encoded for a random class. This is useful for
-// exercising forward/backward and verifying loss decreases.
-func DummyDataset(n, dim int) []TrainingRecord {
-	out := make([]TrainingRecord, n)
-	for i := 0; i < n; i++ {
-		// simple deterministic synthetic inputs (small values)
-		values := make([]float64, dim)
-		for j := 0; j < dim; j++ {
-			values[j] = float64((i+j)%7) * 0.01 // deterministic small pattern
-		}
-		inputVec := mat.NewDense(dim, 1, values)
-
-		targetIdx := (i % dim)
-		targetVec := make([]float64, dim)
-		for k := 0; k < dim; k++ {
-			if k == targetIdx {
-				targetVec[k] = 1.0
-			} else {
-				targetVec[k] = 0.0
-			}
-		}
-		targetDense := mat.NewDense(dim, 1, targetVec)
-
-		out[i] = TrainingRecord{
-			Inputs:  inputVec,
-			Targets: targetDense,
-		}
-	}
-	return out
-}
-// -------- Bilingual vocab and embeddings (EN-ZH) --------
-
 type Vocab struct {
 	TokenToID map[string]int
 	IDToToken []string
@@ -67,6 +33,110 @@ var (
 
 // Special tokens kept at the start of the vocab
 var special = []string{"<pad>", "<bos>", "<eos>", "<unk>"}
+
+// -------- Public functions required by your training loop --------
+
+// loadTrainingSet builds:
+//   - EN/ZH vocabs, each of size dModel (to match your block output size)
+//   - EN and ZH embeddings (dModel x |V|)
+//   - returns TrainingRecord slice where Inputs are embedded EN token vectors
+//     (dModel x 1) and Targets are one-hot ZH token vectors (dModel x 1)
+func loadTrainingSet(gpt Transformer) ([]TrainingRecord, error) {
+	if len(gpt.blocks) == 0 || gpt.blocks[0].attn == nil {
+		return nil, errors.New("model is not initialized")
+	}
+	dModel := gpt.blocks[0].attn.dModel
+
+	paths, err := findParallelFiles()
+	if err != nil {
+		return nil, err
+	}
+
+	var enLines, zhLines []string
+
+	enLines, err = readLines(paths.en, 0)
+	if err != nil {
+		return nil, err
+	}
+	zhLines, err = readLines(paths.zh, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	enTokSeqs := make([][]string, len(enLines))
+	zhTokSeqs := make([][]string, len(zhLines))
+	n := min(len(zhTokSeqs), len(enTokSeqs))
+
+	enTokensAll := []string{}
+	zhTokensAll := []string{}
+	for i := 0; i < n; i++ {
+		enTokSeqs[i] = tokenizeEN(enLines[i])
+		zhTokSeqs[i] = tokenizeZH(zhLines[i])
+		enTokensAll = append(enTokensAll, enTokSeqs[i]...)
+		zhTokensAll = append(zhTokensAll, zhTokSeqs[i]...)
+	}
+
+	// Build fixed-size vocabs of size dModel
+	enVocab = buildVocab(enTokensAll, dModel)
+	zhVocab = buildVocab(zhTokensAll, dModel)
+
+	// Initialize embeddings (dModel x dModel here)
+	embEN = initEmbeddings(dModel, enVocab)
+	embZH = initEmbeddings(dModel, zhVocab)
+
+	// Create position-aligned token pairs and convert to training samples
+	pairs := alignByPosition(enTokSeqs, zhTokSeqs)
+	records := make([]TrainingRecord, 0, len(pairs))
+	for _, p := range pairs {
+		enID := vocabLookup(enVocab, p[0])
+		zhID := vocabLookup(zhVocab, p[1])
+
+		// Input: embedded EN vector (d x 1)
+		X := embed(embEN, enID)
+
+		// Target: one-hot over size dModel, index = zhID
+		T := oneHot(dModel, zhID)
+
+		records = append(records, TrainingRecord{
+			Inputs:  X,
+			Targets: T,
+		})
+	}
+
+	return records, nil
+}
+
+// evaluateAccuracy computes simple top-1 accuracy using a held-out slice of
+// up to 10,000 records from the same building procedure as training.
+// It forwards through the model blocks and compares argmax(logits) vs argmax(target).
+func evaluateAccuracy(gpt Transformer) (int, int) {
+	// Rebuild a fresh dataset and use a slice for "test".
+	// In a real setup, you would separate train/test files.
+	records, err := loadTrainingSet(gpt)
+	if err != nil || len(records) == 0 {
+		return 0, 0
+	}
+
+	// Use up to 10,000 records for evaluation
+	N := min(len(records), 10000)
+
+	correct := 0
+	for i := 0; i < N; i++ {
+		X := records[i].Inputs
+		for l := 0; l < layers; l++ {
+			X = gpt.blocks[l].Forward(X)
+		}
+		logits := UnembedZH(X)
+		pred := argmaxVec(logits)
+		tgt := argmaxVec(records[i].Targets)
+		if pred == tgt {
+			correct++
+		}
+	}
+	return correct, N
+}
+
+// -------- Bilingual vocab and embeddings (EN-ZH) --------
 
 // Build a vocab of fixed size 'size'. We reserve space for specials first,
 // then fill with most frequent tokens from corpus.
@@ -224,7 +294,7 @@ func findParallelFiles() (parallelPaths, error) {
 
 		// Actual files I will pull from to train the modal
 		// {en: "../data/tokenized/train.sample.en", zh: "../data/tokenized/train.sample.zh"},
-		// Others are from 
+		// Others are from
 		// {en: "data/tokenized/train.en", zh: "data/tokenized/train.zh"},
 		// {en: "data/tokenized/en.txt", zh: "data/tokenized/zh.txt"},
 		// {en: "data/raw/wmt23-enzh/train.eng", zh: "data/raw/wmt23-enzh/train.zho"},
@@ -295,134 +365,6 @@ func alignByPosition(enTokens, zhTokens [][]string) [][2]string {
 		}
 	}
 	return pairs
-}
-
-// -------- Public functions required by your training loop --------
-
-// loadTrainingSet builds:
-// - EN/ZH vocabs, each of size dModel (to match your block output size)
-// - EN and ZH embeddings (dModel x |V|)
-// - returns TrainingRecord slice where Inputs are embedded EN token vectors
-//   (dModel x 1) and Targets are one-hot ZH token vectors (dModel x 1)
-func loadTrainingSet(gpt Transformer) ([]TrainingRecord, error) {
-	if len(gpt.blocks) == 0 || gpt.blocks[0].attn == nil {
-		return nil, errors.New("model is not initialized")
-	}
-	dModel := gpt.blocks[0].attn.dModel
-
-	paths, err := findParallelFiles()
-	useToy := false
-	if err != nil {
-		fmt.Println(err.Error())
-		useToy = true
-	}
-
-	var enLines, zhLines []string
-	if !useToy {
-		enLines, err = readLines(paths.en, 0)
-		if err != nil {
-			return nil, err
-		}
-		zhLines, err = readLines(paths.zh, 0)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		enLines = []string{
-			"hello world",
-			"how are you",
-			"this is a test",
-			"good morning",
-			"thank you",
-		}
-		zhLines = []string{
-			"你好 世界",
-			"你 好吗",
-			"这是 一个 测试",
-			"早上 好",
-			"谢谢 你",
-		}
-	}
-
-	enTokSeqs := make([][]string, len(enLines))
-	zhTokSeqs := make([][]string, len(zhLines))
-	n := len(enTokSeqs)
-	if len(zhTokSeqs) < n {
-		n = len(zhTokSeqs)
-	}
-	enTokensAll := []string{}
-	zhTokensAll := []string{}
-	for i := 0; i < n; i++ {
-		enTokSeqs[i] = tokenizeEN(enLines[i])
-		zhTokSeqs[i] = tokenizeZH(zhLines[i])
-		enTokensAll = append(enTokensAll, enTokSeqs[i]...)
-		zhTokensAll = append(zhTokensAll, zhTokSeqs[i]...)
-	}
-
-	// Build fixed-size vocabs of size dModel
-	enVocab = buildVocab(enTokensAll, dModel)
-	zhVocab = buildVocab(zhTokensAll, dModel)
-
-	// Initialize embeddings (dModel x dModel here)
-	embEN = initEmbeddings(dModel, enVocab)
-	embZH = initEmbeddings(dModel, zhVocab)
-
-	// Create position-aligned token pairs and convert to training samples
-	pairs := alignByPosition(enTokSeqs, zhTokSeqs)
-	records := make([]TrainingRecord, 0, len(pairs))
-	for _, p := range pairs {
-		enID := vocabLookup(enVocab, p[0])
-		zhID := vocabLookup(zhVocab, p[1])
-
-		// Input: embedded EN vector (d x 1)
-		X := embed(embEN, enID)
-
-		// Target: one-hot over size dModel, index = zhID
-		T := oneHot(dModel, zhID)
-
-		records = append(records, TrainingRecord{
-			Inputs:  X,
-			Targets: T,
-		})
-	}
-	// If nothing found (empty files), safety fallback
-	if len(records) == 0 {
-		records = DummyDataset(2048, dModel)
-	}
-	return records, nil
-}
-
-// evaluateAccuracy computes simple top-1 accuracy using a held-out slice of
-// up to 10,000 records from the same building procedure as training.
-// It forwards through the model blocks and compares argmax(logits) vs argmax(target).
-func evaluateAccuracy(gpt Transformer) int {
-	// Rebuild a fresh dataset and use a slice for "test".
-	// In a real setup, you would separate train/test files.
-	records, err := loadTrainingSet(gpt)
-	if err != nil || len(records) == 0 {
-		return 0
-	}
-
-	// Use up to 10,000 records for evaluation
-	N := 10000
-	if len(records) < N {
-		N = len(records)
-	}
-	correct := 0
-	for i := 0; i < N; i++ {
-		X := records[i].Inputs
-		for l := 0; l < layers; l++ {
-			X = gpt.blocks[l].Forward(X)
-		}
-		// Predicted class
-		pred := argmaxVec(X)
-		// Ground-truth class
-		tgt := argmaxVec(records[i].Targets)
-		if pred == tgt {
-			correct++
-		}
-	}
-	return correct
 }
 
 // save persists the whole Transformer using the gob-based SaveTransformer.

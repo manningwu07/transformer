@@ -1,257 +1,224 @@
 package main
 
 import (
-	// "encoding/csv"
-	// "fmt"
+	"bytes"
+	"encoding/gob"
+	"fmt"
+	"os"
+
 	"gonum.org/v1/gonum/mat"
-	"math"
-	// "math/rand"
-	// "os"
-	// "strconv"
-	// "time"
 )
 
-type Transformer struct {
-	blocks []TransformerBlock
-}
-
-type TransformerBlock struct {
-	attn *Attention
-	mlp  *MLP
-}
-
-type Attention struct {
-    H            int          
-    dModel       int          
-    dHead        int          
-    Wquery       []*mat.Dense 
-    Wkey         []*mat.Dense 
-    Wvalue       []*mat.Dense 
-    Woutput      *mat.Dense   
-    learningRate float64
-
-	// cache for backprop
-    X      *mat.Dense    
-    Q, K, V []*mat.Dense 
-    Scores  []*mat.Dense
-    A       []*mat.Dense
-    O       []*mat.Dense
-    O_cat    *mat.Dense   
-}
-
-type MLP struct {
-	inputs, hiddens, outputs  int
-	hiddenWeights, hiddenBias *mat.Dense
-	outputWeights, outputBias *mat.Dense
-	learningRate              float64
-
-	// cache for backprop
-	lastInput, hiddenOutputs, finalOutputs *mat.Dense
-}
-
-// Initalization
-
-func CreateGPT(input, hidden, output int, AttnRate float64, MLPRate float64) Transformer {
-	gpt := Transformer{
-		blocks: make([]TransformerBlock, layers),
+// Predict takes an English input string, tokenizes it, embeds it,
+// runs it through the Transformer, and returns the top-1 predicted
+// Chinese tokens (as strings).
+func (gpt *Transformer) Predict(input string, maxLen int) []string {
+	if embEN == nil || embZH == nil {
+		panic("embeddings not initialized; call loadTrainingSet first")
 	}
 
-	for i := range layers {
-		attn := NewAttention(input, 8, AttnRate)
+	// Tokenize English input
+	enTokens := tokenizeEN(input)
+	if len(enTokens) == 0 {
+		return []string{}
+	}
 
-		mlp := &MLP{
-			inputs:        input,
-			hiddens:       hidden,
-			outputs:       output,
-			learningRate:  MLPRate,
-			hiddenWeights: mat.NewDense(hidden, input, randomArray(input*hidden, float64(input))),
-			hiddenBias:    mat.NewDense(hidden, 1, nil),
-			outputWeights: mat.NewDense(output, hidden, randomArray(hidden*output, float64(hidden))),
-			outputBias:    mat.NewDense(output, 1, nil),
+	outputs := []string{}
+
+	// For each input token, predict one Chinese token
+	for _, tok := range enTokens {
+		enID := vocabLookup(enVocab, tok)
+		X := embed(embEN, enID)
+
+		// Forward through all layers
+		for l := 0; l < layers; l++ {
+			X = gpt.blocks[l].Forward(X)
 		}
 
-		gpt.blocks[i] = TransformerBlock{
-			attn: attn,
-			mlp:  mlp,
+		// Unembed into ZH vocab logits
+		logits := UnembedZH(X)
+
+		// Softmax -> probabilities
+		probs := ColVectorSoftmax(logits)
+
+		// Argmax
+		predID := argmaxVec(probs)
+		predTok := zhVocab.IDToToken[predID]
+		outputs = append(outputs, predTok)
+
+		if len(outputs) >= maxLen {
+			break
 		}
 	}
-	return gpt
+
+	return outputs
 }
 
-func NewAttention(dModel, nHeads int, lr float64) *Attention {
-    if dModel % nHeads != 0 {
-        panic("dModel must be divisible by nHeads")
-    }
-    dHead := dModel / nHeads
-    attn := &Attention{
-        H:            nHeads,
-        dModel:       dModel,
-        dHead:        dHead,
-        learningRate: lr,
-        Wquery:       make([]*mat.Dense, nHeads),
-        Wkey:         make([]*mat.Dense, nHeads),
-        Wvalue:       make([]*mat.Dense, nHeads),
-        Q:            make([]*mat.Dense, nHeads),
-        K:            make([]*mat.Dense, nHeads),
-        V:            make([]*mat.Dense, nHeads),
-        Scores:       make([]*mat.Dense, nHeads),
-        A:            make([]*mat.Dense, nHeads),
-        O:            make([]*mat.Dense, nHeads),
-    }
-    for h := 0; h < nHeads; h++ {
-        attn.Wquery[h] = mat.NewDense(dHead, dModel, randomArray(dHead*dModel, float64(dModel)))
-        attn.Wkey[h]   = mat.NewDense(dHead, dModel, randomArray(dHead*dModel, float64(dModel)))
-        attn.Wvalue[h] = mat.NewDense(dHead, dModel, randomArray(dHead*dModel, float64(dModel)))
-    }
-    attn.Woutput = mat.NewDense(dModel, dModel, randomArray(dModel*dModel, float64(dModel)))
-    return attn
+// PrintMatrix prints a Gonum matrix in a compact form.
+func PrintMatrix(m mat.Matrix, name string) {
+	r, c := m.Dims()
+	fmt.Printf("Matrix %s (%dx%d):\n", name, r, c)
+	fa := mat.Formatted(m, mat.Prefix("  "), mat.Squeeze())
+	fmt.Printf("%v\n", fa)
 }
 
-
-
-// Block forward/backward with residuals.
-func (b *TransformerBlock) Forward(X *mat.Dense) *mat.Dense {
-	attnOut := b.attn.Forward(X)
-	X = add(X, attnOut).(*mat.Dense)
-	mlpOut := b.mlp.Forward(X)
-	X = add(X, mlpOut).(*mat.Dense)
-	return X
+// RowSums returns per-row sums for a mat.Dense.
+func RowSums(m *mat.Dense) []float64 {
+	r, c := m.Dims()
+	out := make([]float64, r)
+	for i := 0; i < r; i++ {
+		sum := 0.0
+		for j := 0; j < c; j++ {
+			sum += m.At(i, j)
+		}
+		out[i] = sum
+	}
+	return out
 }
 
-func (b *TransformerBlock) Backward(grad *mat.Dense) *mat.Dense {
-    // Set this up concurrently
-	grad = b.mlp.Backward(grad)
-	grad = b.attn.Backward(grad)
-	return grad
-}
-// Attention forward/backward.
-func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
-    attn.X = X
-    headsCat := mat.NewDense(attn.dModel, 1, nil)
+// SaveTransformer persists a Transformer to disk using gob.
+// It serializes only the numeric weight data (not function pointers).
+// filename should be a path to create/overwrite.
+func SaveTransformer(gpt *Transformer, filename string) error {
+	// Build a serializable container
+	type blockData struct {
+		WqData   []float64
+		WqR, WqC int
 
-    row := 0
-    rescale := 1.0 / math.Sqrt(float64(attn.dHead))
+		WkData   []float64
+		WkR, WkC int
 
-    for h := 0; h < attn.H; h++ {
-        Q := dot(attn.Wquery[h], X).(*mat.Dense) // (dHead x 1)
-        K := dot(attn.Wkey[h], X).(*mat.Dense)
-        V := dot(attn.Wvalue[h], X).(*mat.Dense)
+		WvData   []float64
+		WvR, WvC int
 
-        S := scale(rescale, dot(Q, K.T())).(*mat.Dense) // (dHead x dHead)
-        A := RowSoftmax(S)
-        O := dot(A, V).(*mat.Dense) // (dHead x 1)
+		WoData   []float64
+		WoR, WoC int
+	}
 
-        attn.Q[h], attn.K[h], attn.V[h] = Q, K, V
-        attn.Scores[h], attn.A[h], attn.O[h] = S, A, O
+	data := struct {
+		Layers int
+		Blocks []blockData
+	}{}
 
-        // concat into headsCat
-        for i := 0; i < attn.dHead; i++ {
-            headsCat.Set(row+i, 0, O.At(i, 0))
-        }
-        row += attn.dHead
-    }
-    attn.O_cat = headsCat
-    Y := dot(attn.Woutput, headsCat).(*mat.Dense) // (dModel x 1)
-    return Y
-}
+	data.Layers = len(gpt.blocks)
+	data.Blocks = make([]blockData, len(gpt.blocks))
 
-// Backward: computes grads and updates weights (SGD)
-func (attn *Attention) Backward(dY *mat.Dense) *mat.Dense {
-    dX, dWq, dWk, dWv, dWout := attn.BackwardGradsOnly(dY)
+	for i, b := range gpt.blocks {
+		attn := b.attn
+		for h := 0; h < attn.H; h++ {
+			// Wquery
+			if attn.Wquery != nil {
+				r, c := attn.Wquery[h].Dims()
+				data.Blocks[i].WqR = r
+				data.Blocks[i].WqC = c
+				raw := mat.DenseCopyOf(attn.Wquery[h]).RawMatrix()
+				data.Blocks[i].WqData = make([]float64, len(raw.Data))
+				copy(data.Blocks[i].WqData, raw.Data)
+			}
+			// Wkey
+			if attn.Wkey != nil {
+				r, c := attn.Wkey[h].Dims()
+				data.Blocks[i].WkR = r
+				data.Blocks[i].WkC = c
+				raw := mat.DenseCopyOf(attn.Wkey[h]).RawMatrix()
+				data.Blocks[i].WkData = make([]float64, len(raw.Data))
+				copy(data.Blocks[i].WkData, raw.Data)
+			}
+			// Wvalue
+			if attn.Wvalue != nil {
+				r, c := attn.Wvalue[h].Dims()
+				data.Blocks[i].WvR = r
+				data.Blocks[i].WvC = c
+				raw := mat.DenseCopyOf(attn.Wvalue[h]).RawMatrix()
+				data.Blocks[i].WvData = make([]float64, len(raw.Data))
+				copy(data.Blocks[i].WvData, raw.Data)
+			}
+			// Woutput
+			if attn.Woutput != nil {
+				r, c := attn.Woutput.Dims()
+				data.Blocks[i].WoR = r
+				data.Blocks[i].WoC = c
+				raw := mat.DenseCopyOf(attn.Woutput).RawMatrix()
+				data.Blocks[i].WoData = make([]float64, len(raw.Data))
+				copy(data.Blocks[i].WoData, raw.Data)
+			}
+		}
 
-    // === Apply updates ===
-    lr := attn.learningRate
-    for h := 0; h < attn.H; h++ {
-        attn.Wquery[h] = add(attn.Wquery[h], scale(-lr, dWq[h])).(*mat.Dense)
-        attn.Wkey[h]   = add(attn.Wkey[h],   scale(-lr, dWk[h])).(*mat.Dense)
-        attn.Wvalue[h] = add(attn.Wvalue[h], scale(-lr, dWv[h])).(*mat.Dense)
-    }
-    attn.Woutput = add(attn.Woutput, scale(-lr, dWout)).(*mat.Dense)
+	}
 
-    return dX
-}
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(data); err != nil {
+		return err
+	}
 
-// BackwardGradsOnly: computes grads but does NOT update weights
-func (attn *Attention) BackwardGradsOnly(dY *mat.Dense) (
-    dX *mat.Dense,
-    dWq, dWk, dWv []*mat.Dense,
-    dWout *mat.Dense,
-) {
-    dWq = make([]*mat.Dense, attn.H)
-    dWk = make([]*mat.Dense, attn.H)
-    dWv = make([]*mat.Dense, attn.H)
-
-    // dY wrt Y = Wout * Ocat
-    dWout = dot(dY, attn.O_cat.T()).(*mat.Dense)
-    dOcat := dot(attn.Woutput.T(), dY).(*mat.Dense)
-
-    dXtotal := mat.NewDense(attn.dModel, 1, nil)
-
-    row := 0
-    rescale := 1.0 / math.Sqrt(float64(attn.dHead))
-
-    for h := 0; h < attn.H; h++ {
-        // slice out this head’s portion of dOcat
-        dO := mat.NewDense(attn.dHead, 1, nil)
-        for i := 0; i < attn.dHead; i++ {
-            dO.Set(i, 0, dOcat.At(row+i, 0))
-        }
-        row += attn.dHead
-
-        // O = A V
-        dA := dot(dO, attn.V[h].T()).(*mat.Dense)
-        dV := dot(attn.A[h].T(), dO).(*mat.Dense)
-
-        // softmax backward
-        dS := softmaxBackward(dA, attn.A[h])
-
-        // scores = Q K^T / sqrt(dHead)
-        dQ := scale(rescale, dot(dS, attn.K[h])).(*mat.Dense)
-        dK := scale(rescale, dot(dS.T(), attn.Q[h])).(*mat.Dense)
-
-        // param grads
-        dWq[h] = dot(dQ, attn.X.T()).(*mat.Dense)
-        dWk[h] = dot(dK, attn.X.T()).(*mat.Dense)
-        dWv[h] = dot(dV, attn.X.T()).(*mat.Dense)
-
-        // input grads
-        dXq := dot(attn.Wquery[h].T(), dQ).(*mat.Dense)
-        dXk := dot(attn.Wkey[h].T(), dK).(*mat.Dense)
-        dXv := dot(attn.Wvalue[h].T(), dV).(*mat.Dense)
-        dXh := add(add(dXq, dXk), dXv).(*mat.Dense)
-        dXtotal = add(dXtotal, dXh).(*mat.Dense)
-    }
-
-    return dXtotal, dWq, dWk, dWv, dWout
+	return os.WriteFile(filename, buf.Bytes(), 0644)
 }
 
-// MLP functions
+// LoadTransformer loads a Transformer saved by SaveTransformer into the provided gpt.
+// It will overwrite the attention weight matrices on gpt.blocks (creates matrices if nil).
+func LoadTransformer(gpt *Transformer, filename string) error {
+	type headData struct {
+		WqData   []float64
+		WqR, WqC int
+		WkData   []float64
+		WkR, WkC int
+		WvData   []float64
+		WvR, WvC int
+	}
+	type blockData struct {
+		Heads    []headData
+		WoData   []float64
+		WoR, WoC int
+	}
+	data := struct {
+		Layers int
+		Blocks []blockData
+	}{}
 
-func (mlp *MLP) Forward(X *mat.Dense) *mat.Dense {
-	mlp.lastInput = X
-	hiddenInputs := add(dot(mlp.hiddenWeights, X), mlp.hiddenBias)
-	mlp.hiddenOutputs = apply(sigmoid, hiddenInputs).(*mat.Dense)
-	finalInputs := add(dot(mlp.outputWeights, mlp.hiddenOutputs), mlp.outputBias)
-	mlp.finalOutputs = finalInputs.(*mat.Dense) // logits
-	return mlp.finalOutputs
-}
+	data.Layers = len(gpt.blocks)
+	data.Blocks = make([]blockData, len(gpt.blocks))
 
-func (mlp *MLP) Backward(grad *mat.Dense) *mat.Dense {
-	dWout := dot(grad, mlp.hiddenOutputs.T()).(*mat.Dense)
-	dbOut := grad
+	for i, b := range gpt.blocks {
+		attn := b.attn
+		hArr := make([]headData, attn.H)
+		for h := 0; h < attn.H; h++ {
+			// Q
+			if attn.Wquery != nil && attn.Wquery[h] != nil {
+				r, c := attn.Wquery[h].Dims()
+				raw := mat.DenseCopyOf(attn.Wquery[h]).RawMatrix()
+				hArr[h].WqR, hArr[h].WqC = r, c
+				hArr[h].WqData = append([]float64(nil), raw.Data...)
+			}
+			// K
+			if attn.Wkey != nil && attn.Wkey[h] != nil {
+				r, c := attn.Wkey[h].Dims()
+				raw := mat.DenseCopyOf(attn.Wkey[h]).RawMatrix()
+				hArr[h].WkR, hArr[h].WkC = r, c
+				hArr[h].WkData = append([]float64(nil), raw.Data...)
+			}
+			// V
+			if attn.Wvalue != nil && attn.Wvalue[h] != nil {
+				r, c := attn.Wvalue[h].Dims()
+				raw := mat.DenseCopyOf(attn.Wvalue[h]).RawMatrix()
+				hArr[h].WvR, hArr[h].WvC = r, c
+				hArr[h].WvData = append([]float64(nil), raw.Data...)
+			}
+		}
+		data.Blocks[i].Heads = hArr
+		if attn.Woutput != nil {
+			r, c := attn.Woutput.Dims()
+			raw := mat.DenseCopyOf(attn.Woutput).RawMatrix()
+			data.Blocks[i].WoR, data.Blocks[i].WoC = r, c
+			data.Blocks[i].WoData = append([]float64(nil), raw.Data...)
+		}
+	}
 
-	hiddenPre := dot(mlp.outputWeights.T(), grad).(*mat.Dense)
-	hiddenErrors := multiply(hiddenPre, sigmoidPrime(mlp.hiddenOutputs)).(*mat.Dense)
-
-	dWhid := dot(hiddenErrors, mlp.lastInput.T()).(*mat.Dense)
-	dbHidden := hiddenErrors
-
-	lr := mlp.learningRate
-	mlp.outputWeights = add(mlp.outputWeights, scale(-lr, dWout)).(*mat.Dense)
-	mlp.outputBias = add(mlp.outputBias, scale(-lr, dbOut)).(*mat.Dense)
-	mlp.hiddenWeights = add(mlp.hiddenWeights, scale(-lr, dWhid)).(*mat.Dense)
-	mlp.hiddenBias = add(mlp.hiddenBias, scale(-lr, dbHidden)).(*mat.Dense)
-
-	dX := dot(mlp.hiddenWeights.T(), hiddenErrors).(*mat.Dense)
-	return dX
+	var buf bytes.Buffer
+ 	enc := gob.NewEncoder(&buf)
+ 	if err := enc.Encode(data); err != nil {
+ 		return err
+ 	}
+ 
+ 	return os.WriteFile(filename, buf.Bytes(), 0644)
 }
