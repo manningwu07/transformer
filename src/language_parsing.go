@@ -347,7 +347,7 @@ func readLines(p string, limit int) ([]string, error) {
 	return out, sc.Err()
 }
 
-// alignByPosition pairs tokens by index in each sentence. Shorter side is truncated.
+// Until this gets fixed, accuracy will be shit
 func alignByPosition(enTokens, zhTokens [][]string) [][2]string {
 	pairs := make([][2]string, 0, 1024)
 	for i := 0; i < len(enTokens) && i < len(zhTokens); i++ {
@@ -370,7 +370,7 @@ func alignByPosition(enTokens, zhTokens [][]string) [][2]string {
 // save persists the whole Transformer using the gob-based SaveTransformer.
 func save(gpt Transformer) error {
 	_ = os.MkdirAll("models", 0o755)
-	path := "..models/transformer.gob"
+	path := "models/transformer.gob"
 	return SaveTransformer(&gpt, path)
 }
 

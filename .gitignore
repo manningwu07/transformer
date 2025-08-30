@@ -10,4 +10,4 @@
 *.tar.gz
 
 # modal
-/src/model/
+/src/models/
