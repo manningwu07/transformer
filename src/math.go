@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math"
 
 	"gonum.org/v1/gonum/mat"
@@ -75,7 +76,7 @@ func sigmoidPrime(m mat.Matrix) mat.Matrix {
 	r, c := m.Dims()
 	out := mat.NewDense(r, c, nil)
 	for i := 0; i < r; i++ {
-	for j := 0; j < c; j++ {
+		for j := 0; j < c; j++ {
 			v := m.At(i, j)
 			out.Set(i, j, v*(1.0-v))
 		}
@@ -83,7 +84,60 @@ func sigmoidPrime(m mat.Matrix) mat.Matrix {
 	return out
 }
 
+// Masking stuff
+
+func addBias(m, bias *mat.Dense) *mat.Dense {
+	r, c := m.Dims()
+	rb, cb := bias.Dims()
+	if rb != r || cb != 1 {
+		panic("addBias: bias must be (r x 1)")
+	}
+	out := mat.NewDense(r, c, nil)
+	for j := 0; j < c; j++ {
+		for i := 0; i < r; i++ {
+			out.Set(i, j, m.At(i, j)+bias.At(i, 0))
+		}
+	}
+	return out
+}
+
+func lastCol(m *mat.Dense) *mat.Dense {
+	r, c := m.Dims()
+	out := mat.NewDense(r, 1, nil)
+	for i := 0; i < r; i++ {
+		out.Set(i, 0, m.At(i, c-1))
+	}
+	return out
+}
+
+// causalMask returns (T x T) with 0 on and below diagonal, -Inf above.
+func causalMask(T int) *mat.Dense {
+	out := mat.NewDense(T, T, nil)
+	negInf := -1e30
+	for i := 0; i < T; i++ {
+		for j := 0; j < T; j++ {
+			if j > i {
+				out.Set(i, j, negInf)
+			} else {
+				out.Set(i, j, 0.0)
+			}
+		}
+	}
+	return out
+}
+
 // ---------- Softmax variants ----------
+
+func RowSoftmaxMasked(m, mask *mat.Dense) *mat.Dense {
+	r, c := m.Dims()
+	if mr, mc := mask.Dims(); mr != r || mc != c {
+		fmt.Println("m:", mr, mc, "mask:", r, c)
+		panic("mask shape mismatch")
+	}
+	tmp := mat.NewDense(r, c, nil)
+	tmp.Add(m, mask)
+	return RowSoftmax(tmp)
+}
 
 // RowSoftmax applies softmax independently to each row across columns.
 // Used by attention (scores have shape [d x d]; row sums should be 1).

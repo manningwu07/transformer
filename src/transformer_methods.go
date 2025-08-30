@@ -3,12 +3,13 @@ package main
 import (
 	// "encoding/csv"
 	// "fmt"
-	"gonum.org/v1/gonum/mat"
-	"math"
 	// "math/rand"
 	// "os"
 	// "strconv"
 	// "time"
+
+    "gonum.org/v1/gonum/mat"
+	"math"
 )
 
 type Transformer struct {
@@ -51,23 +52,23 @@ type MLP struct {
 
 // Initalization
 
-func CreateGPT(input, hidden, output int, AttnRate float64, MLPRate float64) Transformer {
+func CreateGPT(dModel, hidden, vocabSize int, AttnRate float64, MLPRate float64) Transformer {
 	gpt := Transformer{
 		blocks: make([]TransformerBlock, layers),
 	}
 
 	for i := range layers {
-		attn := NewAttention(input, 8, AttnRate)
+		attn := NewAttention(dModel, config.NumHeads, AttnRate)
 
 		mlp := &MLP{
-			inputs:        input,
+			inputs:        dModel,
 			hiddens:       hidden,
-			outputs:       output,
+			outputs:       dModel,
 			learningRate:  MLPRate,
-			hiddenWeights: mat.NewDense(hidden, input, randomArray(input*hidden, float64(input))),
+			hiddenWeights: mat.NewDense(hidden, dModel, randomArray(dModel*hidden, float64(dModel))),
 			hiddenBias:    mat.NewDense(hidden, 1, nil),
-			outputWeights: mat.NewDense(output, hidden, randomArray(hidden*output, float64(hidden))),
-			outputBias:    mat.NewDense(output, 1, nil),
+			outputWeights: mat.NewDense(dModel, hidden, randomArray(hidden*dModel, float64(hidden))),
+            outputBias:    mat.NewDense(dModel, 1, nil),
 		}
 
 		gpt.blocks[i] = TransformerBlock{
@@ -127,10 +128,12 @@ func (b *TransformerBlock) Backward(grad *mat.Dense) *mat.Dense {
 // Attention forward/backward.
 func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
     attn.X = X
+    _, T := X.Dims()
     headsCat := mat.NewDense(attn.dModel, 1, nil)
 
     row := 0
     rescale := 1.0 / math.Sqrt(float64(attn.dHead))
+    mask := causalMask(T)
 
     for h := 0; h < attn.H; h++ {
         Q := dot(attn.Wquery[h], X).(*mat.Dense) // (dHead x 1)
@@ -138,7 +141,7 @@ func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
         V := dot(attn.Wvalue[h], X).(*mat.Dense)
 
         S := scale(rescale, dot(Q, K.T())).(*mat.Dense) // (dHead x dHead)
-        A := RowSoftmax(S)
+        A := RowSoftmaxMasked(S, mask)
         O := dot(A, V).(*mat.Dense) // (dHead x 1)
 
         attn.Q[h], attn.K[h], attn.V[h] = Q, K, V
@@ -146,7 +149,9 @@ func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 
         // concat into headsCat
         for i := 0; i < attn.dHead; i++ {
-            headsCat.Set(row+i, 0, O.At(i, 0))
+            for t := 0; t < T; t++ {
+                headsCat.Set(row+i, t, O.At(i, t))
+            }
         }
         row += attn.dHead
     }
@@ -187,6 +192,7 @@ func (attn *Attention) BackwardGradsOnly(dY *mat.Dense) (
 
     dXtotal := mat.NewDense(attn.dModel, 1, nil)
 
+    _, T := attn.X.Dims()
     row := 0
     rescale := 1.0 / math.Sqrt(float64(attn.dHead))
 
@@ -194,34 +200,37 @@ func (attn *Attention) BackwardGradsOnly(dY *mat.Dense) (
         // slice out this head’s portion of dOcat
         dO := mat.NewDense(attn.dHead, 1, nil)
         for i := 0; i < attn.dHead; i++ {
-            dO.Set(i, 0, dOcat.At(row+i, 0))
+            for t := 0; t < T; t++ {
+                dO.Set(i, t, dOcat.At(row+i, t))
+            }
         }
+        
         row += attn.dHead
 
-        // O = A V
-        dA := dot(dO, attn.V[h].T()).(*mat.Dense)
-        dV := dot(attn.A[h].T(), dO).(*mat.Dense)
+        // O = V * A^T
+        dV := dot(dO, attn.A[h]).(*mat.Dense)           // (dHead x T)
+        dA_T := dot(attn.V[h].T(), dO).(*mat.Dense)     // (T x T)
+        dA := dA_T.T().(*mat.Dense)                                   // (T x T)
 
-        // softmax backward
-        dS := softmaxBackward(dA, attn.A[h])
+        // A = softmax_row(S)
+        dS := softmaxBackward(dA, attn.A[h])            // (T x T)
 
-        // scores = Q K^T / sqrt(dHead)
-        dQ := scale(rescale, dot(dS, attn.K[h])).(*mat.Dense)
-        dK := scale(rescale, dot(dS.T(), attn.Q[h])).(*mat.Dense)
+        // S = Q^T K / sqrt(dHead)
+        dQ := scale(rescale, dot(attn.K[h], dS.T())).(*mat.Dense) // (dHead x T)
+        dK := scale(rescale, dot(attn.Q[h], dS)).(*mat.Dense)     // (dHead x T)
 
-        // param grads
+        // Params
         dWq[h] = dot(dQ, attn.X.T()).(*mat.Dense)
         dWk[h] = dot(dK, attn.X.T()).(*mat.Dense)
         dWv[h] = dot(dV, attn.X.T()).(*mat.Dense)
 
-        // input grads
+        // Inputs
         dXq := dot(attn.Wquery[h].T(), dQ).(*mat.Dense)
-        dXk := dot(attn.Wkey[h].T(), dK).(*mat.Dense)
+        dXk := dot(attn.Wkey[h].T(),   dK).(*mat.Dense)
         dXv := dot(attn.Wvalue[h].T(), dV).(*mat.Dense)
         dXh := add(add(dXq, dXk), dXv).(*mat.Dense)
         dXtotal = add(dXtotal, dXh).(*mat.Dense)
     }
-
     return dXtotal, dWq, dWk, dWv, dWout
 }
 
@@ -238,13 +247,25 @@ func (mlp *MLP) Forward(X *mat.Dense) *mat.Dense {
 
 func (mlp *MLP) Backward(grad *mat.Dense) *mat.Dense {
 	dWout := dot(grad, mlp.hiddenOutputs.T()).(*mat.Dense)
-	dbOut := grad
+    // sum gradients over time for biases
+    _, T := grad.Dims()
+    dbOut := mat.NewDense(mlp.outputs, 1, nil)
+    for i := 0; i < mlp.outputs; i++ {
+        s := 0.0
+        for t := 0; t < T; t++ { s += grad.At(i, t) }
+        dbOut.Set(i, 0, s)
+    }
 
 	hiddenPre := dot(mlp.outputWeights.T(), grad).(*mat.Dense)
 	hiddenErrors := multiply(hiddenPre, sigmoidPrime(mlp.hiddenOutputs)).(*mat.Dense)
 
 	dWhid := dot(hiddenErrors, mlp.lastInput.T()).(*mat.Dense)
-	dbHidden := hiddenErrors
+	dbHidden := mat.NewDense(mlp.hiddens, 1, nil)
+    for i := 0; i < mlp.hiddens; i++ {
+        s := 0.0
+        for t := 0; t < T; t++ { s += hiddenErrors.At(i, t) }
+        dbHidden.Set(i, 0, s)
+    }
 
 	dX := dot(mlp.hiddenWeights.T(), hiddenErrors).(*mat.Dense)
 

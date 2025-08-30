@@ -11,3 +11,6 @@
 
 # modal
 /src/models/
+
+# archived
+/src/archived

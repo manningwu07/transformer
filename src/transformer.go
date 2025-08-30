@@ -9,49 +9,47 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
-// Predict takes an English input string, tokenizes it, embeds it,
-// runs it through the Transformer, and returns the top-1 predicted
-// Chinese tokens (as strings).
+// Predict generates text autoregressively from an English prompt.
+// It tokenizes the input, embeds it, runs it through the Transformer,
+// and predicts next tokens until <eos> or maxLen.
 func (gpt *Transformer) Predict(input string, maxLen int) []string {
-	if embEN == nil || embZH == nil {
+	if emb == nil {
 		panic("embeddings not initialized; call loadTrainingSet first")
 	}
 
-	// Tokenize English input
-	enTokens := tokenizeEN(input)
-	if len(enTokens) == 0 {
-		return []string{}
+	// Tokenize into 1–4 char pieces
+	toks := tokenizeENPieces(input)
+
+	// Start with <bos> + prompt
+	seq := append([]string{"<bos>"}, toks...)
+	ids := make([]int, len(seq))
+	for i, t := range seq {
+		ids[i] = vocabLookup(vocab, t)
 	}
 
-	outputs := []string{}
-
-	// For each input token, predict one Chinese token
-	for _, tok := range enTokens {
-		enID := vocabLookup(enVocab, tok)
-		X := embed(embEN, enID)
-
-		// Forward through all layers
-		for l := 0; l < layers; l++ {
-			X = gpt.blocks[l].Forward(X)
+	for steps := 0; steps < maxLen; steps++ {
+		start := 0
+		if len(ids) > config.SeqLen {
+			start = len(ids) - config.SeqLen
 		}
-
-		// Unembed into ZH vocab logits
-		logits := UnembedZH(X)
-
-		// Softmax -> probabilities
+		X := embedSequence(emb, ids[start:])
+		Y := X
+		for l := 0; l < layers; l++ {
+			Y = gpt.blocks[l].Forward(Y)
+		}
+		yLast := lastCol(Y)
+		logits := Unembed(yLast)
 		probs := ColVectorSoftmax(logits)
-
-		// Argmax
-		predID := argmaxVec(probs)
-		predTok := zhVocab.IDToToken[predID]
-		outputs = append(outputs, predTok)
-
-		if len(outputs) >= maxLen {
+		nextID := argmaxVec(probs)
+		nextTok := vocab.IDToToken[nextID]
+		if nextTok == "<eos>" {
 			break
 		}
+		ids = append(ids, nextID)
+		seq = append(seq, nextTok)
 	}
-
-	return outputs
+	// return generated tokens after the prompt
+	return seq[1+len(toks):]
 }
 
 // PrintMatrix prints a Gonum matrix in a compact form.
@@ -215,10 +213,10 @@ func LoadTransformer(gpt *Transformer, filename string) error {
 	}
 
 	var buf bytes.Buffer
- 	enc := gob.NewEncoder(&buf)
- 	if err := enc.Encode(data); err != nil {
- 		return err
- 	}
- 
- 	return os.WriteFile(filename, buf.Bytes(), 0644)
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(data); err != nil {
+		return err
+	}
+
+	return os.WriteFile(filename, buf.Bytes(), 0644)
 }
