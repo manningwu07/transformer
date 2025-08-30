@@ -19,8 +19,6 @@ func randomArray(size int, v float64) []float64 {
 	return out
 }
 
-
-
 // Helper functions
 
 func oneHot(n, idx int) *mat.Dense {
@@ -31,42 +29,9 @@ func oneHot(n, idx int) *mat.Dense {
 	return mat.NewDense(n, 1, v)
 }
 
-func vector(vals []float64) *mat.Dense {
-	return mat.NewDense(len(vals), 1, vals)
-}
-
-func headVec(v *mat.Dense, k int) []float64 {
-	r, c := v.Dims()
-	if c != 1 {
-		return []float64{}
+func toDense(m mat.Matrix) *mat.Dense {
+	if d, ok := m.(*mat.Dense); ok {
+		return d
 	}
-	if k > r {
-		k = r
-	}
-	out := make([]float64, k)
-	for i := 0; i < k; i++ {
-		out[i] = v.At(i, 0)
-	}
-	return out
-}
-
-func rowSums(m *mat.Dense) []float64 {
-	r, c := m.Dims()
-	out := make([]float64, r)
-	for i := 0; i < r; i++ {
-		sum := 0.0
-		for j := 0; j < c; j++ {
-			sum += m.At(i, j)
-		}
-		out[i] = sum
-	}
-	return out
-}
-
-func forwardThrough(gpt Transformer, x *mat.Dense) *mat.Dense {
-	out := x
-	for i := 0; i < layers; i++ {
-		out = gpt.blocks[i].Forward(out)
-	}
-	return out
+	return mat.DenseCopyOf(m) // safely materialize
 }

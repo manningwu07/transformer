@@ -250,7 +250,7 @@ func Unembed(x *mat.Dense) *mat.Dense {
     if emb == nil {
         panic("embedding not initialized; call loadTrainingSet first")
     }
-    return dot(emb.T(), x).(*mat.Dense)
+    return toDense(dot(emb.T(), x))
 }
 
 // -------- Tokenization (very lightweight) --------

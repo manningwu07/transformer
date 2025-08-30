@@ -133,10 +133,10 @@ func main() {
 
 			// Backprop through tied unembedding: logits = emb^T * yLast
 			// dyLast = emb * (p - t)
-			dyLast := dot(emb, gradLogits).(*mat.Dense) // (d x 1)
+			dyLast := toDense(dot(emb, gradLogits))
 			// dEmb = yLast * (p - t)^T
-			dEmb := dot(yLast, gradLogits.T()).(*mat.Dense)
-			emb = add(emb, scale(-config.UnembedLR, dEmb)).(*mat.Dense)
+			dEmb := toDense(dot(yLast, gradLogits.T()))
+			emb = toDense(add(emb, scale(-config.UnembedLR, dEmb)))
 
 			dY := mat.NewDense(config.DModel, Xctx.RawMatrix().Cols, nil)
 			for i := 0; i < config.DModel; i++ {

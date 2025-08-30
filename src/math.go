@@ -197,11 +197,10 @@ func ColVectorSoftmax(v *mat.Dense) *mat.Dense {
 }
 
 // Softmax backward for row-wise softmax used in attention.
-func softmaxBackward(dA, A *mat.Dense) *mat.Dense {
+func softmaxBackward(dA mat.Matrix, A *mat.Dense) *mat.Dense {
 	r, c := A.Dims()
 	dS := mat.NewDense(r, c, nil)
 	for i := 0; i < r; i++ {
-		// Jacobian-vector product per row
 		for j := 0; j < c; j++ {
 			grad := 0.0
 			for k := 0; k < c; k++ {
