@@ -12,11 +12,9 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
-// Keep transformer.go unchanged. We define layers here
-// because transformer.go references it.
+// How many times does attn --> mlp happen
 var layers = 2
 
-// TrainingConfig holds all tunable hyperparameters in one place.
 type TrainingConfig struct {
 	DModel     int // model width
 	HiddenSize int // MLP hidden
@@ -36,9 +34,9 @@ type TrainingConfig struct {
 
 // Reasonable defaults for small experiments
 var config = TrainingConfig{
-	DModel:     512,   // try 512 or 768; go 1024 if you can
-	HiddenSize: 2048,  // ~4x dModel
-	VocabSize:  8192,  // top 1–4 char pieces
+	DModel:     256,   // try 512 or 768; go 1024 if you can
+	HiddenSize: 1024,  // ~4x dModel
+	VocabSize:  4096,  // top 1–4 char pieces
 	NumHeads:   8,     // dHead = DModel/NumHeads
 	SeqLen:     128,   // max context
 	AttnLR:     0.003, // simple SGD -> smaller LRs
@@ -56,9 +54,6 @@ func main() {
 	rand.Seed(time.Now().UTC().UnixNano())
 	t1 := time.Now()
 
-	// --- Mini-Batch SGD and Early Stopping Variables ---
-	// Load all training data into memory once to avoid slow file I/O in each epoch.
-
 	gpt := CreateGPT(
 		config.DModel,
 		config.HiddenSize,
@@ -66,6 +61,8 @@ func main() {
 		config.AttnLR,
 		config.MLPLR,
 	)
+
+	// Load all training data (May need to change as memory becomes an issue for bigger training data)
 	trainingData, err := loadTrainingSet(gpt)
 	if err != nil {
 		fmt.Println(err)

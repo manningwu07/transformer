@@ -2,11 +2,12 @@ package main
 
 import (
 	// "encoding/csv"
-	// "fmt"
 	// "math/rand"
 	// "os"
 	// "strconv"
 	// "time"
+
+	// "fmt"
 
 	"gonum.org/v1/gonum/mat"
 	"math"
@@ -57,8 +58,10 @@ func CreateGPT(dModel, hidden, vocabSize int, AttnRate float64, MLPRate float64)
 		blocks: make([]TransformerBlock, layers),
 	}
 
+    numHeads := chooseValidHeads(dModel, config.NumHeads)
+
 	for i := range layers {
-		attn := NewAttention(dModel, config.NumHeads, AttnRate)
+		attn := NewAttention(dModel, numHeads, AttnRate)
 
 		mlp := &MLP{
 			inputs:        dModel,
@@ -118,10 +121,30 @@ func (b *TransformerBlock) Forward(X *mat.Dense) *mat.Dense {
 }
 
 func (b *TransformerBlock) Backward(grad *mat.Dense) *mat.Dense {
-	// Set this up concurrently
-	grad = b.mlp.Backward(grad)
-	grad = b.attn.Backward(grad)
-	return grad
+	grad = expandGradToSeq(grad, b.mlp.lastInput)
+
+	// Forward: X1 = X0  Attn(X0); Y = X1  MLP(X1)
+	// Backward (top residual): dX1_total = grad (identity)  dMLP
+	gradIntoX1FromMLP := b.mlp.Backward(grad)                // dL/dX1 via MLP
+	gradIntoX1Total := toDense(add(grad, gradIntoX1FromMLP)) // + identity
+	gradIntoX0FromAttn := b.attn.Backward(gradIntoX1Total)
+	gradIntoX0Total := toDense(add(gradIntoX1Total, gradIntoX0FromAttn))
+	return gradIntoX0Total
+
+}
+
+func (b *TransformerBlock) BackwardGradsOnly(grad *mat.Dense) (dX *mat.Dense,
+	dWq, dWk, dWv []*mat.Dense, dWo *mat.Dense,
+	dWhid, dWout *mat.Dense) {
+
+	grad = expandGradToSeq(grad, b.mlp.lastInput)
+
+	gradIntoX1FromMLP, dWhid, _, dWout, _ := b.mlp.BackwardGradsOnly(grad)
+	gradIntoX1Total := toDense(add(grad, gradIntoX1FromMLP))
+
+	dXattn, dWq, dWk, dWv, dWo := b.attn.BackwardGradsOnly(gradIntoX1Total)
+	dX = toDense(add(gradIntoX1Total, dXattn))
+	return
 }
 
 // Attention forward/backward.
@@ -141,7 +164,7 @@ func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 
 		S := scale(rescale, dot(Q.T(), K)).(*mat.Dense) // (T x T)
 		A := RowSoftmaxMasked(S, mask)                  // (T x T)
-		O := dot(V, A.T()).(*mat.Dense)                 // (dHead x T)
+		O := toDense(dot(V, A.T()))                     // (dHead x T)
 
 		attn.Q[h], attn.K[h], attn.V[h] = Q, K, V
 		attn.Scores[h], attn.A[h], attn.O[h] = S, A, O
@@ -155,7 +178,7 @@ func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 		row += attn.dHead
 	}
 	attn.O_cat = headsCat
-	Y := dot(attn.Woutput, headsCat).(*mat.Dense) // (dModel x 1)
+	Y := toDense(dot(attn.Woutput, headsCat)) // (dModel x 1)
 	return Y
 }
 
@@ -185,19 +208,29 @@ func (attn *Attention) BackwardGradsOnly(dY *mat.Dense) (
 	dWk = make([]*mat.Dense, attn.H)
 	dWv = make([]*mat.Dense, attn.H)
 
-	// dY wrt Y = Wout * Ocat
-	dWout = dot(dY, attn.O_cat.T()).(*mat.Dense)
-	dOcat := dot(attn.Woutput.T(), dY).(*mat.Dense)
-
-	dXtotal := mat.NewDense(attn.dModel, 1, nil)
-
+	// Expand dY to full sequence if only the last position gradient was provided.
+	dYr, dYc := dY.Dims()
 	_, T := attn.X.Dims()
+	if dYc == 1 && T > 1 {
+		full := mat.NewDense(dYr, T, nil)
+		for i := 0; i < dYr; i++ {
+			full.Set(i, T-1, dY.At(i, 0))
+		}
+		dY = full
+	}
+
+	// dY with respect to Y = Wout * Ocat
+	dWout = toDense(dot(dY, attn.O_cat.T()))
+	dOcat := toDense(dot(attn.Woutput.T(), dY))
+
+	dXtotal := mat.NewDense(attn.dModel, T, nil)
+
 	row := 0
 	rescale := 1.0 / math.Sqrt(float64(attn.dHead))
 
 	for h := 0; h < attn.H; h++ {
 		// slice out this head’s portion of dOcat
-		dO := mat.NewDense(attn.dHead, 1, nil)
+		dO := mat.NewDense(attn.dHead, T, nil)
 		for i := 0; i < attn.dHead; i++ {
 			for t := 0; t < T; t++ {
 				dO.Set(i, t, dOcat.At(row+i, t))
@@ -207,28 +240,28 @@ func (attn *Attention) BackwardGradsOnly(dY *mat.Dense) (
 		row += attn.dHead
 
 		// O = V * A^T
-		dV := dot(dO, attn.A[h]).(*mat.Dense)       // (dHead x T)
-		dA_T := dot(attn.V[h].T(), dO).(*mat.Dense) // (T x T)
+		dV := toDense(dot(dO, attn.A[h]))       // (dHead x T)
+		dA_T := toDense(dot(attn.V[h].T(), dO)) // (T x T)
 		dA := dA_T.T()
 
 		// A = softmax_row(S)
 		dS := softmaxBackward(dA, attn.A[h]) // (T x T)
 
 		// S = Q^T K / sqrt(dHead)
-		dQ := scale(rescale, dot(attn.K[h], dS.T())).(*mat.Dense) // (dHead x T)
-		dK := scale(rescale, dot(attn.Q[h], dS)).(*mat.Dense)     // (dHead x T)
+		dQ := toDense(scale(rescale, dot(attn.K[h], dS.T()))) // (dHead x T)
+		dK := toDense(scale(rescale, dot(attn.Q[h], dS)))     // (dHead x T)
 
 		// Params
-		dWq[h] = dot(dQ, attn.X.T()).(*mat.Dense)
-		dWk[h] = dot(dK, attn.X.T()).(*mat.Dense)
-		dWv[h] = dot(dV, attn.X.T()).(*mat.Dense)
+		dWq[h] = toDense(dot(dQ, attn.X.T()))
+		dWk[h] = toDense(dot(dK, attn.X.T()))
+		dWv[h] = toDense(dot(dV, attn.X.T()))
 
 		// Inputs
-		dXq := dot(attn.Wquery[h].T(), dQ).(*mat.Dense)
-		dXk := dot(attn.Wkey[h].T(), dK).(*mat.Dense)
-		dXv := dot(attn.Wvalue[h].T(), dV).(*mat.Dense)
-		dXh := add(add(dXq, dXk), dXv).(*mat.Dense)
-		dXtotal = add(dXtotal, dXh).(*mat.Dense)
+		dXq := toDense(dot(attn.Wquery[h].T(), dQ))
+		dXk := toDense(dot(attn.Wkey[h].T(), dK))
+		dXv := toDense(dot(attn.Wvalue[h].T(), dV))
+		dXh := toDense(add(add(dXq, dXk), dXv))
+		dXtotal = toDense(add(dXtotal, dXh))
 	}
 	return dXtotal, dWq, dWk, dWv, dWout
 }
@@ -237,18 +270,34 @@ func (attn *Attention) BackwardGradsOnly(dY *mat.Dense) (
 
 func (mlp *MLP) Forward(X *mat.Dense) *mat.Dense {
 	mlp.lastInput = X
-	hiddenInputs := add(dot(mlp.hiddenWeights, X), mlp.hiddenBias)
-	mlp.hiddenOutputs = apply(sigmoid, hiddenInputs).(*mat.Dense)
-	finalInputs := add(dot(mlp.outputWeights, mlp.hiddenOutputs), mlp.outputBias)
-	mlp.finalOutputs = finalInputs.(*mat.Dense) // logits
+	hiddenLin := toDense(dot(mlp.hiddenWeights, X))      // (h x T)
+	hiddenWithBias := addBias(hiddenLin, mlp.hiddenBias) // (h x T)
+	mlp.hiddenOutputs = apply(sigmoid, hiddenWithBias).(*mat.Dense)
+	finalLin := toDense(dot(mlp.outputWeights, mlp.hiddenOutputs)) // (d x T)
+	finalWithBias := addBias(finalLin, mlp.outputBias)             // (d x T)
+	mlp.finalOutputs = finalWithBias
 	return mlp.finalOutputs
 }
 
 func (mlp *MLP) Backward(grad *mat.Dense) *mat.Dense {
-	dWout := dot(grad, mlp.hiddenOutputs.T()).(*mat.Dense)
+
+	dX, dWhid, dbHidden, dWout, dbOut := mlp.BackwardGradsOnly(grad)
+	lr := mlp.learningRate
+	mlp.outputWeights = add(mlp.outputWeights, scale(-lr, dWout)).(*mat.Dense)
+	mlp.outputBias = add(mlp.outputBias, scale(-lr, dbOut)).(*mat.Dense)
+	mlp.hiddenWeights = add(mlp.hiddenWeights, scale(-lr, dWhid)).(*mat.Dense)
+	mlp.hiddenBias = add(mlp.hiddenBias, scale(-lr, dbHidden)).(*mat.Dense)
+	return dX
+}
+
+func (mlp *MLP) BackwardGradsOnly(grad *mat.Dense) (dX, dWhid, dbHidden, dWout, dbOut *mat.Dense) {
+
+    grad = expandGradToSeq(grad, mlp.lastInput)
+
+	dWout = dot(grad, mlp.hiddenOutputs.T()).(*mat.Dense)
 	// sum gradients over time for biases
 	_, T := grad.Dims()
-	dbOut := mat.NewDense(mlp.outputs, 1, nil)
+	dbOut = mat.NewDense(mlp.outputs, 1, nil)
 	for i := 0; i < mlp.outputs; i++ {
 		s := 0.0
 		for t := 0; t < T; t++ {
@@ -257,11 +306,11 @@ func (mlp *MLP) Backward(grad *mat.Dense) *mat.Dense {
 		dbOut.Set(i, 0, s)
 	}
 
-	hiddenPre := dot(mlp.outputWeights.T(), grad).(*mat.Dense)
+	hiddenPre := toDense(dot(mlp.outputWeights.T(), grad))
 	hiddenErrors := multiply(hiddenPre, sigmoidPrime(mlp.hiddenOutputs)).(*mat.Dense)
 
-	dWhid := dot(hiddenErrors, mlp.lastInput.T()).(*mat.Dense)
-	dbHidden := mat.NewDense(mlp.hiddens, 1, nil)
+	dWhid = toDense(dot(hiddenErrors, mlp.lastInput.T()))
+	dbHidden = mat.NewDense(mlp.hiddens, 1, nil)
 	for i := 0; i < mlp.hiddens; i++ {
 		s := 0.0
 		for t := 0; t < T; t++ {
@@ -270,13 +319,6 @@ func (mlp *MLP) Backward(grad *mat.Dense) *mat.Dense {
 		dbHidden.Set(i, 0, s)
 	}
 
-	dX := dot(mlp.hiddenWeights.T(), hiddenErrors).(*mat.Dense)
-
-	lr := mlp.learningRate
-	mlp.outputWeights = add(mlp.outputWeights, scale(-lr, dWout)).(*mat.Dense)
-	mlp.outputBias = add(mlp.outputBias, scale(-lr, dbOut)).(*mat.Dense)
-	mlp.hiddenWeights = add(mlp.hiddenWeights, scale(-lr, dWhid)).(*mat.Dense)
-	mlp.hiddenBias = add(mlp.hiddenBias, scale(-lr, dbHidden)).(*mat.Dense)
-
-	return dX
+	dX = toDense(dot(mlp.hiddenWeights.T(), hiddenErrors))
+	return dX, dWhid, dbHidden, dWout, dbOut
 }

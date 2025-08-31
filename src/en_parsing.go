@@ -110,13 +110,16 @@ func evaluateAccuracy(gpt Transformer) (int, int) {
 	// Use up to 10,000 records for evaluation
 	N := min(len(records), 10000)
 
+
+
 	correct := 0
 	for i := 0; i < N; i++ {
 		X := records[i].Inputs
 		for l := 0; l < layers; l++ {
 			X = gpt.blocks[l].Forward(X)
 		}
-		logits := Unembed(X)
+		yLast := lastCol(X)
+        logits := Unembed(yLast)
 		pred := argmaxVec(logits)
 		tgt := argmaxVec(records[i].Targets)
 		if pred == tgt {
@@ -135,10 +138,7 @@ func tokenizeENPieces(s string) []string {
     for _, w := range parts {
         for len(w) > 0 {
             // prefer longest piece up to 4 bytes (ASCII assumed for now)
-            take := 4
-            if take > len(w) {
-                take = len(w)
-            }
+            take := min(4, len(w))
             // UTF-8 safety: back off to valid boundary
             for take > 1 && !utf8.ValidString(w[:take]) {
                 take--
