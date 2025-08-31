@@ -34,20 +34,20 @@ type TrainingConfig struct {
 
 // Reasonable defaults for small experiments
 var config = TrainingConfig{
-	DModel:     256,   // try 512 or 768; go 1024 if you can
+	DModel:     512,   // try 512 or 768; go 1024 if you can
 	HiddenSize: 1024,  // ~4x dModel
-	VocabSize:  4096,  // top 1–4 char pieces
+	VocabSize:  8192,  // top 1–4 char pieces
 	NumHeads:   8,     // dHead = DModel/NumHeads
 	SeqLen:     128,   // max context
-	AttnLR:     0.003, // simple SGD -> smaller LRs
-	MLPLR:      0.003,
-	UnembedLR:  0.003,
+	AttnLR:     0.03, // simple SGD -> smaller LRs
+	MLPLR:      0.03,
+	UnembedLR:  0.03,
 
-	MaxEpochs:  50,
-	Patience:   10,
-	Epsilon:    1e-4,
-	BatchSize:  1024, // each example is one prefix
-	ValFrac:    0.1,
+	MaxEpochs: 50,
+	Patience:  10,
+	Epsilon:   1e-4,
+	BatchSize: 1024, // each example is one prefix
+	ValFrac:   0.1,
 }
 
 func main() {
@@ -63,27 +63,18 @@ func main() {
 	)
 
 	// Load all training data (May need to change as memory becomes an issue for bigger training data)
-	trainingData, err := loadTrainingSet(gpt)
+	trainSeqs, err := loadTrainSequences(gpt)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	fmt.Printf("Finished loading %d training records.\n", len(trainingData))
+	fmt.Printf("Loaded %d training sequences.\n", len(trainSeqs))
 
 	var bestAccuracy float64 = -1.0
 	var noImprovementCount int
 	bestModel := gpt
 
-	rand.Shuffle(len(trainingData), func(i, j int) {
-		trainingData[i], trainingData[j] = trainingData[j], trainingData[i]
-	})
-	valN := int(config.ValFrac * float64(len(trainingData)))
-	if valN < 1 {
-		valN = max(min(1000, len(trainingData)/10), 1)
-	}
-	valRecords := trainingData[:valN]
-	trainRecords := trainingData[valN:]
-	fmt.Printf("Train: %d  Val: %d\n", len(trainRecords), len(valRecords))
+	fmt.Printf("Train sequences: %d  Eval: from eval.en\n", len(trainSeqs))
 
 	// Create or truncate the log file
 	logFile, err := os.Create("training_log.csv")
@@ -98,21 +89,27 @@ func main() {
 
 	for e := 0; e < config.MaxEpochs; e++ {
 		var totalLoss float64
-		var totalRecords float64
+		var steps float64
 
-		// Randomly shuffle the training data at the beginning of each epoch.
-		rand.Shuffle(len(trainingData), func(i, j int) {
-			trainingData[i], trainingData[j] = trainingData[j], trainingData[i]
-		})
+		epochTime := time.Now()
 
-		// Use a mini-batch for training in this epoch.
-		end := min(config.BatchSize, len(trainingData))
-		miniBatch := trainingData[:end]
+		// Random-sample BatchSize prefix examples; build X and target on the fly.
+		B := min(config.BatchSize, 1000000000) // cap for safety
+		for b := 0; b < B; b++ {
+			// pick a random sequence and position
+			si := rand.Intn(len(trainSeqs))
+			ids := trainSeqs[si]
+			if len(ids) < 2 {
+				continue
+			}
+			i := rand.Intn(len(ids) - 1) // predict ids[i+1]
+			start := 0
+			if i+1 > config.SeqLen {
+				start = i + 1 - config.SeqLen
+			}
+			Xctx := embedSequence(emb, ids[start:i+1]) // (d x T)
+			target := oneHot(len(vocab.IDToToken), ids[i+1])
 
-		// Iterate through the mini-batch
-		for _, record := range miniBatch {
-			// Forward pass on context matrix (d x T)
-			Xctx := record.Inputs
 			Y := Xctx
 			for i := 0; i < layers; i++ {
 				Y = gpt.blocks[i].Forward(Y)
@@ -122,11 +119,10 @@ func main() {
 			logits := Unembed(yLast)
 
 			// Loss + gradient
-			target := record.Targets
 			loss, gradLogits := CrossEntropyWithGrad(logits, target)
 
 			totalLoss += loss
-			totalRecords++
+			steps++
 
 			// Backprop through tied unembedding: logits = emb^T * yLast
 			// dyLast = emb * (p - t)
@@ -145,7 +141,7 @@ func main() {
 		}
 
 		// Calculate average loss for the epoch
-		avgLoss := totalLoss / totalRecords
+		avgLoss := totalLoss / steps
 
 		// Evaluate accuracy on the test set
 		correct, total := evaluateAccuracy(gpt)
@@ -163,7 +159,8 @@ func main() {
 			strconv.FormatFloat(avgLoss, 'f', 4, 64),
 		})
 
-		fmt.Printf("Epoch %d - Accuracy: %.4f, Loss: %.4f\n", e+1, accuracy, avgLoss)
+		elapsed := time.Since(epochTime)
+		fmt.Printf("Epoch %d - Accuracy: %.4f, Loss: %.4f\n, Time for epoch: %s", e+1, accuracy, avgLoss, elapsed)
 
 		// --- Early stopping logic based on loss improvement and accuracy checkpointing ---
 		// Check if the current accuracy is the best we've seen so far.

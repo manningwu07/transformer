@@ -34,99 +34,131 @@ var (
 // Special tokens kept at the start of the vocab
 var special = []string{"<pad>", "<bos>", "<eos>", "<unk>"}
 
-// -------- Public functions required by your training loop --------
-
-// loadTrainingSet builds:
-//   - English 1–4 char piece vocab of size config.VocabSize
-//   - tied embedding emb (dModel x |V|)
-//   - prefix examples: for sentence tokens t0..tN, produce contexts [t0..ti] -> target ti1
-func loadTrainingSet(gpt Transformer) ([]TrainingRecord, error) {
+// load only token-id sequences for TRAIN. Builds vocabemb once.
+func loadTrainSequences(gpt Transformer) ([][]int, error) {
 	if len(gpt.blocks) == 0 || gpt.blocks[0].attn == nil {
 		return nil, errors.New("model is not initialized")
 	}
 	dModel := gpt.blocks[0].attn.dModel
-
-	// Find English training text (re-use your existing data dir)
-	p := findEnglishFile()
+	p := findTrainFile()
 	if p == "" {
-		return nil, errors.New("could not find English training file")
+		return nil, errors.New("could not find training file")
 	}
 	lines, err := readLines(p, 0)
 	if err != nil {
 		return nil, err
 	}
-
-	// Build vocab from 1–4 char pieces
+	// Build vocab from train only
 	allTokens := []string{}
-	seqs := make([][]string, len(lines))
+	seqTok := make([][]string, len(lines))
 	for i, s := range lines {
-		toks := tokenizeENPieces(s) // 1–4 char greedy pieces
-		// add BOS and EOS
+		toks := tokenizeENPieces(s)
 		toks = append([]string{"<bos>"}, toks...)
 		toks = append(toks, "<eos>")
-		seqs[i] = toks
+		seqTok[i] = toks
 		allTokens = append(allTokens, toks...)
 	}
 	vocab = buildFixedVocab(allTokens, config.VocabSize)
 	emb = initEmbeddings(dModel, vocab)
-
-	// Build prefix examples
-	records := make([]TrainingRecord, 0, 1<<16)
-	for _, toks := range seqs {
-		// convert to IDs
+	// Convert to IDs
+	seqIDs := make([][]int, len(seqTok))
+	for i, toks := range seqTok {
 		ids := make([]int, len(toks))
-		for i, t := range toks {
-			ids[i] = vocabLookup(vocab, t)
+		for j, t := range toks {
+			ids[j] = vocabLookup(vocab, t)
 		}
-		// produce contexts up to SeqLen
+		seqIDs[i] = ids
+	}
+	return seqIDs, nil
+}
+
+// load only token-id sequences for EVAL
+func loadEvalSequences() ([][]int, error) {
+	if len(vocab.IDToToken) == 0 {
+		return nil, errors.New("vocab not initialized; load train first")
+	}
+	p := findEvalFile()
+	if p == "" {
+		return nil, errors.New("could not find eval file")
+	}
+	lines, err := readLines(p, 0)
+	if err != nil {
+		return nil, err
+	}
+	seqIDs := make([][]int, len(lines))
+	for i, s := range lines {
+		toks := tokenizeENPieces(s)
+		toks = append([]string{"<bos>"}, toks...)
+		toks = append(toks, "<eos>")
+		ids := make([]int, len(toks))
+		for j, t := range toks {
+			ids[j] = vocabLookup(vocab, t) // unseen -> <unk>
+		}
+		seqIDs[i] = ids
+	}
+	return seqIDs, nil
+}
+
+func findTrainFile() string {
+    if p := findEnglishFile(); p != "" { return p }
+    return ""
+}
+
+func findEvalFile() string {
+    candidates := []string{
+        "../data/test/eval.en",
+        "data/test/eval.en",
+        "data/raw/eval.eng",
+    }
+    for _, p := range candidates {
+        if fileExists(p) { return p }
+    }
+    // fallback: first *.en named "eval" in tree
+    root := "data"
+    var first string
+    _ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+        if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".en") &&
+            strings.Contains(strings.ToLower(d.Name()), "eval") {
+            if first == "" { first = path }
+        }
+        return nil
+    })
+    return first
+}
+
+// evaluateAccuracy: uses eval.en and existing vocab/emb; streams examples.
+func evaluateAccuracy(gpt Transformer) (int, int) {
+	seqs, err := loadEvalSequences()
+	if err != nil || len(seqs) == 0 {
+		return 0, 0
+	}
+	totalLimit := 10000
+	correct, total := 0, 0
+VEC:
+	for _, ids := range seqs {
 		for i := 0; i+1 < len(ids); i++ {
 			start := 0
 			if i+1 > config.SeqLen {
 				start = i + 1 - config.SeqLen
 			}
-			ctxIDs := ids[start : i+1] // include current token
-			targetID := ids[i+1]
-
-			X := embedSequence(emb, ctxIDs)             // (dModel x T)
-			T := oneHot(len(vocab.IDToToken), targetID) // (|V| x 1)
-
-			records = append(records, TrainingRecord{Inputs: X, Targets: T})
+			X := embedSequence(emb, ids[start:i+1]) // (d x T)
+			Y := X
+			for l := 0; l < layers; l++ {
+				Y = gpt.blocks[l].Forward(Y)
+			}
+			yLast := lastCol(Y)
+			logits := Unembed(yLast)
+			pred := argmaxVec(logits)
+			if pred == ids[i+1] {
+				correct++
+			}
+			total++
+			if total >= totalLimit {
+				break VEC
+			}
 		}
 	}
-	return records, nil
-}
-
-// evaluateAccuracy computes simple top-1 accuracy using a held-out slice of
-// up to 10,000 records from the same building procedure as training.
-// It forwards through the model blocks and compares argmax(logits) vs argmax(target).
-func evaluateAccuracy(gpt Transformer) (int, int) {
-	// Rebuild a fresh dataset and use a slice for "test".
-	// In a real setup, you would separate train/test files.
-	records, err := loadTrainingSet(gpt)
-	if err != nil || len(records) == 0 {
-		return 0, 0
-	}
-
-	// Use up to 10,000 records for evaluation
-	N := min(len(records), 10000)
-
-
-
-	correct := 0
-	for i := 0; i < N; i++ {
-		X := records[i].Inputs
-		for l := 0; l < layers; l++ {
-			X = gpt.blocks[l].Forward(X)
-		}
-		yLast := lastCol(X)
-        logits := Unembed(yLast)
-		pred := argmaxVec(logits)
-		tgt := argmaxVec(records[i].Targets)
-		if pred == tgt {
-			correct++
-		}
-	}
-	return correct, N
+	return correct, total
 }
 
 // Tokenization and files
@@ -185,10 +217,8 @@ func buildFixedVocab(tokens []string, size int) Vocab {
 
 func findEnglishFile() string {
     candidates := []string{
-        // "../data/test/train.test.eval.en",
-        "../data/test/train.en",
-        // "../data/raw/wmt23-enzh/train.eng",
-        // "../data/raw/wmt23-enzh/wmt23-enzh.en",
+       "../data/test/train.en",
+        // "../data/raw/train.eng",
     }
     for _, p := range candidates {
         if fileExists(p) { return p }
