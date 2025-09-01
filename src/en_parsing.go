@@ -4,11 +4,11 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
-	"unicode/utf8"
 
 	"gonum.org/v1/gonum/mat"
 )
@@ -34,42 +34,30 @@ var (
 // Special tokens kept at the start of the vocab
 var special = []string{"<pad>", "<bos>", "<eos>", "<unk>"}
 
-// load only token-id sequences for TRAIN. Builds vocabemb once.
-func loadTrainSequences(gpt Transformer) ([][]int, error) {
+// Build vocab  initialize embeddings from the training file in a streaming pass.
+// Returns the number of lines seen (for logging) but does not load sequences into memory.
+func buildVocabAndEmbFromTrain(gpt Transformer) (int, error) {
 	if len(gpt.blocks) == 0 || gpt.blocks[0].attn == nil {
-		return nil, errors.New("model is not initialized")
+		return 0, errors.New("model is not initialized")
 	}
 	dModel := gpt.blocks[0].attn.dModel
 	p := findTrainFile()
 	if p == "" {
-		return nil, errors.New("could not find training file")
+		return 0, errors.New("could not find training file")
 	}
-	lines, err := readLines(p, 0)
+	var err error
+	vocab, _, err = buildFixedVocabFromFile(p, config.VocabSize)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-	// Build vocab from train only
-	allTokens := []string{}
-	seqTok := make([][]string, len(lines))
-	for i, s := range lines {
-		toks := tokenizeENPieces(s)
-		toks = append([]string{"<bos>"}, toks...)
-		toks = append(toks, "<eos>")
-		seqTok[i] = toks
-		allTokens = append(allTokens, toks...)
-	}
-	vocab = buildFixedVocab(allTokens, config.VocabSize)
 	emb = initEmbeddings(dModel, vocab)
-	// Convert to IDs
-	seqIDs := make([][]int, len(seqTok))
-	for i, toks := range seqTok {
-		ids := make([]int, len(toks))
-		for j, t := range toks {
-			ids[j] = vocabLookup(vocab, t)
-		}
-		seqIDs[i] = ids
+
+	// return line count for logging
+	lines, err := countLines(p)
+	if err != nil {
+		return 0, err
 	}
-	return seqIDs, nil
+	return lines, nil
 }
 
 // load only token-id sequences for EVAL
@@ -87,7 +75,7 @@ func loadEvalSequences() ([][]int, error) {
 	}
 	seqIDs := make([][]int, len(lines))
 	for i, s := range lines {
-		toks := tokenizeENPieces(s)
+		toks := tokenizeENPieces(s) //ASCII Only
 		toks = append([]string{"<bos>"}, toks...)
 		toks = append(toks, "<eos>")
 		ids := make([]int, len(toks))
@@ -106,9 +94,9 @@ func findTrainFile() string {
 
 func findEvalFile() string {
     candidates := []string{
-        "../data/test/eval.en",
-        "data/test/eval.en",
-        "data/raw/eval.eng",
+        "../data/test/train.en",
+        // "data/test/eval.en",
+        // "data/raw/eval.eng",
     }
     for _, p := range candidates {
         if fileExists(p) { return p }
@@ -162,37 +150,38 @@ func evaluateAccuracy(gpt Transformer) (int, int) {
 	return correct, total
 }
 
-// Tokenization and files
+// Tokenization (ASCII-only pieces). Lowercases, drops any non 1-byte ASCII chars.
 func tokenizeENPieces(s string) []string {
-    // Keep it simple: split on whitespace, then break each word into 1–4 char pieces
-    // e.g., "chatgpt" -> ["chat","gpt"] ; "the" -> ["the"]
-    parts := strings.Fields(strings.ToLower(s))
-    out := []string{}
-    for _, w := range parts {
-        for len(w) > 0 {
-            // prefer longest piece up to 4 bytes (ASCII assumed for now)
-            take := min(4, len(w))
-            // UTF-8 safety: back off to valid boundary
-            for take > 1 && !utf8.ValidString(w[:take]) {
-                take--
-            }
-            out = append(out, w[:take])
-            w = w[take:]
-        }
-    }
-    return out
+	// Fast ASCII lowercase  non-ASCII drop
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c = c + 32
+		}
+		if c < 0x80 {
+			b = append(b, c)
+		} else {
+			// replace non-ascii with space to enforce splitting
+			b = append(b, ' ')
+		}
+	}
+	parts := strings.Fields(string(b))
+	out := make([]string, 0, 16)
+	for _, w := range parts {
+		// split each ASCII word into 1–4 byte pieces
+		for len(w) > 0 {
+			take := min(4, len(w))
+			out = append(out, w[:take])
+			w = w[take:]
+		}
+	}
+	return out
 }
 
-func buildFixedVocab(tokens []string, size int) Vocab {
+func buildFixedVocabFromCounts(cnt map[string]int, size int) Vocab {
     if size < len(special) {
         panic("vocab size must be >= number of special tokens")
-    }
-    cnt := map[string]int{}
-    for _, t := range tokens {
-        if t == "" {
-            continue
-        }
-        cnt[t]++
     }
     type kv struct{ k string; v int }
     arr := make([]kv, 0, len(cnt))
@@ -206,7 +195,10 @@ func buildFixedVocab(tokens []string, size int) Vocab {
         if len(idToToken) >= size { break }
         skip := false
         for _, s := range special { if p.k == s { skip = true; break } }
-        if !skip { idToToken = append(idToToken, p.k) }
+		if skip { continue }
+        if !isASCIIString(p.k) { continue } // enforce 1-byte ASCII only
+        if p.k == "" { continue }
+        idToToken = append(idToToken, p.k)
     }
     for len(idToToken) < size {
         idToToken = append(idToToken, fmt.Sprintf("<pad%d>", len(idToToken)))
@@ -216,10 +208,54 @@ func buildFixedVocab(tokens []string, size int) Vocab {
     return Vocab{TokenToID: tok2id, IDToToken: idToToken}
 }
 
+// Streaming vocab builder from file; returns vocab and number of lines processed.
+func buildFixedVocabFromFile(path string, size int) (Vocab, int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return Vocab{}, 0, err
+	}
+	defer f.Close()
+	r := bufio.NewReaderSize(f, 1<<20) // 1MB buffer
+	counts := make(map[string]int, 1<<15)
+	lines := 0
+	for {
+		line, err := r.ReadString('\n')
+		if len(line) > 0 {
+			lines++
+			toks := tokenizeENPieces(line)
+			for _, t := range toks {
+				// enforce ASCII-only
+				if t == "" || !isASCIIString(t) {
+					continue
+				}
+				counts[t]++
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return Vocab{}, lines, err
+		}
+	}
+	return buildFixedVocabFromCounts(counts, size), lines, nil
+}
+
+// ASCII helper
+func isASCIIString(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+
 func findEnglishFile() string {
     candidates := []string{
-       "../data/test/train.en",
-        // "../data/raw/train.eng",
+    //    "../data/test/train.en",
+        "../data/raw/train.eng",
     }
     for _, p := range candidates {
         if fileExists(p) { return p }
@@ -284,8 +320,6 @@ func Unembed(x *mat.Dense) *mat.Dense {
     return toDense(dot(emb.T(), x))
 }
 
-// -------- Tokenization (very lightweight) --------
-
 
 
 func fileExists(p string) bool {
@@ -293,21 +327,111 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
+// readLines reads up to 'limit' lines (0 = no limit). Uses a large buffered reader.
 func readLines(p string, limit int) ([]string, error) {
 	f, err := os.Open(p)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	out := []string{}
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		out = append(out, sc.Text())
-		if limit > 0 && len(out) >= limit {
-			break
+	r := bufio.NewReaderSize(f, 1<<20) // 1MB
+	out := make([]string, 0, 4096)
+	for {
+		line, err := r.ReadString('\n')
+		if len(line) > 0 {
+			// trim trailing newline
+			if line[len(line)-1] == '\n' {
+				line = line[:len(line)-1]
+			}
+			out = append(out, line)
+			if limit > 0 && len(out) >= limit {
+				return out, nil
+			}
+		}
+		if err == io.EOF {
+			return out, nil
+		}
+		if err != nil {
+			return out, err
 		}
 	}
-	return out, sc.Err()
+}
+
+// Stream training lines -> token IDs without loading all into memory.
+type trainLineIter struct {
+	path string
+	f    *os.File
+	r    *bufio.Reader
+}
+
+func newTrainLineIter(path string) (*trainLineIter, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return &trainLineIter{path: path, f: f, r: bufio.NewReaderSize(f, 1<<20)}, nil
+}
+
+func (it *trainLineIter) close() error {
+	if it.f != nil {
+		return it.f.Close()
+	}
+	return nil
+}
+
+// nextIDs returns the next line converted to token IDs, or nil, io.EOF when at end.
+// When EOF is reached, the iterator rewinds to the beginning to allow multiple epochs.
+func (it *trainLineIter) nextIDs() ([]int, error) {
+	for {
+		line, err := it.r.ReadString('\n')
+		if len(line) > 0 {
+			toks := tokenizeENPieces(line)
+			if len(toks) == 0 {
+				// skip empty lines
+				continue
+			}
+			// add BOS/EOS
+			ids := make([]int, 0, len(toks) + 2)
+			ids = append(ids, vocabLookup(vocab, "<bos>"))
+			for _, t := range toks {
+				ids = append(ids, vocabLookup(vocab, t))
+			}
+			ids = append(ids, vocabLookup(vocab, "<eos>"))
+			return ids, nil
+		}
+		if err == io.EOF {
+			// rewind for next epoch
+			if _, err2 := it.f.Seek(0, io.SeekStart); err2 != nil {
+				return nil, err2
+			}
+			it.r.Reset(it.f)
+			return nil, io.EOF
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+}
+
+// countLines returns number of lines in file (used for logging).
+func countLines(path string) (int, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	r := bufio.NewReaderSize(f, 1<<20)
+	n := 0
+	for {
+		_, err := r.ReadString('\n')
+		if err == io.EOF {
+			return n, nil
+		}
+		if err != nil {
+			return n, err
+		}
+		n++
+	}
 }
 
 // save persists the whole Transformer using the gob-based SaveTransformer.

@@ -35,8 +35,8 @@ type TrainingConfig struct {
 var config = TrainingConfig{
 	DModel:     256, 
 	HiddenSize: 512, 
-	VocabSize:  32768, // Top number of 1-4 chars
-	NumHeads:   4,    // dHead = DModel/NumHeads
+	VocabSize:  16384, // Top number of 1-4 chars
+	NumHeads:   8,    // dHead = DModel/NumHeads
 	SeqLen:     128,  // max context
 	AttnLR:     0.003, // simple SGD -> smaller LRs
 	MLPLR:      0.003,
@@ -61,19 +61,28 @@ func main() {
 		config.MLPLR,
 	)
 
-	// Load all training data (May need to change as memory becomes an issue for bigger training data)
-	trainSeqs, err := loadTrainSequences(gpt)
+	// Build vocab + embeddings via streaming pass (no full dataset in memory)
+	linesCount, err := buildVocabAndEmbFromTrain(gpt)
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-	fmt.Printf("Loaded %d training sequences.\n", len(trainSeqs))
+	fmt.Printf("Initialized vocab (%d) and embeddings from training file. Estimated lines: %d\n",
+		len(vocab.IDToToken), linesCount)
+
+	trainPath := findTrainFile()
+	iter, err := newTrainLineIter(trainPath)
+	if err != nil {
+		fmt.Println("failed to open training file:", err)
+		return
+	}
+	defer iter.close()
 
 	var bestAccuracy float64 = -1.0
 	var noImprovementCount int
 	bestModel := gpt
 
-	fmt.Printf("Train sequences: %d  Eval: from eval.en\n", len(trainSeqs))
+	fmt.Printf("Train (streaming): lines≈%d  Eval: from eval.en\n", linesCount)
 
 	// Create or truncate the log file
 	logFile, err := os.Create("training_log.csv")
@@ -96,8 +105,14 @@ func main() {
 		B := min(config.BatchSize, 1000000000) // cap for safety
 		for b := 0; b < B; b++ {
 			// pick a random sequence and position
-			si := rand.Intn(len(trainSeqs))
-			ids := trainSeqs[si]
+			ids, err := iter.nextIDs()
+			if err != nil {
+				// Reached EOF; rewind happened. Fetch again.
+				ids, err = iter.nextIDs()
+				if err != nil {
+					continue
+				}
+			}
 			if len(ids) < 2 {
 				continue
 			}
@@ -130,6 +145,7 @@ func main() {
 			dEmb := toDense(dot(yLast, gradLogits.T()))
 			emb = toDense(add(emb, scale(-config.UnembedLR, dEmb)))
 
+			// Backprop only last timestep: expand to sequence (allocs per step minimized)
 			dY := mat.NewDense(config.DModel, Xctx.RawMatrix().Cols, nil)
 			for i := 0; i < config.DModel; i++ {
 				dY.Set(i, dY.RawMatrix().Cols-1, dyLast.At(i, 0))
