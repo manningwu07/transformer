@@ -76,3 +76,16 @@ func toDense(m mat.Matrix) *mat.Dense {
 	}
 	return mat.DenseCopyOf(m)
 }
+
+
+func matrixNorm(m *mat.Dense) float64 {
+    r, c := m.Dims()
+    s := 0.0
+    for i := 0; i < r; i++ {
+        for j := 0; j < c; j++ {
+            v := m.At(i, j)
+            s += v * v
+        }
+    }
+    return math.Sqrt(s)
+}

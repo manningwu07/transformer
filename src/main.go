@@ -13,7 +13,7 @@ import (
 )
 
 // How many times does attn --> mlp happen
-var layers = 2
+var layers = 6
 
 type TrainingConfig struct {
 	DModel     int // model width
@@ -34,16 +34,16 @@ type TrainingConfig struct {
 
 // Reasonable defaults for small experiments
 var config = TrainingConfig{
-	DModel:     512,   // try 512 or 768; go 1024 if you can
-	HiddenSize: 1024,  // ~4x dModel
-	VocabSize:  8192,  // top 1–4 char pieces
-	NumHeads:   8,     // dHead = DModel/NumHeads
-	SeqLen:     128,   // max context
-	AttnLR:     0.03, // simple SGD -> smaller LRs
-	MLPLR:      0.03,
-	UnembedLR:  0.03,
+	DModel:     256, 
+	HiddenSize: 512, 
+	VocabSize:  32768, // Top number of 1-4 chars
+	NumHeads:   4,    // dHead = DModel/NumHeads
+	SeqLen:     128,  // max context
+	AttnLR:     0.01, // simple SGD -> smaller LRs
+	MLPLR:      0.01,
+	UnembedLR:  0.01,
 
-	MaxEpochs: 50,
+	MaxEpochs: 25,
 	Patience:  10,
 	Epsilon:   1e-4,
 	BatchSize: 1024, // each example is one prefix
@@ -160,7 +160,12 @@ func main() {
 		})
 
 		elapsed := time.Since(epochTime)
-		fmt.Printf("Epoch %d - Accuracy: %.4f, Loss: %.4f\n, Time for epoch: %s", e+1, accuracy, avgLoss, elapsed)
+		fmt.Printf("Epoch %d - Accuracy: %.4f, Loss: %.4f, Time for epoch: %s\n", e+1, accuracy, avgLoss, elapsed)
+		fmt.Printf("Before epoch %d: Attn.Wq[0] norm=%.6g MLP.hidden norm=%.6g\n",
+			e+1,
+			matrixNorm(gpt.blocks[0].attn.Wquery[0]),
+			matrixNorm(gpt.blocks[0].mlp.hiddenWeights),
+		)
 
 		// --- Early stopping logic based on loss improvement and accuracy checkpointing ---
 		// Check if the current accuracy is the best we've seen so far.

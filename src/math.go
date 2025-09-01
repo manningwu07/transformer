@@ -134,9 +134,28 @@ func RowSoftmaxMasked(m, mask *mat.Dense) *mat.Dense {
 		fmt.Println("m:", mr, mc, "mask:", r, c)
 		panic("mask shape mismatch")
 	}
-	tmp := mat.NewDense(r, c, nil)
-	tmp.Add(m, mask)
-	return RowSoftmax(tmp)
+	out := mat.NewDense(r, c, nil)
+	for i := 0; i < r; i++ {
+		// max for stability
+		mx := m.At(i, 0) + mask.At(i, 0)
+		for j := 1; j < c; j++ {
+			v := m.At(i, j) + mask.At(i, j)
+			if v > mx {
+				mx = v
+			}
+		}
+		sum := 0.0
+		for j := 0; j < c; j++ {
+			e := math.Exp(m.At(i, j) + mask.At(i, j) - mx)
+			out.Set(i, j, e)
+			sum += e
+		}
+		inv := 1.0 / sum
+	for j := 0; j < c; j++ {
+			out.Set(i, j, out.At(i, j)*inv)
+		}
+	}
+	return out
 }
 
 // RowSoftmax applies softmax independently to each row across columns.
@@ -197,20 +216,19 @@ func ColVectorSoftmax(v *mat.Dense) *mat.Dense {
 }
 
 // Softmax backward for row-wise softmax used in attention.
+// Vector-JVP form: for each row i,
+// s = sum_k dA[i,k] * A[i,k]; dS[i,j] = A[i,j] * (dA[i,j] - s)
 func softmaxBackward(dA mat.Matrix, A *mat.Dense) *mat.Dense {
 	r, c := A.Dims()
 	dS := mat.NewDense(r, c, nil)
 	for i := 0; i < r; i++ {
+		s := 0.0
+		for k := 0; k < c; k++ {
+			s += dA.At(i, k) * A.At(i, k)
+		}
 		for j := 0; j < c; j++ {
-			grad := 0.0
-			for k := 0; k < c; k++ {
-				if j == k {
-					grad += A.At(i, j) * (1.0 - A.At(i, k)) * dA.At(i, k)
-				} else {
-					grad += -A.At(i, j) * A.At(i, k) * dA.At(i, k)
-				}
-			}
-			dS.Set(i, j, grad)
+			aj := A.At(i, j)
+			dS.Set(i, j, aj*(dA.At(i, j)-s))
 		}
 	}
 	return dS

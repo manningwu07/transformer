@@ -132,29 +132,30 @@ func evaluateAccuracy(gpt Transformer) (int, int) {
 	if err != nil || len(seqs) == 0 {
 		return 0, 0
 	}
-	totalLimit := 10000
-	correct, total := 0, 0
-VEC:
+	limit := 10000
+	total, correct := 0, 0
 	for _, ids := range seqs {
-		for i := 0; i+1 < len(ids); i++ {
-			start := 0
-			if i+1 > config.SeqLen {
-				start = i + 1 - config.SeqLen
-			}
-			X := embedSequence(emb, ids[start:i+1]) // (d x T)
-			Y := X
+		if len(ids) < 2 { continue }
+		// per-sequence KV caches, one per block
+		type blkKV struct{ attnKV AttnKV }
+		kvs := make([]blkKV, layers)
+		// roll through the sequence once; predict next token at each step
+		// we run up to len(ids)-1 predictions
+		var yLast *mat.Dense
+		for t := 0; t+1 < len(ids); t++ {
+			xLast := colAsVector(emb, ids[t]) // (dModel x 1)
+			yLast = xLast
 			for l := 0; l < layers; l++ {
-				Y = gpt.blocks[l].Forward(Y)
+				yLast = gpt.blocks[l].ForwardLastWithKV(yLast, &kvs[l].attnKV)
 			}
-			yLast := lastCol(Y)
-			logits := Unembed(yLast)
+			logits := Unembed(yLast) // emb^T * yLast
 			pred := argmaxVec(logits)
-			if pred == ids[i+1] {
+			if pred == ids[t+1] {
 				correct++
 			}
 			total++
-			if total >= totalLimit {
-				break VEC
+			if total >= limit {
+				return correct, total
 			}
 		}
 	}
