@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/csv"
 	"os"
-	"strconv"
 	"time"
 
 	"fmt"
@@ -13,7 +12,7 @@ import (
 )
 
 // How many times does attn --> mlp happen
-var layers = 6
+var layers = 8
 
 type TrainingConfig struct {
 	DModel     int // model width
@@ -39,9 +38,9 @@ var config = TrainingConfig{
 	VocabSize:  32768, // Top number of 1-4 chars
 	NumHeads:   4,    // dHead = DModel/NumHeads
 	SeqLen:     128,  // max context
-	AttnLR:     0.01, // simple SGD -> smaller LRs
-	MLPLR:      0.01,
-	UnembedLR:  0.01,
+	AttnLR:     0.003, // simple SGD -> smaller LRs
+	MLPLR:      0.003,
+	UnembedLR:  0.003,
 
 	MaxEpochs: 25,
 	Patience:  10,
@@ -151,13 +150,6 @@ func main() {
 		} else {
 			accuracy = 0
 		}
-
-		// Log the epoch's metrics to the CSV file
-		logWriter.Write([]string{
-			strconv.Itoa(e + 1),
-			strconv.FormatFloat(accuracy, 'f', 4, 64),
-			strconv.FormatFloat(avgLoss, 'f', 4, 64),
-		})
 
 		elapsed := time.Since(epochTime)
 		fmt.Printf("Epoch %d - Accuracy: %.4f, Loss: %.4f, Time for epoch: %s\n", e+1, accuracy, avgLoss, elapsed)

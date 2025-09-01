@@ -190,7 +190,6 @@ func (attn *Attention) ForwardLastWithKV(xLast *mat.Dense, kv *AttnKV) *mat.Dens
 		*kv = newAttnKV(attn.H, attn.dHead)
 	}
 	rescale := 1.0 / math.Sqrt(float64(attn.dHead))
-	T := kv.t + 1
 	headsCatLast := mat.NewDense(attn.dModel, 1, nil)
 	// per-head local buffers
 	for h := 0; h < attn.H; h++ {
@@ -202,6 +201,16 @@ func (attn *Attention) ForwardLastWithKV(xLast *mat.Dense, kv *AttnKV) *mat.Dens
 		// append to cache
 		kv.K[h] = appendCol(kv.K[h], toDense(&k))
 		kv.V[h] = appendCol(kv.V[h], toDense(&v))
+
+		// cap cache length to SeqLen by dropping oldest columns
+		if config.SeqLen > 0 {
+			if cols := kv.K[h].RawMatrix().Cols; cols > config.SeqLen {
+				start := cols - config.SeqLen
+				kv.K[h] = kv.K[h].Slice(0, kv.K[h].RawMatrix().Rows, start, cols).(*mat.Dense)
+				kv.V[h] = kv.V[h].Slice(0, kv.V[h].RawMatrix().Rows, start, cols).(*mat.Dense)
+			}
+		}
+
 		// scores for last row: (1 x T)
 		var s mat.Dense
 		s.Mul(q.T(), kv.K[h])
@@ -217,7 +226,12 @@ func (attn *Attention) ForwardLastWithKV(xLast *mat.Dense, kv *AttnKV) *mat.Dens
 		dst := headsCatLast.Slice(base, base+attn.dHead, 0, 1).(*mat.Dense)
 		dst.Copy(toDense(&o))
 	}
-	kv.t = T
+	// update cached length
+	if kv.K[0] != nil {
+		kv.t = kv.K[0].RawMatrix().Cols
+	} else {
+		kv.t = 0
+	}
 	// output projection
 	var yLast mat.Dense
 	yLast.Mul(attn.Woutput, headsCatLast)
