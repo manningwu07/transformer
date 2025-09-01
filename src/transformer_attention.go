@@ -75,7 +75,13 @@ func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 		attn.Scores[h].Mul(attn.Q[h].T(), attn.K[h])
 		attn.Scores[h].Scale(rescale, attn.Scores[h])
 		// A
-		attn.A[h] = RowSoftmaxMasked(attn.Scores[h], mask)
+		// Reuse buffer for A to avoid allocation each step
+		if attn.A[h] == nil {
+			attn.A[h] = mat.NewDense(T, T, nil)
+		} else if ar, ac := attn.A[h].Dims(); ar != T || ac != T {
+			attn.A[h] = mat.NewDense(T, T, nil)
+		}
+		RowSoftmaxMaskedInPlace(attn.A[h], attn.Scores[h], mask)
 		// O = V * A^T
 		attn.O[h].Mul(attn.V[h], attn.A[h].T())
 		// concat into headsCat rows

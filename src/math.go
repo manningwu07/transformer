@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"math"
 
 	"gonum.org/v1/gonum/mat"
@@ -102,6 +101,7 @@ func geluPrime(m mat.Matrix) *mat.Dense {
 	}
 	return out
 }
+
 // Masking stuff
 
 func addBias(m, bias *mat.Dense) *mat.Dense {
@@ -146,15 +146,16 @@ func causalMask(T int) *mat.Dense {
 
 // ---------- Softmax variants ----------
 
-func RowSoftmaxMasked(m, mask *mat.Dense) *mat.Dense {
+// RowSoftmaxMaskedInPlace writes softmax(m+mask) into dst (r x c) in place
+func RowSoftmaxMaskedInPlace(dst, m, mask *mat.Dense) *mat.Dense {
 	r, c := m.Dims()
-	if mr, mc := mask.Dims(); mr != r || mc != c {
-		fmt.Println("m:", mr, mc, "mask:", r, c)
-		panic("mask shape mismatch")
+	if dr, dc := dst.Dims(); dr != r || dc != c {
+		panic("RowSoftmaxMaskedInPlace: dst shape mismatch")
 	}
-	out := mat.NewDense(r, c, nil)
+	if mr, mc := mask.Dims(); mr != r || mc != c {
+		panic("RowSoftmaxMaskedInPlace: mask shape mismatch")
+	}
 	for i := 0; i < r; i++ {
-		// max for stability
 		mx := m.At(i, 0) + mask.At(i, 0)
 		for j := 1; j < c; j++ {
 			v := m.At(i, j) + mask.At(i, j)
@@ -165,15 +166,15 @@ func RowSoftmaxMasked(m, mask *mat.Dense) *mat.Dense {
 		sum := 0.0
 		for j := 0; j < c; j++ {
 			e := math.Exp(m.At(i, j) + mask.At(i, j) - mx)
-			out.Set(i, j, e)
+			dst.Set(i, j, e)
 			sum += e
 		}
 		inv := 1.0 / sum
-	for j := 0; j < c; j++ {
-			out.Set(i, j, out.At(i, j)*inv)
+		for j := 0; j < c; j++ {
+			dst.Set(i, j, dst.At(i, j)*inv)
 		}
 	}
-	return out
+	return dst
 }
 
 // RowSoftmax applies softmax independently to each row across columns.

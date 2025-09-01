@@ -305,9 +305,8 @@ func embedSequence(emb *mat.Dense, ids []int) *mat.Dense {
     T := len(ids)
     out := mat.NewDense(d, T, nil)
     for t, id := range ids {
-        col := colAsVector(emb, id)
         for i := 0; i < d; i++ {
-            out.Set(i, t, col.At(i, 0))
+            out.Set(i, t, emb.At(i, id))
         }
     }
     return out
@@ -319,7 +318,6 @@ func Unembed(x *mat.Dense) *mat.Dense {
     }
     return toDense(dot(emb.T(), x))
 }
-
 
 
 func fileExists(p string) bool {

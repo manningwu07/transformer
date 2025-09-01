@@ -1,15 +1,14 @@
 package main
 
 import (
-	"time"
 	"fmt"
 	"math/rand"
+	"time"
 
 	"gonum.org/v1/gonum/mat"
 )
 
 // How many times does attn --> mlp happen
-
 
 // Adam Optimizer global vars
 var (
@@ -29,7 +28,7 @@ type TrainingConfig struct {
 	UnembedLR  float64
 
 	// Optimization/training wheel parameters
-	NormLR     float64
+	NormLR      float64
 	WarmupSteps int     // linear warmup steps
 	DecaySteps  int     // cosine decay steps after warmup (0 = none)
 	AdamBeta1   float64 // default 0.9
@@ -45,16 +44,15 @@ type TrainingConfig struct {
 
 var layers = 6
 var config = TrainingConfig{
-	DModel:     512, 
-	HiddenSize: 1024, 
+	DModel:     512,
+	HiddenSize: 1024,
 	VocabSize:  4096, // Top number of 1-4 chars
 	NumHeads:   8,    // dHead = DModel/NumHeads
-	SeqLen:     64,  // max context
+	SeqLen:     64,   // max context
 	AttnLR:     0.0003,
 	MLPLR:      0.0003,
 	UnembedLR:  0.0003,
 	NormLR:     0.0003,
-	
 
 	MaxEpochs: 25,
 	Patience:  10,
@@ -98,6 +96,7 @@ func main() {
 	}
 	defer iter.close()
 
+	dYbuf := mat.NewDense(config.DModel, config.SeqLen, nil)
 	var bestAccuracy float64 = -1.0
 	var noImprovementCount int
 	bestModel := gpt
@@ -149,7 +148,6 @@ func main() {
 			// Loss + gradient
 			loss, gradLogits := CrossEntropyWithGrad(logits, target)
 
-
 			adamStep++
 			attnLR := LRSchedule(adamStep, config.AttnLR)
 			mlpLR := LRSchedule(adamStep, config.MLPLR)
@@ -169,16 +167,27 @@ func main() {
 			dyLast := toDense(dot(emb, gradLogits))
 			// dEmb = yLast * (p - t)^T
 			dEmb := toDense(dot(yLast, gradLogits.T()))
-			
+
 			initEmbAdamIfNeeded()
 			embT++
 			adamUpdateInPlace(emb, dEmb, embM, embV, embT, unembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
 
-			// Backprop only last timestep: expand to sequence (allocs per step minimized)
-			dY := mat.NewDense(config.DModel, Xctx.RawMatrix().Cols, nil)
-			for i := 0; i < config.DModel; i++ {
-				dY.Set(i, dY.RawMatrix().Cols-1, dyLast.At(i, 0))
+			// Backprop only last timestep: reuse dY buffer
+			cols := Xctx.RawMatrix().Cols
+			dY := dYbuf.Slice(0, config.DModel, 0, cols).(*mat.Dense)
+			// zero dY quickly
+			{
+				r, c := dY.Dims()
+				for i := 0; i < r; i++ {
+					for j := 0; j < c; j++ {
+						dY.Set(i, j, 0)
+					}
+				}
 			}
+			for i := 0; i < config.DModel; i++ {
+				dY.Set(i, cols-1, dyLast.At(i, 0))
+			}
+
 			for i := layers - 1; i >= 0; i-- {
 				dY = gpt.blocks[i].Backward(dY)
 			}
