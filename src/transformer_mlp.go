@@ -2,11 +2,29 @@ package main
 
 import "gonum.org/v1/gonum/mat"
 
+type MLP struct {
+	inputs, hiddens, outputs  int
+	hiddenWeights, hiddenBias *mat.Dense
+	outputWeights, outputBias *mat.Dense
+	learningRate              float64
+
+	// Adam
+	t                  int
+	mHiddenW, vHiddenW *mat.Dense
+	mHiddenB, vHiddenB *mat.Dense
+	mOutputW, vOutputW *mat.Dense
+	mOutputB, vOutputB *mat.Dense
+
+	// cache for backprop
+	lastInput, hiddenPreAct, hiddenOutputs, finalOutputs *mat.Dense
+}
+
 func (mlp *MLP) Forward(X *mat.Dense) *mat.Dense {
 	mlp.lastInput = X
 	hiddenLin := toDense(dot(mlp.hiddenWeights, X))      // (h x T)
 	hiddenWithBias := addBias(hiddenLin, mlp.hiddenBias) // (h x T)
-	mlp.hiddenOutputs = apply(sigmoid, hiddenWithBias).(*mat.Dense)
+	mlp.hiddenPreAct = hiddenWithBias
+	mlp.hiddenOutputs = apply(geluApply, hiddenWithBias).(*mat.Dense)
 	finalLin := toDense(dot(mlp.outputWeights, mlp.hiddenOutputs)) // (d x T)
 	finalWithBias := addBias(finalLin, mlp.outputBias)             // (d x T)
 	mlp.finalOutputs = finalWithBias
@@ -16,17 +34,22 @@ func (mlp *MLP) Forward(X *mat.Dense) *mat.Dense {
 func (mlp *MLP) Backward(grad *mat.Dense) *mat.Dense {
 
 	dX, dWhid, dbHidden, dWout, dbOut := mlp.BackwardGradsOnly(grad)
+	mlp.t++
 	lr := mlp.learningRate
-	mlp.outputWeights = add(mlp.outputWeights, scale(-lr, dWout)).(*mat.Dense)
-	mlp.outputBias = add(mlp.outputBias, scale(-lr, dbOut)).(*mat.Dense)
-	mlp.hiddenWeights = add(mlp.hiddenWeights, scale(-lr, dWhid)).(*mat.Dense)
-	mlp.hiddenBias = add(mlp.hiddenBias, scale(-lr, dbHidden)).(*mat.Dense)
+	adamUpdateInPlace(mlp.outputWeights, dWout, mlp.mOutputW, mlp.vOutputW, mlp.t,
+		lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
+	adamUpdateInPlace(mlp.outputBias, dbOut, mlp.mOutputB, mlp.vOutputB, mlp.t,
+		lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
+	adamUpdateInPlace(mlp.hiddenWeights, dWhid, mlp.mHiddenW, mlp.vHiddenW, mlp.t,
+		lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
+	adamUpdateInPlace(mlp.hiddenBias, dbHidden, mlp.mHiddenB, mlp.vHiddenB, mlp.t,
+		lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
 	return dX
 }
 
 func (mlp *MLP) BackwardGradsOnly(grad *mat.Dense) (dX, dWhid, dbHidden, dWout, dbOut *mat.Dense) {
 
-    grad = expandGradToSeq(grad, mlp.lastInput)
+	grad = expandGradToSeq(grad, mlp.lastInput)
 
 	dWout = dot(grad, mlp.hiddenOutputs.T()).(*mat.Dense)
 	// sum gradients over time for biases
@@ -40,8 +63,8 @@ func (mlp *MLP) BackwardGradsOnly(grad *mat.Dense) (dX, dWhid, dbHidden, dWout, 
 		dbOut.Set(i, 0, s)
 	}
 
-	hiddenPre := toDense(dot(mlp.outputWeights.T(), grad))
-	hiddenErrors := multiply(hiddenPre, sigmoidPrime(mlp.hiddenOutputs)).(*mat.Dense)
+	hiddenGradOut := toDense(dot(mlp.outputWeights.T(), grad)) // dL/d(hidden_out)
+	hiddenErrors := multiply(hiddenGradOut, geluPrime(mlp.hiddenPreAct)).(*mat.Dense)
 
 	dWhid = toDense(dot(hiddenErrors, mlp.lastInput.T()))
 	dbHidden = mat.NewDense(mlp.hiddens, 1, nil)
@@ -57,14 +80,13 @@ func (mlp *MLP) BackwardGradsOnly(grad *mat.Dense) (dX, dWhid, dbHidden, dWout, 
 	return dX, dWhid, dbHidden, dWout, dbOut
 }
 
-
 // ForwardCol: one column only, returns (dModel x 1)
 func (mlp *MLP) ForwardCol(xCol *mat.Dense) *mat.Dense {
 	// hidden = sigmoid(W_hid*x + b_hid)
 	var h mat.Dense
-	h.Mul(mlp.hiddenWeights, xCol)      // (h x 1)
+	h.Mul(mlp.hiddenWeights, xCol) // (h x 1)
 	hb := addBias(toDense(&h), mlp.hiddenBias)
-	hs := apply(sigmoid, hb).(*mat.Dense)
+	hs := apply(geluApply, hb).(*mat.Dense)
 	// out = W_out*hidden + b_out
 	var o mat.Dense
 	o.Mul(mlp.outputWeights, hs)

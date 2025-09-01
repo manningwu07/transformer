@@ -68,22 +68,40 @@ func addScalar(i float64, m mat.Matrix) mat.Matrix {
 	return add(m, n)
 }
 
-func sigmoid(r, c int, z float64) float64 {
-	return 1.0 / (1 + math.Exp(-1*z))
+// -------- GELU activation (GPT-style) --------
+// Approximation used by GPT-2/3:
+// gelu(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715*x^3) ))
+// We provide:
+// - geluApply: shape-compatible with mat.Dense.Apply (i,j,v) -> value
+// - geluPrime: elementwise derivative given pre-activation matrix X
+
+func geluApply(i, j int, x float64) float64 {
+	const k = 0.7978845608028654 // sqrt(2/pi)
+	t := k * (x + 0.044715*x*x*x)
+	return 0.5 * x * (1.0 + math.Tanh(t))
 }
 
-func sigmoidPrime(m mat.Matrix) mat.Matrix {
+func geluPrime(m mat.Matrix) *mat.Dense {
 	r, c := m.Dims()
 	out := mat.NewDense(r, c, nil)
+	const k = 0.7978845608028654 // sqrt(2/pi)
 	for i := 0; i < r; i++ {
 		for j := 0; j < c; j++ {
-			v := m.At(i, j)
-			out.Set(i, j, v*(1.0-v))
+			x := m.At(i, j)
+			t := k * (x + 0.044715*x*x*x)
+			th := math.Tanh(t)
+			// sech^2(t) = 1 / cosh^2(t)
+			cosh := math.Cosh(t)
+			sech2 := 1.0 / (cosh * cosh)
+			dt := k * (1.0 + 3.0*0.044715*x*x)
+			// d/dx gelu approx:
+			// 0.5*(1 + tanh(t)) + 0.5*x*sech^2(t)*dt
+			grad := 0.5*(1.0+th) + 0.5*x*sech2*dt
+			out.Set(i, j, grad)
 		}
 	}
 	return out
 }
-
 // Masking stuff
 
 func addBias(m, bias *mat.Dense) *mat.Dense {

@@ -1,10 +1,7 @@
 package main
 
 import (
-	"encoding/csv"
-	"os"
 	"time"
-
 	"fmt"
 	"math/rand"
 
@@ -12,9 +9,16 @@ import (
 )
 
 // How many times does attn --> mlp happen
-var layers = 8
+
+
+// Adam Optimizer global vars
+var (
+	embM, embV *mat.Dense
+	embT       int
+)
 
 type TrainingConfig struct {
+	// Core transformer parameters
 	DModel     int // model width
 	HiddenSize int // MLP hidden
 	VocabSize  int // |V|
@@ -24,6 +28,14 @@ type TrainingConfig struct {
 	MLPLR      float64
 	UnembedLR  float64
 
+	// Optimization/training wheel parameters
+	NormLR     float64
+	WarmupSteps int     // linear warmup steps
+	DecaySteps  int     // cosine decay steps after warmup (0 = none)
+	AdamBeta1   float64 // default 0.9
+	AdamBeta2   float64 // default 0.999
+	AdamEps     float64 // default 1e-8
+
 	MaxEpochs int     // maximum number of epochs
 	Patience  int     // early stopping patience
 	Epsilon   float64 // stop if loss < epsilon
@@ -31,22 +43,30 @@ type TrainingConfig struct {
 	ValFrac   float64 // fraction of data held out for validation
 }
 
-// Reasonable defaults for small experiments
+var layers = 6
 var config = TrainingConfig{
-	DModel:     256, 
-	HiddenSize: 512, 
-	VocabSize:  16384, // Top number of 1-4 chars
+	DModel:     512, 
+	HiddenSize: 1024, 
+	VocabSize:  4096, // Top number of 1-4 chars
 	NumHeads:   8,    // dHead = DModel/NumHeads
-	SeqLen:     128,  // max context
-	AttnLR:     0.003, // simple SGD -> smaller LRs
-	MLPLR:      0.003,
-	UnembedLR:  0.003,
+	SeqLen:     64,  // max context
+	AttnLR:     0.0003,
+	MLPLR:      0.0003,
+	UnembedLR:  0.0003,
+	NormLR:     0.0003,
+	
 
 	MaxEpochs: 25,
 	Patience:  10,
 	Epsilon:   1e-4,
 	BatchSize: 1024, // each example is one prefix
 	ValFrac:   0.1,
+
+	WarmupSteps: 10_000,
+	DecaySteps:  1_000_000,
+	AdamBeta1:   0.9,
+	AdamBeta2:   0.999,
+	AdamEps:     1e-8,
 }
 
 func main() {
@@ -84,16 +104,7 @@ func main() {
 
 	fmt.Printf("Train (streaming): lines≈%d  Eval: from eval.en\n", linesCount)
 
-	// Create or truncate the log file
-	logFile, err := os.Create("training_log.csv")
-	if err != nil {
-		fmt.Println("Error creating log file:", err)
-		return
-	}
-	defer logFile.Close()
-	logWriter := csv.NewWriter(logFile)
-	logWriter.Write([]string{"epoch", "accuracy", "loss"})
-	defer logWriter.Flush()
+	adamStep := 0
 
 	for e := 0; e < config.MaxEpochs; e++ {
 		var totalLoss float64
@@ -113,9 +124,11 @@ func main() {
 					continue
 				}
 			}
+
 			if len(ids) < 2 {
 				continue
 			}
+
 			i := rand.Intn(len(ids) - 1) // predict ids[i+1]
 			start := 0
 			if i+1 > config.SeqLen {
@@ -128,12 +141,25 @@ func main() {
 			for i := 0; i < layers; i++ {
 				Y = gpt.blocks[i].Forward(Y)
 			}
+
 			// take last position only
 			yLast := lastCol(Y)
 			logits := Unembed(yLast)
 
 			// Loss + gradient
 			loss, gradLogits := CrossEntropyWithGrad(logits, target)
+
+
+			adamStep++
+			attnLR := LRSchedule(adamStep, config.AttnLR)
+			mlpLR := LRSchedule(adamStep, config.MLPLR)
+			normLR := LRSchedule(adamStep, config.NormLR)
+			unembedLR := LRSchedule(adamStep, config.UnembedLR)
+			for i := 0; i < layers; i++ {
+				gpt.blocks[i].attn.learningRate = attnLR
+				gpt.blocks[i].mlp.learningRate = mlpLR
+				gpt.blocks[i].ln1.learningRate, gpt.blocks[i].ln2.learningRate = normLR, normLR
+			}
 
 			totalLoss += loss
 			steps++
@@ -143,7 +169,10 @@ func main() {
 			dyLast := toDense(dot(emb, gradLogits))
 			// dEmb = yLast * (p - t)^T
 			dEmb := toDense(dot(yLast, gradLogits.T()))
-			emb = toDense(add(emb, scale(-config.UnembedLR, dEmb)))
+			
+			initEmbAdamIfNeeded()
+			embT++
+			adamUpdateInPlace(emb, dEmb, embM, embV, embT, unembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
 
 			// Backprop only last timestep: expand to sequence (allocs per step minimized)
 			dY := mat.NewDense(config.DModel, Xctx.RawMatrix().Cols, nil)

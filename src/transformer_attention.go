@@ -7,6 +7,37 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
+type Attention struct {
+	H            int
+	dModel       int
+	dHead        int
+	Wquery       []*mat.Dense
+	Wkey         []*mat.Dense
+	Wvalue       []*mat.Dense
+	Woutput      *mat.Dense
+	learningRate float64
+
+	// Adam
+	t        int
+	mWq, vWq []*mat.Dense
+	mWk, vWk []*mat.Dense
+	mWv, vWv []*mat.Dense
+	mWo, vWo *mat.Dense
+
+	// cache for backprop
+	X       *mat.Dense
+	Q, K, V []*mat.Dense
+	Scores  []*mat.Dense
+	A       []*mat.Dense
+	O       []*mat.Dense
+	O_cat   *mat.Dense
+
+	// Performance optimization
+	maskCache map[int]*mat.Dense
+	lastT     int
+	parallel  bool // parallelize over heads if true
+}
+
 // Attention forward/backward.
 func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 	attn.X = X
@@ -72,14 +103,18 @@ func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 func (attn *Attention) Backward(dY *mat.Dense) *mat.Dense {
 	dX, dWq, dWk, dWv, dWout := attn.BackwardGradsOnly(dY)
 
-	// === Apply updates ===
+	attn.t++
 	lr := attn.learningRate
 	for h := 0; h < attn.H; h++ {
-		attn.Wquery[h] = add(attn.Wquery[h], scale(-lr, dWq[h])).(*mat.Dense)
-		attn.Wkey[h] = add(attn.Wkey[h], scale(-lr, dWk[h])).(*mat.Dense)
-		attn.Wvalue[h] = add(attn.Wvalue[h], scale(-lr, dWv[h])).(*mat.Dense)
+		adamUpdateInPlace(attn.Wquery[h], dWq[h], attn.mWq[h], attn.vWq[h], attn.t,
+			lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
+		adamUpdateInPlace(attn.Wkey[h], dWk[h], attn.mWk[h], attn.vWk[h], attn.t,
+			lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
+		adamUpdateInPlace(attn.Wvalue[h], dWv[h], attn.mWv[h], attn.vWv[h], attn.t,
+			lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
 	}
-	attn.Woutput = add(attn.Woutput, scale(-lr, dWout)).(*mat.Dense)
+	adamUpdateInPlace(attn.Woutput, dWout, attn.mWo, attn.vWo, attn.t,
+		lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
 
 	return dX
 }

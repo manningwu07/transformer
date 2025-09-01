@@ -89,3 +89,94 @@ func matrixNorm(m *mat.Dense) float64 {
     }
     return math.Sqrt(s)
 }
+// ------- LayerNorm --------
+
+// ensureNorms lazily allocates LayerNorms if they are nil.
+func (b *TransformerBlock) ensureNorms(d int) {
+	if b.ln1 == nil {
+		b.ln1 = NewLayerNorm(d, 1e-5, config.NormLR)
+	}
+	if b.ln2 == nil {
+		b.ln2 = NewLayerNorm(d, 1e-5, config.NormLR)
+	}
+}
+
+// ------- LR schedule: linear warmup, then cosine decay --------
+func LRSchedule(step int, peak float64) float64 {
+	if step <= 0 {
+		return 0
+	}
+	wu := config.WarmupSteps
+	dec := config.DecaySteps
+	if wu > 0 && step < wu {
+		return peak * float64(step) / float64(wu)
+	}
+	if dec > 0 {
+		x := float64(step-wu) / float64(dec)
+		if x > 1 {
+			x = 1
+		} else if x < 0 {
+			x = 0
+		}
+		scale := 0.5 * (1 + math.Cos(math.Pi*x))
+		return peak * scale
+	}
+	return peak
+}
+
+// ------- Adam optimizer (in-place) --------
+
+func initEmbAdamIfNeeded() {
+	if emb != nil && embM == nil {
+		embM = zerosLike(emb)
+		embV = zerosLike(emb)
+		embT = 0
+	}
+}
+
+// p -= lr * mhat / (sqrt(vhat)+eps) with bias correction.
+func adamUpdateInPlace(
+	p, g, m, v *mat.Dense,
+	t int,
+	lr, beta1, beta2, eps float64,
+) {
+	pr, pc := p.Dims()
+	if gr, gc := g.Dims(); gr != pr || gc != pc {
+		panic("adamUpdateInPlace: grad shape mismatch")
+	}
+	if mr, mc := m.Dims(); mr != pr || mc != pc {
+		panic("adamUpdateInPlace: m shape mismatch")
+	}
+	if vr, vc := v.Dims(); vr != pr || vc != pc {
+		panic("adamUpdateInPlace: v shape mismatch")
+	}
+	b1t := math.Pow(beta1, float64(t))
+	b2t := math.Pow(beta2, float64(t))
+	c1 := 1.0 / (1.0 - b1t)
+	c2 := 1.0 / (1.0 - b2t)
+	for i := 0; i < pr; i++ {
+		for j := 0; j < pc; j++ {
+			gij := g.At(i, j)
+			mij := beta1*m.At(i, j) + (1.0-beta1)*gij
+			vij := beta2*v.At(i, j) + (1.0-beta2)*gij*gij
+			mhat := mij * c1
+			vhat := vij * c2
+			pij := p.At(i, j) - lr*mhat/(math.Sqrt(vhat)+eps)
+			m.Set(i, j, mij)
+			v.Set(i, j, vij)
+			p.Set(i, j, pij)
+		}
+	}
+}
+
+func zerosLike(a *mat.Dense) *mat.Dense {
+	r, c := a.Dims()
+	return mat.NewDense(r, c, nil)
+}
+
+func onesLike(a *mat.Dense) *mat.Dense {
+	r, c := a.Dims()
+	out := mat.NewDense(r, c, nil)
+	for i := 0; i < r; i++ { for j := 0; j < c; j++ { out.Set(i, j, 1) } }
+	return out
+}
