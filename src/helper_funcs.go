@@ -11,6 +11,25 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
+
+// ChatCLI
+
+func chatCLI(gpt *Transformer) {
+    reader := bufio.NewReader(os.Stdin)
+    fmt.Println("ChatGPT-like CLI. Type 'exit' to quit.")
+    for {
+        fmt.Print("You: ")
+        input, _ := reader.ReadString('\n')
+        input = strings.TrimSpace(input)
+        if input == "exit" {
+            break
+        }
+        // Generate up to 50 tokens
+        out := gpt.Predict(input, 50)
+        fmt.Println("Bot:", strings.Join(out, " "))
+    }
+}
+
 // Guard functions
 func chooseValidHeads(dModel, preferred int) int {
     if preferred <= 0 {
@@ -91,25 +110,6 @@ func matrixNorm(m *mat.Dense) float64 {
         }
     }
     return math.Sqrt(s)
-}
-
-// ChatCLI
-
-
-func chatCLI(gpt *Transformer) {
-    reader := bufio.NewReader(os.Stdin)
-    fmt.Println("ChatGPT-like CLI. Type 'exit' to quit.")
-    for {
-        fmt.Print("You: ")
-        input, _ := reader.ReadString('\n')
-        input = strings.TrimSpace(input)
-        if input == "exit" {
-            break
-        }
-        // Generate up to 50 tokens
-        out := gpt.Predict(input, 50)
-        fmt.Println("Bot:", strings.Join(out, " "))
-    }
 }
 
 
