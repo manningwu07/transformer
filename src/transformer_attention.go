@@ -101,6 +101,18 @@ func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 		for h := 0; h < attn.H; h++ { work(h) }
 	}
 	attn.O_cat = headsCat
+	// Debug: quick sanity check on head 0 attention row sums.
+    if config.Debug && attn.H > 0 && attn.t%config.DebugEvery == 0 {
+        a := attn.A[0]
+        if a != nil {
+            rs := RowSums(a)
+            mn, mx := rs[0], rs[0]
+            for _, v := range rs { if v < mn { mn = v }; if v > mx { mx = v } }
+            debugf("Attn: head0 A row-sum min/max = %.4f/%.4f (T=%d)", mn, mx,
+                len(rs))
+        }
+    }
+
 	Y := toDense(dot(attn.Woutput, headsCat)) // (dModel x 1)
 	return Y
 }
@@ -111,16 +123,33 @@ func (attn *Attention) Backward(dY *mat.Dense) *mat.Dense {
 
 	attn.t++
 	lr := attn.learningRate
+
+	// Global per-module grad clipping (includes all heads + Wout)
+    if config.GradClip > 0 {
+        // flatten slice for clip call
+        grads := []*mat.Dense{dWout}
+        for h := 0; h < attn.H; h++ {
+            grads = append(grads, dWq[h], dWk[h], dWv[h])
+        }
+        s := clipGrads(config.GradClip, grads...)
+        if s < 1.0 && config.Debug && attn.t%config.DebugEvery == 0 {
+            debugf("Attn: clipped grads by %.4f at step %d", s, attn.t)
+        }
+    }
+
 	for h := 0; h < attn.H; h++ {
-		adamUpdateInPlace(attn.Wquery[h], dWq[h], attn.mWq[h], attn.vWq[h], attn.t,
-			lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
-		adamUpdateInPlace(attn.Wkey[h], dWk[h], attn.mWk[h], attn.vWk[h], attn.t,
-			lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
-		adamUpdateInPlace(attn.Wvalue[h], dWv[h], attn.mWv[h], attn.vWv[h], attn.t,
-			lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
+		 adamUpdateInPlace(attn.Wquery[h], dWq[h], attn.mWq[h], attn.vWq[h],
+            attn.t, lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+            config.WeightDecay)
+        adamUpdateInPlace(attn.Wkey[h], dWk[h], attn.mWk[h], attn.vWk[h],
+            attn.t, lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+            config.WeightDecay)
+        adamUpdateInPlace(attn.Wvalue[h], dWv[h], attn.mWv[h], attn.vWv[h],
+            attn.t, lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+            config.WeightDecay)
 	}
-	adamUpdateInPlace(attn.Woutput, dWout, attn.mWo, attn.vWo, attn.t,
-		lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
+	adamUpdateInPlace(attn.Woutput, dWout, attn.mWo, attn.vWo, attn.t, lr,
+        config.AdamBeta1, config.AdamBeta2, config.AdamEps, config.WeightDecay)
 
 	return dX
 }

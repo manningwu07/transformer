@@ -41,6 +41,12 @@ type TrainingConfig struct {
 	Epsilon   float64 // stop if loss < epsilon
 	BatchSize int     // mini-batch size
 	ValFrac   float64 // fraction of data held out for validation
+
+	// Stability parameters
+	GradClip    float64 // <=0 disables (default 1.0 is a good start)
+	WeightDecay float64 // AdamW-style, e.g., 0.01; 0 disables
+	Debug       bool    // enable periodic debug logs
+	DebugEvery  int     // print every N optimizer steps
 }
 
 var layers = 6
@@ -66,6 +72,11 @@ var config = TrainingConfig{
 	AdamBeta1:   0.9,
 	AdamBeta2:   0.999,
 	AdamEps:     1e-8,
+
+	GradClip:    1.0,
+	WeightDecay: 0.01,
+	Debug:       true,
+	DebugEvery:  1000,
 }
 
 func main() {
@@ -156,9 +167,9 @@ func main() {
 			unembedLR := LRSchedule(adamStep, config.UnembedLR)
 
 			// Freeze embeddings during early warmup to avoid regressions
-            if adamStep < config.WarmupSteps/2 {
-                unembedLR = 0
-            }
+			if adamStep < config.WarmupSteps/2 {
+				unembedLR = 0
+			}
 
 			for i := 0; i < layers; i++ {
 				gpt.blocks[i].attn.learningRate = attnLR
@@ -177,7 +188,11 @@ func main() {
 
 			initEmbAdamIfNeeded()
 			embT++
-			adamUpdateInPlace(emb, dEmb, embM, embV, embT, unembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
+			adamUpdateInPlace(
+				emb, dEmb, embM, embV, embT,
+				unembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+				0.0, 
+			)
 
 			// Backprop only last timestep: reuse dY buffer
 			cols := Xctx.RawMatrix().Cols
@@ -223,20 +238,20 @@ func main() {
 		// --- Early stopping logic based on loss improvement and accuracy checkpointing ---
 		// Check if the current accuracy is the best we've seen so far.
 		if accuracy > bestAccuracy && e > 20 {
-            bestAccuracy = accuracy
-            // Deep copy weights
-            tmpFile := "models/tmp_best.gob"
-            if err := SaveTransformer(&gpt, tmpFile); err == nil {
-                var clone Transformer = CreateGPT(config.DModel, config.HiddenSize, config.VocabSize, config.AttnLR, config.MLPLR)
-                if err := LoadTransformer(&clone, tmpFile); err == nil {
-                    bestModel = clone
-                }
-                _ = os.Remove(tmpFile)
-            }
-            noImprovementCount = 0
-        } else {
-            noImprovementCount++
-        }
+			bestAccuracy = accuracy
+			// Deep copy weights
+			tmpFile := "models/tmp_best.gob"
+			if err := SaveTransformer(&gpt, tmpFile); err == nil {
+				var clone Transformer = CreateGPT(config.DModel, config.HiddenSize, config.VocabSize, config.AttnLR, config.MLPLR)
+				if err := LoadTransformer(&clone, tmpFile); err == nil {
+					bestModel = clone
+				}
+				_ = os.Remove(tmpFile)
+			}
+			noImprovementCount = 0
+		} else {
+			noImprovementCount++
+		}
 
 		// The loop now breaks if we've seen enough epochs without a new best accuracy.
 		if noImprovementCount >= config.Patience {
@@ -263,6 +278,4 @@ func main() {
 		fmt.Println("Saved the best performing model.")
 		chatCLI(&gpt)
 	}
-
-	
 }

@@ -36,14 +36,25 @@ func (mlp *MLP) Backward(grad *mat.Dense) *mat.Dense {
 	dX, dWhid, dbHidden, dWout, dbOut := mlp.BackwardGradsOnly(grad)
 	mlp.t++
 	lr := mlp.learningRate
-	adamUpdateInPlace(mlp.outputWeights, dWout, mlp.mOutputW, mlp.vOutputW, mlp.t,
-		lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
-	adamUpdateInPlace(mlp.outputBias, dbOut, mlp.mOutputB, mlp.vOutputB, mlp.t,
-		lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
-	adamUpdateInPlace(mlp.hiddenWeights, dWhid, mlp.mHiddenW, mlp.vHiddenW, mlp.t,
-		lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
-	adamUpdateInPlace(mlp.hiddenBias, dbHidden, mlp.mHiddenB, mlp.vHiddenB, mlp.t,
-		lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps)
+    // Optional global clipping for this module
+    if config.GradClip > 0 {
+        s := clipGrads(config.GradClip, dWout, dWhid, dbOut, dbHidden)
+        if s < 1.0 && config.Debug && mlp.t%config.DebugEvery == 0 {
+            debugf("MLP: clipped grads by %.4f at step %d", s, mlp.t)
+        }
+    }
+
+    // AdamW: weight decay only on weights, not biases
+    adamUpdateInPlace(mlp.outputWeights, dWout, mlp.mOutputW, mlp.vOutputW,
+        mlp.t, lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+        config.WeightDecay)
+    adamUpdateInPlace(mlp.outputBias, dbOut, mlp.mOutputB, mlp.vOutputB, mlp.t,
+        lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps, 0.0)
+    adamUpdateInPlace(mlp.hiddenWeights, dWhid, mlp.mHiddenW, mlp.vHiddenW,
+        mlp.t, lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+        config.WeightDecay)
+    adamUpdateInPlace(mlp.hiddenBias, dbHidden, mlp.mHiddenB, mlp.vHiddenB,
+        mlp.t, lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps, 0.0)
 	return dX
 }
 

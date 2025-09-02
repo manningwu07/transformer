@@ -17,6 +17,8 @@ func (gpt *Transformer) Predict(input string, maxLen int) []string {
 		panic("embeddings not initialized; call loadTrainingSet first")
 	}
 
+	// make sure <eos> is present at inference time
+    ensureEOSToken()
 	// Tokenize into 1–4 char pieces
 	toks := tokenizeENPieces(input)
 	// Start with <bos> + prompt

@@ -82,11 +82,11 @@ func (ln *LayerNorm) Backward(dY *mat.Dense) *mat.Dense {
 	ln.t++
 	adamUpdateInPlace(
 		ln.gamma, dGamma, ln.mGamma, ln.vGamma, ln.t, ln.learningRate,
-		config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+        config.AdamBeta1, config.AdamBeta2, config.AdamEps, 0.0,
 	)
 	adamUpdateInPlace(
 		ln.beta, dBeta, ln.mBeta, ln.vBeta, ln.t, ln.learningRate,
-		config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+        config.AdamBeta1, config.AdamBeta2, config.AdamEps, 0.0,
 	)
 	return dX
 }

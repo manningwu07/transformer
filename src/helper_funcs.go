@@ -7,10 +7,10 @@ import (
 	"math/rand"
 	"os"
 	"strings"
+	"time"
 
 	"gonum.org/v1/gonum/mat"
 )
-
 
 // ChatCLI
 
@@ -26,9 +26,26 @@ func chatCLI(gpt *Transformer) {
         }
         // Generate up to 50 tokens
         out := gpt.Predict(input, 50)
-        fmt.Println("Bot:", strings.Join(out, " "))
+         fmt.Println("Bot:", renderTokens(out))
     }
 }
+
+// renderTokens concatenates tokens and treats <eos> as newline.
+func renderTokens(toks []string) string {
+    if len(toks) == 0 {
+        return ""
+    }
+    var sb strings.Builder
+    for _, tk := range toks {
+        if tk == "<eos>" {
+            sb.WriteString("\n")
+            break
+        }
+        sb.WriteString(tk)
+    }
+    return sb.String()
+}
+
 
 // Guard functions
 func chooseValidHeads(dModel, preferred int) int {
@@ -113,6 +130,34 @@ func matrixNorm(m *mat.Dense) float64 {
 }
 
 
+// ------- EOS helpers (inference-time safety) --------
+// Ensure <eos> exists in vocab/emb. If added, append a small-random row in emb.
+func ensureEOSToken() {
+    const eos = "<eos>"
+    if vocab.TokenToID == nil {
+        return
+    }
+    if _, ok := vocab.TokenToID[eos]; ok {
+        return
+    }
+    id := len(vocab.IDToToken)
+    vocab.TokenToID[eos] = id
+    vocab.IDToToken = append(vocab.IDToToken, eos)
+    if emb != nil {
+        r, c := emb.Dims()
+        if r == id { // need to grow by 1
+            ne := mat.NewDense(r+1, c, nil)
+            ne.Slice(0, r, 0, c).(*mat.Dense).Copy(emb)
+            // small random row
+            for j := 0; j < c; j++ {
+                ne.Set(r, j, (rand.Float64()-0.5)*1e-3)
+            }
+            emb = ne
+        }
+    }
+}
+
+
 // ------- LayerNorm --------
 
 // ensureNorms lazily allocates LayerNorms if they are nil.
@@ -158,11 +203,75 @@ func initEmbAdamIfNeeded() {
 	}
 }
 
+// Small helpers for debugging and clipping.
+func matFroNorm(a *mat.Dense) float64 {
+    r, c := a.Dims()
+    s := 0.0
+    for i := 0; i < r; i++ {
+        for j := 0; j < c; j++ {
+            v := a.At(i, j)
+            s += v * v
+        }
+    }
+    return math.Sqrt(s)
+}
+
+func scaleInPlace(a *mat.Dense, s float64) {
+    if s == 1.0 {
+        return
+    }
+    r, c := a.Dims()
+    for i := 0; i < r; i++ {
+        for j := 0; j < c; j++ {
+            a.Set(i, j, a.At(i, j)*s)
+        }
+    }
+}
+
+// clipGrads scales all grads so their combined norm <= maxNorm.
+// Returns the scale actually applied (<=1.0) or 1.0 if no clip.
+func clipGrads(maxNorm float64, grads ...*mat.Dense) float64 {
+    if maxNorm <= 0 {
+        return 1.0
+    }
+    sum := 0.0
+  	for _, g := range grads {
+       if g == nil {
+           continue
+       }
+       n := matFroNorm(g)
+        sum += n * n
+    }
+    gn := math.Sqrt(sum)
+    if gn <= maxNorm || gn == 0 {
+        return 1.0
+    }
+    s := maxNorm / gn
+    for _, g := range grads {
+        if g != nil {
+            scaleInPlace(g, s)
+        }
+    }
+    return s
+}
+
+// gated debug print
+func debugf(format string, args ...any) {
+    if !config.Debug {
+        return
+    }
+    // timestamp to help correlate across goroutines
+    ts := time.Now().Format("15:04:05.000")
+    fmt.Printf("[DBG %s] %s\n", ts, fmt.Sprintf(format, args...))
+}
+
+// p -= lr * (mhat/(sqrt(vhat)+eps) + wd * p) with bias correction (AdamW).
+
 // p -= lr * mhat / (sqrt(vhat)+eps) with bias correction.
 func adamUpdateInPlace(
 	p, g, m, v *mat.Dense,
 	t int,
-	lr, beta1, beta2, eps float64,
+	lr, beta1, beta2, eps, weightDecay float64,
 ) {
 	pr, pc := p.Dims()
 	if gr, gc := g.Dims(); gr != pr || gc != pc {
@@ -185,7 +294,10 @@ func adamUpdateInPlace(
 			vij := beta2*v.At(i, j) + (1.0-beta2)*gij*gij
 			mhat := mij * c1
 			vhat := vij * c2
-			pij := p.At(i, j) - lr*mhat/(math.Sqrt(vhat)+eps)
+			denom := math.Sqrt(vhat) + eps
+            wdTerm := weightDecay * p.At(i, j)
+            update := mhat/denom + wdTerm
+            pij := p.At(i, j) - lr*update
 			m.Set(i, j, mij)
 			v.Set(i, j, vij)
 			p.Set(i, j, pij)
