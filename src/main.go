@@ -75,7 +75,7 @@ var config = TrainingConfig{
 
 	GradClip:    1.0,
 	WeightDecay: 0.01,
-	Debug:       true,
+	Debug:       false,
 	DebugEvery:  1000,
 }
 
@@ -158,7 +158,7 @@ func main() {
 			logits := Unembed(yLast)
 
 			// Loss + gradient
-			loss, gradLogits := CrossEntropyWithGrad(logits, target)
+			loss, _ := CrossEntropyWithGrad(logits, target)
 
 			adamStep++
 			attnLR := LRSchedule(adamStep, config.AttnLR)
@@ -180,35 +180,51 @@ func main() {
 			totalLoss += loss
 			steps++
 
-			// Backprop through tied unembedding: logits = emb^T * yLast
-			// dyLast = emb * (p - t)
-			dyLast := toDense(dot(emb, gradLogits))
-			// dEmb = yLast * (p - t)^T
-			dEmb := toDense(dot(yLast, gradLogits.T()))
+	// -------- FULL-SEQUENCE LOSS --------
+    cols := Xctx.RawMatrix().Cols
+    dY := dYbuf.Slice(0, config.DModel, 0, cols).(*mat.Dense)
+    // zero dY
+    r, c := dY.Dims()
+    for i := 0; i < r; i++ {
+        for j := 0; j < c; j++ {
+            dY.Set(i, j, 0)
+        }
+    }
 
-			initEmbAdamIfNeeded()
-			embT++
-			adamUpdateInPlace(
-				emb, dEmb, embM, embV, embT,
-				unembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
-				0.0, 
-			)
+    // accumulate loss and grads for every timestep
+    totalLoss := 0.0
+    dEmb := mat.NewDense(emb.RawMatrix().Rows, emb.RawMatrix().Cols, nil)
+    for t := 0; t < cols-1; t++ {
+        // logits at time t: (vocab x 1) = emb * y[:,t]
+        yCol := Y.Slice(0, config.DModel, t, t+1).(*mat.Dense)
+        logits := toDense(dot(emb.T(), yCol)) // (VocabSize x 1)
 
-			// Backprop only last timestep: reuse dY buffer
-			cols := Xctx.RawMatrix().Cols
-			dY := dYbuf.Slice(0, config.DModel, 0, cols).(*mat.Dense)
-			// zero dY quickly
-			{
-				r, c := dY.Dims()
-				for i := 0; i < r; i++ {
-					for j := 0; j < c; j++ {
-						dY.Set(i, j, 0)
-					}
-				}
-			}
-			for i := 0; i < config.DModel; i++ {
-				dY.Set(i, cols-1, dyLast.At(i, 0))
-			}
+        // target is token at position t+1
+        goldID := ids[t+1]
+        target := oneHot(config.VocabSize, goldID)
+
+        loss, gradLogits := CrossEntropyWithGrad(logits, target)
+        totalLoss += loss
+
+        // dY[:,t] = emb^T * (p - t)
+        dyCol := toDense(dot(emb, gradLogits)) // (DModel x 1)
+        for i := 0; i < config.DModel; i++ {
+            dY.Set(i, t, dyCol.At(i, 0))
+        }
+
+        // accumulate dEmb += (p - t) * yCol^T
+        dEmb.Add(dEmb, toDense(dot(yCol, gradLogits.T())))
+    }
+
+    // update embeddings with AdamW
+    initEmbAdamIfNeeded()
+    embT++
+    if config.GradClip > 0 {
+        clipGrads(config.GradClip, dEmb)
+    }
+    adamUpdateInPlace(emb, dEmb, embM, embV, embT,
+        unembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+        config.WeightDecay)
 
 			for i := layers - 1; i >= 0; i-- {
 				dY = gpt.blocks[i].Backward(dY)

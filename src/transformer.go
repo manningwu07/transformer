@@ -22,6 +22,7 @@ func (gpt *Transformer) Predict(input string, maxLen int) []string {
 	// Tokenize into 1–4 char pieces
 	toks := tokenizeENPieces(input)
 	// Start with <bos> + prompt
+	toks = append(toks, "<eos>")
 	seq := append([]string{"<bos>"}, toks...)
 	ids := make([]int, len(seq))
 	for i, t := range seq {
