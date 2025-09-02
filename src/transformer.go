@@ -41,7 +41,7 @@ func (gpt *Transformer) Predict(input string, maxLen int) []string {
 	for steps := 0; steps < maxLen; steps++ {
 		logits := Unembed(yLast)
 		probs := ColVectorSoftmax(logits)
-		nextID := argmaxVec	(probs)
+		nextID := argmaxVec(probs)
 		nextTok := vocab.IDToToken[nextID]
 		if nextTok == "<eos>" {
 			break
@@ -81,37 +81,40 @@ func RowSums(m *mat.Dense) []float64 {
 	return out
 }
 
-
 // SaveTransformer persists a Transformer (weights only) to disk using gob.
 // It serializes numeric weights for attention (all heads), output projection,
 // and MLP (weights + biases). It also saves embeddings and vocab if available.
 // filename should be a path to create/overwrite.
+
+type headData struct {
+	WqData   []float64
+	WqR, WqC int
+	WkData   []float64
+	WkR, WkC int
+	WvData   []float64
+	WvR, WvC int
+}
+type blockData struct {
+	Heads             []headData
+	WoData            []float64
+	WoR, WoC          int
+	HiddenW           []float64
+	HiddenWR          int
+	HiddenWC          int
+	HiddenB           []float64
+	HiddenBR          int
+	HiddenBC          int
+	OutputW           []float64
+	OutputWR          int
+	OutputWC          int
+	OutputB           []float64
+	OutputBR          int
+	OutputBC          int
+	Ln1Gamma, Ln1Beta []float64
+	Ln2Gamma, Ln2Beta []float64
+}
+
 func SaveTransformer(gpt *Transformer, filename string) error {
-	type headData struct {
-		WqData       []float64
-		WqR, WqC     int
-		WkData       []float64
-		WkR, WkC     int
-		WvData       []float64
-		WvR, WvC     int
-	}
-	type blockData struct {
-		Heads        []headData
-		WoData       []float64
-		WoR, WoC     int
-		HiddenW      []float64
-		HiddenWR     int
-		HiddenWC     int
-		HiddenB      []float64
-		HiddenBR     int
-		HiddenBC     int
-		OutputW      []float64
-		OutputWR     int
-		OutputWC     int
-		OutputB      []float64
-		OutputBR     int
-		OutputBC     int
-	}
 	data := struct {
 		Layers  int
 		Blocks  []blockData
@@ -163,17 +166,32 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 			// hidden weights/bias
 			if mlp.hiddenWeights != nil {
 				r, c := mlp.hiddenWeights.Dims()
-			raw := mat.DenseCopyOf(mlp.hiddenWeights).RawMatrix()
-			data.Blocks[i].HiddenWR, data.Blocks[i].HiddenWC = r, c
-			data.Blocks[i].HiddenW = append([]float64(nil), raw.Data...)
-		}
-		if mlp.hiddenBias != nil {
-			r, c := mlp.hiddenBias.Dims()
-			raw := mat.DenseCopyOf(mlp.hiddenBias).RawMatrix()
-			data.Blocks[i].HiddenBR, data.Blocks[i].HiddenBC = r, c
-			data.Blocks[i].HiddenB = append([]float64(nil), raw.Data...)
-		}
-		// output weights/bias
+				raw := mat.DenseCopyOf(mlp.hiddenWeights).RawMatrix()
+				data.Blocks[i].HiddenWR, data.Blocks[i].HiddenWC = r, c
+				data.Blocks[i].HiddenW = append([]float64(nil), raw.Data...)
+			}
+
+			// LayerNorms
+			if b.ln1 != nil {
+				gRaw := mat.DenseCopyOf(b.ln1.gamma).RawMatrix()
+				bRaw := mat.DenseCopyOf(b.ln1.beta).RawMatrix()
+				data.Blocks[i].Ln1Gamma = append([]float64(nil), gRaw.Data...)
+				data.Blocks[i].Ln1Beta = append([]float64(nil), bRaw.Data...)
+			}
+			if b.ln2 != nil {
+				gRaw := mat.DenseCopyOf(b.ln2.gamma).RawMatrix()
+				bRaw := mat.DenseCopyOf(b.ln2.beta).RawMatrix()
+				data.Blocks[i].Ln2Gamma = append([]float64(nil), gRaw.Data...)
+				data.Blocks[i].Ln2Beta = append([]float64(nil), bRaw.Data...)
+			}
+
+			if mlp.hiddenBias != nil {
+				r, c := mlp.hiddenBias.Dims()
+				raw := mat.DenseCopyOf(mlp.hiddenBias).RawMatrix()
+				data.Blocks[i].HiddenBR, data.Blocks[i].HiddenBC = r, c
+				data.Blocks[i].HiddenB = append([]float64(nil), raw.Data...)
+			}
+			// output weights/bias
 			if mlp.outputWeights != nil {
 				r, c := mlp.outputWeights.Dims()
 				raw := mat.DenseCopyOf(mlp.outputWeights).RawMatrix()
@@ -204,36 +222,11 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 		return err
 	}
 	return os.WriteFile(filename, buf.Bytes(), 0644)
- }
+}
 
 // LoadTransformer loads a Transformer saved by SaveTransformer into the provided gpt.
 // It overwrites the blocks' attention and MLP weights. Also restores embeddings/vocab if present.
 func LoadTransformer(gpt *Transformer, filename string) error {
-	type headData struct {
-		WqData       []float64
-		WqR, WqC     int
-		WkData       []float64
-		WkR, WkC     int
-		WvData       []float64
-		WvR, WvC     int
-	}
-	type blockData struct {
-		Heads        []headData
-		WoData       []float64
-		WoR, WoC     int
-		HiddenW      []float64
-		HiddenWR     int
-		HiddenWC     int
-		HiddenB      []float64
-		HiddenBR     int
-		HiddenBC     int
-		OutputW      []float64
-		OutputWR     int
-		OutputWC     int
-		OutputB      []float64
-		OutputBR     int
-		OutputBC     int
-	}
 	data := struct {
 		Layers  int
 		Blocks  []blockData
@@ -293,6 +286,15 @@ func LoadTransformer(gpt *Transformer, filename string) error {
 				mlp.outputBias = mat.NewDense(data.Blocks[i].OutputBR, data.Blocks[i].OutputBC, data.Blocks[i].OutputB)
 			}
 		}
+		// LayerNorm
+		if len(data.Blocks[i].Ln1Gamma) > 0 {
+            b.ln1.gamma = mat.NewDense(b.ln1.d, 1, data.Blocks[i].Ln1Gamma)
+            b.ln1.beta  = mat.NewDense(b.ln1.d, 1, data.Blocks[i].Ln1Beta)
+        }
+        if len(data.Blocks[i].Ln2Gamma) > 0 {
+            b.ln2.gamma = mat.NewDense(b.ln2.d, 1, data.Blocks[i].Ln2Gamma)
+            b.ln2.beta  = mat.NewDense(b.ln2.d, 1, data.Blocks[i].Ln2Beta)
+        }
 	}
 	// Restore embeddings and vocab if present
 	if data.EmbR > 0 && data.EmbC > 0 && len(data.EmbData) == data.EmbR*data.EmbC {

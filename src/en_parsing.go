@@ -254,8 +254,8 @@ func isASCIIString(s string) bool {
 
 func findEnglishFile() string {
     candidates := []string{
-    //    "../data/test/train.en",
-        "../data/raw/train.eng",
+       "../data/test/train.en",
+        // "../data/raw/train.eng",
     }
     for _, p := range candidates {
         if fileExists(p) { return p }

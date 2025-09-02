@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"strings"
 
 	"gonum.org/v1/gonum/mat"
 )
@@ -89,6 +92,27 @@ func matrixNorm(m *mat.Dense) float64 {
     }
     return math.Sqrt(s)
 }
+
+// ChatCLI
+
+
+func chatCLI(gpt *Transformer) {
+    reader := bufio.NewReader(os.Stdin)
+    fmt.Println("ChatGPT-like CLI. Type 'exit' to quit.")
+    for {
+        fmt.Print("You: ")
+        input, _ := reader.ReadString('\n')
+        input = strings.TrimSpace(input)
+        if input == "exit" {
+            break
+        }
+        // Generate up to 50 tokens
+        out := gpt.Predict(input, 50)
+        fmt.Println("Bot:", strings.Join(out, " "))
+    }
+}
+
+
 // ------- LayerNorm --------
 
 // ensureNorms lazily allocates LayerNorms if they are nil.

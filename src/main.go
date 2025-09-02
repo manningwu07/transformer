@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"os"
 	"time"
 
 	"gonum.org/v1/gonum/mat"
@@ -51,11 +52,11 @@ var config = TrainingConfig{
 	SeqLen:     64,   // max context
 	AttnLR:     0.0003,
 	MLPLR:      0.0003,
-	UnembedLR:  0.0003,
+	UnembedLR:  0.00003,
 	NormLR:     0.0003,
 
-	MaxEpochs: 25,
-	Patience:  10,
+	MaxEpochs: 1000,
+	Patience:  50,
 	Epsilon:   1e-4,
 	BatchSize: 1024, // each example is one prefix
 	ValFrac:   0.1,
@@ -153,6 +154,12 @@ func main() {
 			mlpLR := LRSchedule(adamStep, config.MLPLR)
 			normLR := LRSchedule(adamStep, config.NormLR)
 			unembedLR := LRSchedule(adamStep, config.UnembedLR)
+
+			// Freeze embeddings during early warmup to avoid regressions
+            if adamStep < config.WarmupSteps/2 {
+                unembedLR = 0
+            }
+
 			for i := 0; i < layers; i++ {
 				gpt.blocks[i].attn.learningRate = attnLR
 				gpt.blocks[i].mlp.learningRate = mlpLR
@@ -215,13 +222,21 @@ func main() {
 
 		// --- Early stopping logic based on loss improvement and accuracy checkpointing ---
 		// Check if the current accuracy is the best we've seen so far.
-		if accuracy > bestAccuracy && e > 5 { // Second condition is to prevent the gpt from being cloned during the beginning
-			bestAccuracy = accuracy
-			bestModel = gpt
-			noImprovementCount = 0
-		} else {
-			noImprovementCount++
-		}
+		if accuracy > bestAccuracy && e > 20 {
+            bestAccuracy = accuracy
+            // Deep copy weights
+            tmpFile := "models/tmp_best.gob"
+            if err := SaveTransformer(&gpt, tmpFile); err == nil {
+                var clone Transformer = CreateGPT(config.DModel, config.HiddenSize, config.VocabSize, config.AttnLR, config.MLPLR)
+                if err := LoadTransformer(&clone, tmpFile); err == nil {
+                    bestModel = clone
+                }
+                _ = os.Remove(tmpFile)
+            }
+            noImprovementCount = 0
+        } else {
+            noImprovementCount++
+        }
 
 		// The loop now breaks if we've seen enough epochs without a new best accuracy.
 		if noImprovementCount >= config.Patience {
@@ -243,7 +258,11 @@ func main() {
 	// After the training loop, save the best-performing model that was found.
 	if err := save(bestModel); err != nil {
 		fmt.Println("Error saving model:", err)
+		return
 	} else {
 		fmt.Println("Saved the best performing model.")
+		chatCLI(&gpt)
 	}
+
+	
 }

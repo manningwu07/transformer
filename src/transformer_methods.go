@@ -133,14 +133,16 @@ func (b *TransformerBlock) Backward(grad *mat.Dense) *mat.Dense {
 		b.ensureNorms(b.mlp.inputs)
 	}
 
-
-	// Y = xRes + MLP(x2); x2 = LN2(xRes); xRes = X + Attn(LN1(X))
+	// Y = xRes + c*MLP(x2); x2 = LN2(xRes); xRes = X + c*Attn(LN1(X))
 	grad = expandGradToSeq(grad, b.mlp.lastInput) // dY shape -> (d x T)
+	c := 1 / math.Sqrt(2)
 
-	dX2_fromMLP := b.mlp.Backward(grad) // dL/dx2
+	// MLP path: dL/d(MLP_out) = c * dL/dY
+	dX2_fromMLP := b.mlp.Backward(toDense(scale(c, grad))) // dL/dx2
+
 	dXres_fromLN2 := b.ln2.Backward(dX2_fromMLP)
 	dXres_total := toDense(add(grad, dXres_fromLN2))
-	dX1_fromAttn := b.attn.Backward(dXres_total) // dL/d(LN1(X))
+	dX1_fromAttn := b.attn.Backward(toDense(scale(c, dXres_total))) // dL/d(LN1(X))
 	dX_fromLN1 := b.ln1.Backward(dX1_fromAttn)
 
 	return toDense(add(dXres_total, dX_fromLN1))
@@ -156,14 +158,15 @@ func (b *TransformerBlock) BackwardGradsOnly(grad *mat.Dense) (dX *mat.Dense,
 		b.ensureNorms(b.mlp.inputs)
 	}
 	grad = expandGradToSeq(grad, b.mlp.lastInput)
-	grad = expandGradToSeq(grad, b.mlp.lastInput) 
-	
-	dX2_fromMLP, dWhid, _, dWout, _ := b.mlp.BackwardGradsOnly(grad)
+	c := 1 / math.Sqrt(2)
+
+	// MLP path with residual scaling
+	dX2_fromMLP, dWhid, _, dWout, _ := b.mlp.BackwardGradsOnly(toDense(scale(c, grad)))
 	dXres_fromLN2, _, _ := b.ln2.BackwardGradsOnly(dX2_fromMLP)
 	dXres_total := toDense(add(grad, dXres_fromLN2))
-	dX1_fromAttn, dWq, dWk, dWv, dWo := b.attn.BackwardGradsOnly(dXres_total)
+	dX1_fromAttn, dWq, dWk, dWv, dWo := b.attn.BackwardGradsOnly(toDense(scale(c, dXres_total)))
 	dX_fromLN1, _, _ := b.ln1.BackwardGradsOnly(dX1_fromAttn)
-	
+
 	dX = toDense(add(dXres_total, dX_fromLN1))
 	return dX, dWq, dWk, dWv, dWo, dWhid, dWout
 }
@@ -173,11 +176,12 @@ func (b *TransformerBlock) ForwardLastWithKV(xLast *mat.Dense, kv *AttnKV) *mat.
 	d, _ := xLast.Dims()
 	b.ensureNorms(d)
 
+	c := 1 / math.Sqrt(2)
 	n1 := b.ln1.ForwardCol(xLast)
 	attnOut := b.attn.ForwardLastWithKV(n1, kv) // (dModel x 1)
-	x1 := toDense(add(xLast, attnOut))          // residual
+	x1 := toDense(add(xLast, scale(c, attnOut)))
 	n2 := b.ln2.ForwardCol(x1)
 	mlpOut := b.mlp.ForwardCol(n2) // (dModel x 1)
-	y := toDense(add(x1, mlpOut))
+	y := toDense(add(x1, scale(c, mlpOut)))
 	return y
 }
