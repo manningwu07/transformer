@@ -115,13 +115,14 @@ func findEvalFile() string {
 }
 
 // evaluateAccuracy: uses eval.en and existing vocab/emb; streams examples.
-func evaluateAccuracy(gpt Transformer) (int, int) {
+func evaluateMetrics(gpt Transformer) (int, int, float64) {
 	seqs, err := loadEvalSequences()
 	if err != nil || len(seqs) == 0 {
-		return 0, 0
+		return 0, 0, 0
 	}
 	limit := 10000
 	total, correct := 0, 0
+	ceSum := 0.0
 	for _, ids := range seqs {
 		if len(ids) < 2 { continue }
 		// per-sequence KV caches, one per block
@@ -141,13 +142,43 @@ func evaluateAccuracy(gpt Transformer) (int, int) {
 			if pred == ids[t+1] {
 				correct++
 			}
+			// accumulate CE
+			oh := oneHot(config.VocabSize, ids[t+1])
+			loss, _ := CrossEntropyWithGrad(logits, oh)
+			ceSum += loss
+
 			total++
 			if total >= limit {
-				return correct, total
+				return correct, total, ceSum
 			}
 		}
 	}
-	return correct, total
+	return correct, total, ceSum
+}
+
+// loadTinyTrainIDs returns the first N training lines as BOS...EOS id sequences.
+func loadTinyTrainIDs(n int) ([][]int, error) {
+	p := findTrainFile()
+	if p == "" {
+		return nil, errors.New("could not find training file")
+	}
+	lines, err := readLines(p, n)
+	if err != nil {
+		return nil, err
+	}
+	out := make([][]int, 0, len(lines))
+	for _, s := range lines {
+		toks := tokenizeENPieces(s)
+		if len(toks) == 0 { continue }
+		ids := make([]int, 0, len(toks) + 2)
+		ids = append(ids, vocabLookup(vocab, "<bos>"))
+		for _, t := range toks {
+			ids = append(ids, vocabLookup(vocab, t))
+		}
+		ids = append(ids, vocabLookup(vocab, "<eos>"))
+		out = append(out, ids)
+	}
+	return out, nil
 }
 
 // Tokenization (ASCII-only pieces). Lowercases, drops any non 1-byte ASCII chars.

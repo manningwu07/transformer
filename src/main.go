@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"time"
@@ -61,10 +62,10 @@ var config = TrainingConfig{
 	UnembedLR:  0.00003,
 	NormLR:     0.0003,
 
-	MaxEpochs: 1000,
-	Patience:  50,
+	MaxEpochs: 250,
+	Patience:  25,
 	Epsilon:   1e-4,
-	BatchSize: 1024, // each example is one prefix
+	BatchSize: 2048, // each example is one prefix
 	ValFrac:   0.1,
 
 	WarmupSteps: 10_000,
@@ -100,6 +101,13 @@ func main() {
 	fmt.Printf("Initialized vocab (%d) and embeddings from training file. Estimated lines: %d\n",
 		len(vocab.IDToToken), linesCount)
 
+	
+	// Tiny overfit mode
+	if os.Getenv("OVERFIT_TINY") == "1" {
+        overfitTiny(&gpt, 100, 5000) // 100 lines, 1000 steps
+        return                       // exit after tiny test
+    }
+
 	trainPath := findTrainFile()
 	iter, err := newTrainLineIter(trainPath)
 	if err != nil {
@@ -120,8 +128,10 @@ func main() {
 	for e := 0; e < config.MaxEpochs; e++ {
 		var totalLoss float64
 		var steps float64
+		var tokenCounter int
+		var totalTokenLoss float64
 
-		epochTime := time.Now()
+		start := time.Now()
 
 		// Random-sample BatchSize prefix examples; build X and target on the fly.
 		B := min(config.BatchSize, 1000000000) // cap for safety
@@ -180,51 +190,55 @@ func main() {
 			totalLoss += loss
 			steps++
 
-	// -------- FULL-SEQUENCE LOSS --------
-    cols := Xctx.RawMatrix().Cols
-    dY := dYbuf.Slice(0, config.DModel, 0, cols).(*mat.Dense)
-    // zero dY
-    r, c := dY.Dims()
-    for i := 0; i < r; i++ {
-        for j := 0; j < c; j++ {
-            dY.Set(i, j, 0)
-        }
-    }
+			// -------- FULL-SEQUENCE LOSS --------
+			cols := Xctx.RawMatrix().Cols
+			dY := dYbuf.Slice(0, config.DModel, 0, cols).(*mat.Dense)
+			// zero dY
+			r, c := dY.Dims()
+			for i := 0; i < r; i++ {
+				for j := 0; j < c; j++ {
+					dY.Set(i, j, 0)
+				}
+			}
 
-    // accumulate loss and grads for every timestep
-    totalLoss := 0.0
-    dEmb := mat.NewDense(emb.RawMatrix().Rows, emb.RawMatrix().Cols, nil)
-    for t := 0; t < cols-1; t++ {
-        // logits at time t: (vocab x 1) = emb * y[:,t]
-        yCol := Y.Slice(0, config.DModel, t, t+1).(*mat.Dense)
-        logits := toDense(dot(emb.T(), yCol)) // (VocabSize x 1)
+			// accumulate loss and grads for every timestep
+			seqTokLoss := 0.0
+			dEmb := mat.NewDense(emb.RawMatrix().Rows, emb.RawMatrix().Cols, nil)
+			for t := 0; t < cols-1; t++ {
+				// logits at time t: (vocab x 1) = emb * y[:,t]
+				yCol := Y.Slice(0, config.DModel, t, t+1).(*mat.Dense)
+				logits := toDense(dot(emb.T(), yCol)) // (VocabSize x 1)
 
-        // target is token at position t+1
-        goldID := ids[t+1]
-        target := oneHot(config.VocabSize, goldID)
+				// target is token at position t+1
+				goldID := ids[t+1]
+				target := oneHot(config.VocabSize, goldID)
 
-        loss, gradLogits := CrossEntropyWithGrad(logits, target)
-        totalLoss += loss
+				loss, gradLogits := CrossEntropyWithGrad(logits, target)
 
-        // dY[:,t] = emb^T * (p - t)
-        dyCol := toDense(dot(emb, gradLogits)) // (DModel x 1)
-        for i := 0; i < config.DModel; i++ {
-            dY.Set(i, t, dyCol.At(i, 0))
-        }
+				// dY[:,t] = emb^T * (p - t)
+				dyCol := toDense(dot(emb, gradLogits)) // (DModel x 1)
+				for i := 0; i < config.DModel; i++ {
+					dY.Set(i, t, dyCol.At(i, 0))
+				}
 
-        // accumulate dEmb += (p - t) * yCol^T
-        dEmb.Add(dEmb, toDense(dot(yCol, gradLogits.T())))
-    }
+				// accumulate dEmb += (p - t) * yCol^T
+				dEmb.Add(dEmb, toDense(dot(yCol, gradLogits.T())))
+				seqTokLoss += loss
+			}
 
-    // update embeddings with AdamW
-    initEmbAdamIfNeeded()
-    embT++
-    if config.GradClip > 0 {
-        clipGrads(config.GradClip, dEmb)
-    }
-    adamUpdateInPlace(emb, dEmb, embM, embV, embT,
-        unembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
-        config.WeightDecay)
+			totalTokenLoss += seqTokLoss
+			tokenCounter += (cols - 1) // number of tokens predicted in this sequence
+			totalLoss += seqTokLoss
+
+			// update embeddings with AdamW
+			initEmbAdamIfNeeded()
+			embT++
+			if config.GradClip > 0 {
+				clipGrads(config.GradClip, dEmb)
+			}
+			adamUpdateInPlace(emb, dEmb, embM, embV, embT,
+				unembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+				config.WeightDecay)
 
 			for i := layers - 1; i >= 0; i-- {
 				dY = gpt.blocks[i].Backward(dY)
@@ -232,19 +246,27 @@ func main() {
 		}
 
 		// Calculate average loss for the epoch
-		avgLoss := totalLoss / steps
 
-		// Evaluate accuracy on the test set
-		correct, total := evaluateAccuracy(gpt)
-		var accuracy float64
-		if total > 0 {
-			accuracy = float64(correct) / float64(total)
-		} else {
-			accuracy = 0
+		avgLoss := 0.0
+		avgTokLoss := 0.0
+		trainPPL := 0.0
+		if tokenCounter > 0 {
+			avgTokLoss = totalTokenLoss / float64(tokenCounter)
+			trainPPL = math.Exp(avgTokLoss)
 		}
 
-		elapsed := time.Since(epochTime)
-		fmt.Printf("Epoch %d - Accuracy: %.4f, Loss: %.4f, Time for epoch: %s\n", e+1, accuracy, avgLoss, elapsed)
+		// Evaluate accuracy on the test set
+		corr, tot, ceSum := evaluateMetrics(gpt)
+		accuracy := 0.0
+		evalPPL := 0.0
+		if tot > 0 {
+			accuracy = float64(corr) / float64(tot)
+			evalPPL = math.Exp(ceSum / float64(tot))
+		}
+		fmt.Printf(
+			"Epoch %d - Acc: %.4f, TrainTokLoss: %.4f, TrainPPL: %.1f, EvalPPL: %.1f, Time: %v\n",
+			e, accuracy, avgTokLoss, trainPPL, evalPPL, time.Since(start),
+		)
 		fmt.Printf("Before epoch %d: Attn.Wq[0] norm=%.6g MLP.hidden norm=%.6g\n",
 			e+1,
 			matrixNorm(gpt.blocks[0].attn.Wquery[0]),
@@ -294,4 +316,69 @@ func main() {
 		fmt.Println("Saved the best performing model.")
 		chatCLI(&gpt)
 	}
+}
+
+// Tiny overfit mode: train on first N lines for S steps to sanity-check the loop.
+// Enable by setting OVERFIT_TINY=1 in the environment.
+func overfitTiny(gpt *Transformer, N, steps int) {
+	seqs, err := loadTinyTrainIDs(N)
+	if err != nil || len(seqs) == 0 {
+		fmt.Println("overfitTiny: no data:", err)
+		return
+	}
+	fmt.Printf("OverfitTiny: %d sequences, %d steps\n", len(seqs), steps)
+	totalCE := 0.0
+	totalTok := 0
+	for step := 0; step < steps; step++ {
+		ids := seqs[step%len(seqs)]
+		// inputs are all but last token
+		X := embedSequence(emb, ids[:len(ids)-1])
+		// forward
+		Y := X
+		for l := 0; l < layers; l++ {
+			Y = gpt.blocks[l].Forward(Y)
+		}
+		cols := Y.RawMatrix().Cols
+		dY := mat.NewDense(config.DModel, cols, nil)
+		dEmb := mat.NewDense(emb.RawMatrix().Rows, emb.RawMatrix().Cols, nil)
+		seqCE := 0.0
+		for t := 0; t < cols; t++ {
+			yCol := Y.Slice(0, config.DModel, t, t+1).(*mat.Dense)
+			logits := toDense(dot(emb.T(), yCol))
+			goldID := ids[t+1] // next token
+			oh := oneHot(config.VocabSize, goldID)
+			loss, gradLogits := CrossEntropyWithGrad(logits, oh)
+			seqCE += loss
+			dyCol := toDense(dot(emb, gradLogits)) // (DModel x 1)
+			for i := 0; i < config.DModel; i++ {
+				dY.Set(i, t, dyCol.At(i, 0))
+			}
+			dEmb.Add(dEmb, toDense(dot(yCol, gradLogits.T())))
+		}
+		// update embeddings
+		initEmbAdamIfNeeded()
+		embT++
+		if config.GradClip > 0 {
+			clipGrads(config.GradClip, dEmb)
+		}
+		adamUpdateInPlace(
+			emb, dEmb, embM, embV, embT,
+			config.UnembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+			config.WeightDecay,
+		)
+		// backprop through blocks
+		for l := layers - 1; l >= 0; l-- {
+			dY = gpt.blocks[l].Backward(dY)
+		}
+		totalCE += seqCE
+		totalTok += cols
+		if (step+1)%100 == 0 {
+			avgTokLoss := totalCE / float64(totalTok)
+			fmt.Printf("Tiny step %4d: tokLoss=%.4f ppl=%.1f\n",
+				step+1, avgTokLoss, math.Exp(avgTokLoss))
+		}
+	}
+	avgTokLoss := totalCE / float64(totalTok)
+	fmt.Printf("OverfitTiny done: tokLoss=%.4f ppl=%.1f\n",
+		avgTokLoss, math.Exp(avgTokLoss))
 }
