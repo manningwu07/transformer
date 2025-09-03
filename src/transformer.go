@@ -8,6 +8,7 @@ import (
 
 	"gonum.org/v1/gonum/mat"
 )
+type posData struct { R, C int; Data []float64 }
 
 // Predict generates text autoregressively from an English prompt.
 // It tokenizes the input, embeds it, runs it through the Transformer,
@@ -18,7 +19,7 @@ func (gpt *Transformer) Predict(input string, maxLen int) []string {
 	}
 
 	// make sure <eos> is present at inference time
-    ensureEOSToken()
+	ensureEOSToken()
 	// Tokenize into 1–4 char pieces
 	toks := tokenizeENPieces(input)
 	// Start with <bos> + prompt
@@ -35,16 +36,17 @@ func (gpt *Transformer) Predict(input string, maxLen int) []string {
 	var yLast *mat.Dense
 	for t := 0; t < len(ids); t++ {
 		xLast := colAsVector(emb, ids[t])
-		yLast = xLast
+		yLast = addPosCol(xLast, kvs[0].attnKV.t)
 		for l := 0; l < layers; l++ {
 			yLast = gpt.blocks[l].ForwardLastWithKV(yLast, &kvs[l].attnKV)
+			// For blocks >0, do NOT add positional embedding again.
 		}
 	}
 	// Generate up to maxLen new tokens
 	for steps := 0; steps < maxLen; steps++ {
 		logits := Unembed(yLast)
 		probs := ColVectorSoftmax(logits)
-		nextID := argmaxVec(probs)
+		nextID := sampleFromProbs(probs, 50, 0.9)
 		nextTok := vocab.IDToToken[nextID]
 		if nextTok == "<eos>" {
 			break
@@ -53,35 +55,15 @@ func (gpt *Transformer) Predict(input string, maxLen int) []string {
 		seq = append(seq, nextTok)
 		// advance one step using KV cache
 		xLast := colAsVector(emb, nextID)
-		yLast = xLast
+		yLast = addPosCol(xLast, kvs[0].attnKV.t)
 		for l := 0; l < layers; l++ {
 			yLast = gpt.blocks[l].ForwardLastWithKV(yLast, &kvs[l].attnKV)
 		}
 	}
 	// return generated tokens after the prompt
+	fmt.Println("Input tokens:", toks)
+	fmt.Println("Mapped IDs:", ids)
 	return seq[1+len(toks):]
-}
-
-// PrintMatrix prints a Gonum matrix in a compact form.
-func PrintMatrix(m mat.Matrix, name string) {
-	r, c := m.Dims()
-	fmt.Printf("Matrix %s (%dx%d):\n", name, r, c)
-	fa := mat.Formatted(m, mat.Prefix("  "), mat.Squeeze())
-	fmt.Printf("%v\n", fa)
-}
-
-// RowSums returns per-row sums for a mat.Dense.
-func RowSums(m *mat.Dense) []float64 {
-	r, c := m.Dims()
-	out := make([]float64, r)
-	for i := 0; i < r; i++ {
-		sum := 0.0
-		for j := 0; j < c; j++ {
-			sum += m.At(i, j)
-		}
-		out[i] = sum
-	}
-	return out
 }
 
 // SaveTransformer persists a Transformer (weights only) to disk using gob.
@@ -124,6 +106,7 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 		EmbR    int
 		EmbC    int
 		EmbData []float64
+		Pos     posData
 		Vocab   []string
 	}{}
 	data.Layers = len(gpt.blocks)
@@ -209,7 +192,7 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 			}
 		}
 	}
-	// Embeddings and vocab (optional)
+	// Embeddings and vocab
 	if emb != nil {
 		r, c := emb.Dims()
 		raw := mat.DenseCopyOf(emb).RawMatrix()
@@ -236,6 +219,7 @@ func LoadTransformer(gpt *Transformer, filename string) error {
 		EmbR    int
 		EmbC    int
 		EmbData []float64
+		Pos     posData
 		Vocab   []string
 	}{}
 	// Read file and decode
@@ -291,18 +275,26 @@ func LoadTransformer(gpt *Transformer, filename string) error {
 		}
 		// LayerNorm
 		if len(data.Blocks[i].Ln1Gamma) > 0 {
-            b.ln1.gamma = mat.NewDense(b.ln1.d, 1, data.Blocks[i].Ln1Gamma)
-            b.ln1.beta  = mat.NewDense(b.ln1.d, 1, data.Blocks[i].Ln1Beta)
-        }
-        if len(data.Blocks[i].Ln2Gamma) > 0 {
-            b.ln2.gamma = mat.NewDense(b.ln2.d, 1, data.Blocks[i].Ln2Gamma)
-            b.ln2.beta  = mat.NewDense(b.ln2.d, 1, data.Blocks[i].Ln2Beta)
-        }
+			b.ln1.gamma = mat.NewDense(b.ln1.d, 1, data.Blocks[i].Ln1Gamma)
+			b.ln1.beta = mat.NewDense(b.ln1.d, 1, data.Blocks[i].Ln1Beta)
+		}
+		if len(data.Blocks[i].Ln2Gamma) > 0 {
+			b.ln2.gamma = mat.NewDense(b.ln2.d, 1, data.Blocks[i].Ln2Gamma)
+			b.ln2.beta = mat.NewDense(b.ln2.d, 1, data.Blocks[i].Ln2Beta)
+		}
 	}
 	// Restore embeddings and vocab if present
 	if data.EmbR > 0 && data.EmbC > 0 && len(data.EmbData) == data.EmbR*data.EmbC {
 		emb = mat.NewDense(data.EmbR, data.EmbC, data.EmbData)
 	}
+
+	 if data.Pos.R > 0 && data.Pos.C > 0 && len(data.Pos.Data) == data.Pos.R*data.Pos.C {
+        posEmb = mat.NewDense(data.Pos.R, data.Pos.C, data.Pos.Data)
+        // reset Adam state on load (optional)
+        posM, posV = nil, nil
+        posT = 0
+    }
+
 	if len(data.Vocab) > 0 {
 		vocab = Vocab{
 			TokenToID: map[string]int{},

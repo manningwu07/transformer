@@ -1,4 +1,9 @@
-//go:build netlib
+//go:build accelerate
+
 package main
 
-import _ "gonum.org/v1/netlib/blas/netlib"
+// #cgo LDFLAGS: -framework Accelerate
+import "C"
+
+// This file forces linking against Apple's Accelerate framework
+// when you build with `-tags accelerate`.

@@ -6,16 +6,32 @@ import (
 	"math/rand"
 	"os"
 	"time"
+	"flag"
 
 	"gonum.org/v1/gonum/mat"
+	"os/signal"
+    "syscall"
 )
 
 // How many times does attn --> mlp happen
+
+var (
+    resumePath string
+    debugFlag  bool
+)
+
+func init() {
+    flag.StringVar(&resumePath, "resume", "", "Path to checkpoint .gob file to resume from")
+    flag.BoolVar(&debugFlag, "debug", false, "Enable debug logging")
+}
 
 // Adam Optimizer global vars
 var (
 	embM, embV *mat.Dense
 	embT       int
+	posEmb *mat.Dense
+	posM, posV *mat.Dense
+	posT int
 )
 
 type TrainingConfig struct {
@@ -48,13 +64,15 @@ type TrainingConfig struct {
 	WeightDecay float64 // AdamW-style, e.g., 0.01; 0 disables
 	Debug       bool    // enable periodic debug logs
 	DebugEvery  int     // print every N optimizer steps
+	PosLR       float64 // learning rate for positional embeddings
+    SaveEverySteps int  // checkpoint every N optimizer steps (0=disable)
 }
 
 var layers = 6
 var config = TrainingConfig{
 	DModel:     512,
 	HiddenSize: 1024,
-	VocabSize:  4096, // Top number of 1-4 chars
+	VocabSize:  8192, // Top number of 1-4 chars
 	NumHeads:   8,    // dHead = DModel/NumHeads
 	SeqLen:     64,   // max context
 	AttnLR:     0.0003,
@@ -78,19 +96,48 @@ var config = TrainingConfig{
 	WeightDecay: 0.01,
 	Debug:       false,
 	DebugEvery:  1000,
+	PosLR:       0.0003,
+    SaveEverySteps: 10000,
 }
 
 func main() {
+	flag.Parse()
+
+    if debugFlag {
+        config.Debug = true
+    }
+
 	rand.Seed(time.Now().UTC().UnixNano())
 	t1 := time.Now()
 
-	gpt := CreateGPT(
-		config.DModel,
-		config.HiddenSize,
-		config.VocabSize,
-		config.AttnLR,
-		config.MLPLR,
-	)
+	var gpt Transformer
+    if resumePath != "" {
+        fmt.Printf("Resuming from checkpoint: %s\n", resumePath)
+        gpt = CreateGPT(
+            config.DModel,
+            config.HiddenSize,
+            config.VocabSize,
+            config.AttnLR,
+            config.MLPLR,
+        )
+        if err := LoadTransformer(&gpt, resumePath); err != nil {
+            fmt.Println("Failed to load checkpoint:", err)
+            os.Exit(1)
+        }
+    } else {
+        fmt.Println("Starting new model from scratch")
+        gpt = CreateGPT(
+            config.DModel,
+            config.HiddenSize,
+            config.VocabSize,
+            config.AttnLR,
+            config.MLPLR,
+        )
+    }
+
+    installSignalCheckpoints(&gpt)
+
+	installSignalCheckpoints(&gpt)
 
 	// Build vocab + embeddings via streaming pass (no full dataset in memory)
 	linesCount, err := buildVocabAndEmbFromTrain(gpt)
@@ -105,6 +152,7 @@ func main() {
 	// Tiny overfit mode
 	if os.Getenv("OVERFIT_TINY") == "1" {
         overfitTiny(&gpt, 100, 5000) // 100 lines, 1000 steps
+		chatCLI(&gpt)
         return                       // exit after tiny test
     }
 
@@ -124,6 +172,7 @@ func main() {
 	fmt.Printf("Train (streaming): lines≈%d  Eval: from eval.en\n", linesCount)
 
 	adamStep := 0
+	lastSave := time.Now()
 
 	for e := 0; e < config.MaxEpochs; e++ {
 		var totalLoss float64
@@ -230,24 +279,64 @@ func main() {
 			tokenCounter += (cols - 1) // number of tokens predicted in this sequence
 			totalLoss += seqTokLoss
 
-			// update embeddings with AdamW
-			initEmbAdamIfNeeded()
-			embT++
-			if config.GradClip > 0 {
-				clipGrads(config.GradClip, dEmb)
-			}
-			adamUpdateInPlace(emb, dEmb, embM, embV, embT,
-				unembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
-				config.WeightDecay)
-
 			for i := layers - 1; i >= 0; i-- {
 				dY = gpt.blocks[i].Backward(dY)
 			}
+
+			dXinput := dY // (dModel x T), gradient wrt Xctx (which is emb + pos)
+
+            // Accumulate input-embedding gradient into emb columns used at each t
+            dEmbIn := mat.NewDense(emb.RawMatrix().Rows, emb.RawMatrix().Cols, nil)
+            for t := 0; t < cols; t++ {
+                if start+t >= len(ids) { break }
+                tokID := ids[start+t]
+                // add dXinput[:,t] into column tokID of dEmbIn
+                colGrad := dXinput.Slice(0, config.DModel, t, t+1).(*mat.Dense)
+                // write-add into dEmbIn[:, tokID]
+                for i := 0; i < config.DModel; i++ {
+                    dEmbIn.Set(i, tokID, dEmbIn.At(i, tokID)+colGrad.At(i, 0))
+                }
+            }
+            // Add input path grad to output path grad
+            dEmb.Add(dEmb, dEmbIn)
+
+            // Positional embedding gradient: since X = emb + pos, dPos[:,t] += dXinput[:,t]
+            initPosAdamIfNeeded()
+            dPos := mat.NewDense(posEmb.RawMatrix().Rows, posEmb.RawMatrix().Cols, nil)
+            maxT := cols
+            if maxT > posEmb.RawMatrix().Cols { maxT = posEmb.RawMatrix().Cols }
+            for t := 0; t < maxT; t++ {
+                for i := 0; i < config.DModel; i++ {
+                    dPos.Set(i, t, dPos.At(i, t)+dXinput.At(i, t))
+                }
+            }
+
+            // Now update embeddings and positional embeddings with AdamW
+            initEmbAdamIfNeeded()
+            embT++
+            posT++
+            if config.GradClip > 0 {
+                clipGrads(config.GradClip, dEmb, dPos)
+            }
+            adamUpdateInPlace(emb, dEmb, embM, embV, embT,
+                unembedLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+                config.WeightDecay)
+            adamUpdateInPlace(posEmb, dPos, posM, posV, posT,
+                config.PosLR, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
+                0.0) // typically no weight decay for pos embeddings
+
+            // Optional periodic checkpoint by step/time
+            if config.SaveEverySteps > 0 && adamStep%config.SaveEverySteps == 0 {
+                _ = safeSaveTransformer(&gpt, "models/ckpt_latest.gob")
+            }
+            if time.Since(lastSave) > 10*time.Minute {
+                _ = safeSaveTransformer(&gpt, "models/ckpt_latest.gob")
+				lastSave = time.Now()
+            }
 		}
 
 		// Calculate average loss for the epoch
 
-		avgLoss := 0.0
 		avgTokLoss := 0.0
 		trainPPL := 0.0
 		if tokenCounter > 0 {
@@ -273,19 +362,14 @@ func main() {
 			matrixNorm(gpt.blocks[0].mlp.hiddenWeights),
 		)
 
+		_ = safeSaveTransformer(&gpt, "models/last_epoch.gob")
+        lastSave = time.Now()
+
 		// --- Early stopping logic based on loss improvement and accuracy checkpointing ---
 		// Check if the current accuracy is the best we've seen so far.
 		if accuracy > bestAccuracy && e > 20 {
 			bestAccuracy = accuracy
-			// Deep copy weights
-			tmpFile := "models/tmp_best.gob"
-			if err := SaveTransformer(&gpt, tmpFile); err == nil {
-				var clone Transformer = CreateGPT(config.DModel, config.HiddenSize, config.VocabSize, config.AttnLR, config.MLPLR)
-				if err := LoadTransformer(&clone, tmpFile); err == nil {
-					bestModel = clone
-				}
-				_ = os.Remove(tmpFile)
-			}
+			_ = SaveTransformer(&gpt, "models/best_model.gob")
 			noImprovementCount = 0
 		} else {
 			noImprovementCount++
@@ -296,7 +380,9 @@ func main() {
 			fmt.Println("\nStopping training early due to lack of improvement in accuracy.")
 			break
 		}
+
 		// If the loss func is too small, stop training.
+		avgLoss := totalLoss / steps
 		if avgLoss < config.Epsilon {
 			fmt.Println("\nStopping training early due to loss being too small.")
 			break
@@ -381,4 +467,41 @@ func overfitTiny(gpt *Transformer, N, steps int) {
 	avgTokLoss := totalCE / float64(totalTok)
 	fmt.Printf("OverfitTiny done: tokLoss=%.4f ppl=%.1f\n",
 		avgTokLoss, math.Exp(avgTokLoss))
+}
+
+
+// installSignalCheckpoints installs handlers:
+// - SIGUSR1: save checkpoint and continue
+// - SIGINT/SIGTERM: save checkpoint then exit
+func installSignalCheckpoints(gpt *Transformer) {
+    ch := make(chan os.Signal, 2)
+    signal.Notify(ch, os.Interrupt, syscall.SIGTERM, syscall.SIGUSR1)
+    go func() {
+        for sig := range ch {
+            switch sig {
+            case syscall.SIGUSR1:
+                fmt.Println("\n[signal] SIGUSR1 received: saving checkpoint...")
+                if err := safeSaveTransformer(gpt, "models/ckpt_latest.gob"); err != nil {
+                    fmt.Println("checkpoint save error:", err)
+                } else {
+                    fmt.Println("checkpoint saved to models/ckpt_latest.gob")
+                }
+            case os.Interrupt, syscall.SIGTERM:
+                fmt.Println("\n[signal] Interrupt/TERM received: saving checkpoint and exiting...")
+                _ = safeSaveTransformer(gpt, "models/ckpt_latest.gob")
+                os.Exit(0)
+            }
+        }
+    }()
+}
+
+// safeSaveTransformer writes to a temp file then renames atomically.
+func safeSaveTransformer(gpt *Transformer, path string) error {
+    _ = os.MkdirAll("models", 0o755)
+    tmp := path + ".tmp"
+    if err := SaveTransformer(gpt, tmp); err != nil {
+        _ = os.Remove(tmp)
+        return err
+    }
+    return os.Rename(tmp, path)
 }

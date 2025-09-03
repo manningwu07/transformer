@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"math"
+	"math/rand"
+	"sort"
 
 	"gonum.org/v1/gonum/mat"
 )
@@ -67,8 +70,95 @@ func addScalar(i float64, m mat.Matrix) mat.Matrix {
 	return add(m, n)
 }
 
+func sampleFromProbs(probs *mat.Dense, topK int, topP float64) int {
+	r, c := probs.Dims()
+	if c != 1 {
+		panic("sampleFromProbs expects column vector")
+	}
+
+	// Collect (id, prob)
+	type kv struct {
+		id  int
+		val float64
+	}
+	arr := make([]kv, r)
+	sum := 0.0
+	for i := 0; i < r; i++ {
+		p := probs.At(i, 0)
+		arr[i] = kv{id: i, val: p}
+		sum += p
+	}
+	// Normalize (just in case)
+	for i := range arr {
+		arr[i].val /= sum
+	}
+
+	// Sort descending by prob
+	sort.Slice(arr, func(i, j int) bool { return arr[i].val > arr[j].val })
+
+	// Apply top-k
+	if topK > 0 && topK < len(arr) {
+		arr = arr[:topK]
+	}
+
+	// Apply top-p (nucleus)
+	if topP > 0 && topP < 1 {
+		cum := 0.0
+		cut := len(arr)
+		for i, kv := range arr {
+			cum += kv.val
+			if cum >= topP {
+				cut = i + 1
+				break
+			}
+		}
+		arr = arr[:cut]
+	}
+
+	// Renormalize after filtering
+	sum = 0.0
+	for _, kv := range arr {
+		sum += kv.val
+	}
+	for i := range arr {
+		arr[i].val /= sum
+	}
+
+	// Sample
+	rnd := rand.Float64()
+	cum := 0.0
+	for _, kv := range arr {
+		cum += kv.val
+		if rnd < cum {
+			return kv.id
+		}
+	}
+	return arr[len(arr)-1].id // fallback
+}
+
+// PrintMatrix prints a Gonum matrix in a compact form.
+func PrintMatrix(m mat.Matrix, name string) {
+	r, c := m.Dims()
+	fmt.Printf("Matrix %s (%dx%d):\n", name, r, c)
+	fa := mat.Formatted(m, mat.Prefix("  "), mat.Squeeze())
+	fmt.Printf("%v\n", fa)
+}
+
+// RowSums returns per-row sums for a mat.Dense.
+func RowSums(m *mat.Dense) []float64 {
+	r, c := m.Dims()
+	out := make([]float64, r)
+	for i := 0; i < r; i++ {
+		sum := 0.0
+		for j := 0; j < c; j++ {
+			sum += m.At(i, j)
+		}
+		out[i] = sum
+	}
+	return out
+}
+
 // -------- GELU activation (GPT-style) --------
-// Approximation used by GPT-2/3:
 // gelu(x) = 0.5 * x * (1 + tanh( sqrt(2/pi) * (x + 0.044715*x^3) ))
 // We provide:
 // - geluApply: shape-compatible with mat.Dense.Apply (i,j,v) -> value

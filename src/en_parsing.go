@@ -52,12 +52,56 @@ func buildVocabAndEmbFromTrain(gpt Transformer) (int, error) {
 	}
 	emb = initEmbeddings(dModel, vocab)
 
+	if posEmb == nil || posEmb.RawMatrix().Rows != dModel || posEmb.RawMatrix().Cols != config.SeqLen {
+		posEmb = mat.NewDense(dModel, config.SeqLen, randomArray(dModel*config.SeqLen, float64(dModel)))
+	}
+
 	// return line count for logging
 	lines, err := countLines(p)
 	if err != nil {
 		return 0, err
 	}
 	return lines, nil
+}
+
+// Add positional embeddings to an embedded sequence X (d x T), using positions 0..T-1.
+func addPosToSequence(X *mat.Dense) *mat.Dense {
+	if posEmb == nil {
+		return X
+	}
+	d, T := X.Dims()
+	if T > posEmb.RawMatrix().Cols {
+		T = posEmb.RawMatrix().Cols
+	}
+	out := mat.NewDense(d, T, nil)
+	out.Copy(X)
+	// out += posEmb[:, 0:T]
+	for i := 0; i < d; i++ {
+		for t := 0; t < T; t++ {
+			out.Set(i, t, out.At(i, t)+posEmb.At(i, t))
+		}
+	}
+	return out
+}
+
+// Add positional embedding column posIdx to xCol (d x 1).
+func addPosCol(xCol *mat.Dense, posIdx int) *mat.Dense {
+	if posEmb == nil {
+		return xCol
+	}
+	idx := posIdx
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= posEmb.RawMatrix().Cols {
+		idx = posEmb.RawMatrix().Cols - 1
+	}
+	d, _ := xCol.Dims()
+	out := mat.NewDense(d, 1, nil)
+	for i := 0; i < d; i++ {
+		out.Set(i, 0, xCol.At(i, 0)+posEmb.At(i, idx))
+	}
+	return out
 }
 
 // load only token-id sequences for EVAL
@@ -88,33 +132,39 @@ func loadEvalSequences() ([][]int, error) {
 }
 
 func findTrainFile() string {
-    if p := findEnglishFile(); p != "" { return p }
-    return ""
+	if p := findEnglishFile(); p != "" {
+		return p
+	}
+	return ""
 }
 
 func findEvalFile() string {
-    candidates := []string{
-        "../data/test/train.en",
-        // "data/test/eval.en",
-        // "data/raw/eval.eng",
-    }
-    for _, p := range candidates {
-        if fileExists(p) { return p }
-    }
-    // fallback: first *.en named "eval" in tree
-    root := "data"
-    var first string
-    _ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-        if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".en") &&
-            strings.Contains(strings.ToLower(d.Name()), "eval") {
-            if first == "" { first = path }
-        }
-        return nil
-    })
-    return first
+	candidates := []string{
+		"../data/test/train.en",
+		// "data/test/eval.en",
+		// "data/raw/eval.eng",
+	}
+	for _, p := range candidates {
+		if fileExists(p) {
+			return p
+		}
+	}
+	// fallback: first *.en named "eval" in tree
+	root := "data"
+	var first string
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".en") &&
+			strings.Contains(strings.ToLower(d.Name()), "eval") {
+			if first == "" {
+				first = path
+			}
+		}
+		return nil
+	})
+	return first
 }
 
-// evaluateAccuracy: uses eval.en and existing vocab/emb; streams examples.
+// uses eval.en and existing vocab/emb; streams examples.
 func evaluateMetrics(gpt Transformer) (int, int, float64) {
 	seqs, err := loadEvalSequences()
 	if err != nil || len(seqs) == 0 {
@@ -124,7 +174,9 @@ func evaluateMetrics(gpt Transformer) (int, int, float64) {
 	total, correct := 0, 0
 	ceSum := 0.0
 	for _, ids := range seqs {
-		if len(ids) < 2 { continue }
+		if len(ids) < 2 {
+			continue
+		}
 		// per-sequence KV caches, one per block
 		type blkKV struct{ attnKV AttnKV }
 		kvs := make([]blkKV, layers)
@@ -133,7 +185,7 @@ func evaluateMetrics(gpt Transformer) (int, int, float64) {
 		var yLast *mat.Dense
 		for t := 0; t+1 < len(ids); t++ {
 			xLast := colAsVector(emb, ids[t]) // (dModel x 1)
-			yLast = xLast
+			yLast = addPosCol(xLast, kvs[0].attnKV.t) // add position for block 0 only
 			for l := 0; l < layers; l++ {
 				yLast = gpt.blocks[l].ForwardLastWithKV(yLast, &kvs[l].attnKV)
 			}
@@ -169,8 +221,10 @@ func loadTinyTrainIDs(n int) ([][]int, error) {
 	out := make([][]int, 0, len(lines))
 	for _, s := range lines {
 		toks := tokenizeENPieces(s)
-		if len(toks) == 0 { continue }
-		ids := make([]int, 0, len(toks) + 2)
+		if len(toks) == 0 {
+			continue
+		}
+		ids := make([]int, 0, len(toks)+2)
 		ids = append(ids, vocabLookup(vocab, "<bos>"))
 		for _, t := range toks {
 			ids = append(ids, vocabLookup(vocab, t))
@@ -183,7 +237,7 @@ func loadTinyTrainIDs(n int) ([][]int, error) {
 
 // Tokenization (ASCII-only pieces). Lowercases, drops any non 1-byte ASCII chars.
 func tokenizeENPieces(s string) []string {
-	// Fast ASCII lowercase  non-ASCII drop
+	// Fast ASCII lowercase non-ASCII drop
 	b := make([]byte, 0, len(s))
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -211,32 +265,54 @@ func tokenizeENPieces(s string) []string {
 }
 
 func buildFixedVocabFromCounts(cnt map[string]int, size int) Vocab {
-    if size < len(special) {
-        panic("vocab size must be >= number of special tokens")
-    }
-    type kv struct{ k string; v int }
-    arr := make([]kv, 0, len(cnt))
-    for k, v := range cnt { arr = append(arr, kv{k, v}) }
-    sort.Slice(arr, func(i, j int) bool {
-        if arr[i].v == arr[j].v { return arr[i].k < arr[j].k }
-        return arr[i].v > arr[j].v
-    })
-    idToToken := append([]string{}, special...)
-    for _, p := range arr {
-        if len(idToToken) >= size { break }
-        skip := false
-        for _, s := range special { if p.k == s { skip = true; break } }
-		if skip { continue }
-        if !isASCIIString(p.k) { continue } // enforce 1-byte ASCII only
-        if p.k == "" { continue }
-        idToToken = append(idToToken, p.k)
-    }
-    for len(idToToken) < size {
-        idToToken = append(idToToken, fmt.Sprintf("<pad%d>", len(idToToken)))
-    }
-    tok2id := map[string]int{}
-    for i, t := range idToToken { tok2id[t] = i }
-    return Vocab{TokenToID: tok2id, IDToToken: idToToken}
+	if size < len(special) {
+		panic("vocab size must be >= number of special tokens")
+	}
+	type kv struct {
+		k string
+		v int
+	}
+	arr := make([]kv, 0, len(cnt))
+	for k, v := range cnt {
+		arr = append(arr, kv{k, v})
+	}
+	sort.Slice(arr, func(i, j int) bool {
+		if arr[i].v == arr[j].v {
+			return arr[i].k < arr[j].k
+		}
+		return arr[i].v > arr[j].v
+	})
+	idToToken := append([]string{}, special...)
+	for _, p := range arr {
+		if len(idToToken) >= size {
+			break
+		}
+		skip := false
+		for _, s := range special {
+			if p.k == s {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		if !isASCIIString(p.k) {
+			continue
+		} // enforce 1-byte ASCII only
+		if p.k == "" {
+			continue
+		}
+		idToToken = append(idToToken, p.k)
+	}
+	for len(idToToken) < size {
+		idToToken = append(idToToken, fmt.Sprintf("<pad%d>", len(idToToken)))
+	}
+	tok2id := map[string]int{}
+	for i, t := range idToToken {
+		tok2id[t] = i
+	}
+	return Vocab{TokenToID: tok2id, IDToToken: idToToken}
 }
 
 // Streaming vocab builder from file; returns vocab and number of lines processed.
@@ -282,26 +358,29 @@ func isASCIIString(s string) bool {
 	return true
 }
 
-
 func findEnglishFile() string {
-    candidates := []string{
-       "../data/test/train.en",
-        // "../data/raw/train.eng",
-    }
-    for _, p := range candidates {
-        if fileExists(p) { return p }
-    }
-    // fallback: first *.en in data tree
+	candidates := []string{
+		"../data/test/train.en",
+		// "../data/raw/train.eng",
+	}
+	for _, p := range candidates {
+		if fileExists(p) {
+			return p
+		}
+	}
+	// fallback: first *.en in data tree
 	fmt.Println("Failed to find candidate file, searching for first file in datatree.")
-    root := "data"
-    _ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-        if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".en") {
-            candidates = append(candidates, path)
-        }
-        return nil
-    })
-    if len(candidates) > 0 && fileExists(candidates[0]) { return candidates[0] }
-    return ""
+	root := "data"
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err == nil && !d.IsDir() && strings.HasSuffix(d.Name(), ".en") {
+			candidates = append(candidates, path)
+		}
+		return nil
+	})
+	if len(candidates) > 0 && fileExists(candidates[0]) {
+		return candidates[0]
+	}
+	return ""
 }
 
 func vocabLookup(v Vocab, tok string) int {
@@ -328,28 +407,31 @@ func colAsVector(m *mat.Dense, j int) *mat.Dense {
 	for i := 0; i < r; i++ {
 		dst[i] = m.At(i, j)
 	}
-	return mat.NewDense(r, 1, dst)
+	out := mat.NewDense(r, 1, dst)
+	if posEmb != nil {
+		out = addPosToSequence(out)
+	}
+	return out
 }
 
 func embedSequence(emb *mat.Dense, ids []int) *mat.Dense {
-    d, _ := emb.Dims()
-    T := len(ids)
-    out := mat.NewDense(d, T, nil)
-    for t, id := range ids {
-        for i := 0; i < d; i++ {
-            out.Set(i, t, emb.At(i, id))
-        }
-    }
-    return out
+	d, _ := emb.Dims()
+	T := len(ids)
+	out := mat.NewDense(d, T, nil)
+	for t, id := range ids {
+		for i := 0; i < d; i++ {
+			out.Set(i, t, emb.At(i, id))
+		}
+	}
+	return out
 }
 
 func Unembed(x *mat.Dense) *mat.Dense {
-    if emb == nil {
-        panic("embedding not initialized; call loadTrainingSet first")
-    }
-    return toDense(dot(emb.T(), x))
+	if emb == nil {
+		panic("embedding not initialized; call loadTrainingSet first")
+	}
+	return toDense(dot(emb.T(), x))
 }
-
 
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
@@ -420,7 +502,7 @@ func (it *trainLineIter) nextIDs() ([]int, error) {
 				continue
 			}
 			// add BOS/EOS
-			ids := make([]int, 0, len(toks) + 2)
+			ids := make([]int, 0, len(toks)+2)
 			ids = append(ids, vocabLookup(vocab, "<bos>"))
 			for _, t := range toks {
 				ids = append(ids, vocabLookup(vocab, t))

@@ -195,6 +195,14 @@ func LRSchedule(step int, peak float64) float64 {
 
 // ------- Adam optimizer (in-place) --------
 
+func initPosAdamIfNeeded() {
+    if posEmb != nil && posM == nil {
+        posM = zerosLike(posEmb)
+        posV = zerosLike(posEmb)
+        posT = 0
+    }
+}
+
 func initEmbAdamIfNeeded() {
 	if emb != nil && embM == nil {
 		embM = zerosLike(emb)
@@ -315,4 +323,12 @@ func onesLike(a *mat.Dense) *mat.Dense {
 	out := mat.NewDense(r, c, nil)
 	for i := 0; i < r; i++ { for j := 0; j < c; j++ { out.Set(i, j, 1) } }
 	return out
+}
+
+// Utility: add gradient column gCol (d x 1) into a matrix target at column j.
+func addCol(target *mat.Dense, gCol *mat.Dense, j int) {
+    d, _ := gCol.Dims()
+    for i := 0; i < d; i++ {
+        target.Set(i, j, target.At(i, j)+gCol.At(i, 0))
+    }
 }
