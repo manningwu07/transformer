@@ -1,28 +1,32 @@
-package main
+package transformer
 
 import (
 	"math"
 	"sync"
 
 	"gonum.org/v1/gonum/mat"
+
+	"github.com/manningwu07/GPT/optimizations"
+	"github.com/manningwu07/GPT/params"
+	"github.com/manningwu07/GPT/utils"
 )
 
 type Attention struct {
 	H            int
-	dModel       int
-	dHead        int
+	DModel       int
+	DHead        int
 	Wquery       []*mat.Dense
 	Wkey         []*mat.Dense
 	Wvalue       []*mat.Dense
 	Woutput      *mat.Dense
-	learningRate float64
+	LearningRate float64
 
 	// Adam
-	t        int
-	mWq, vWq []*mat.Dense
-	mWk, vWk []*mat.Dense
-	mWv, vWv []*mat.Dense
-	mWo, vWo *mat.Dense
+	T        int
+	MWq, VWq []*mat.Dense
+	MWk, VWk []*mat.Dense
+	MWv, VWv []*mat.Dense
+	MWo, VWo *mat.Dense
 
 	// cache for backprop
 	X       *mat.Dense
@@ -42,25 +46,24 @@ type Attention struct {
 func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 	attn.X = X
 	_, T := X.Dims() // T = number of columns (sequence length)
-	headsCat := mat.NewDense(attn.dModel, T, nil)
+	headsCat := mat.NewDense(attn.DModel, T, nil)
 
-
- 	rescale := 1.0 / math.Sqrt(float64(attn.dHead))
+	rescale := 1.0 / math.Sqrt(float64(attn.DHead))
 	// cache mask by T
 	mask, ok := attn.maskCache[T]
 	if !ok {
-		mask = causalMask(T)
+		mask = utils.CausalMask(T)
 		attn.maskCache[T] = mask
 	}
 
 	// prepare per-head scratch resized once per T
 	if attn.lastT != T {
 		for h := 0; h < attn.H; h++ {
-			attn.Q[h] = mat.NewDense(attn.dHead, T, nil)
-			attn.K[h] = mat.NewDense(attn.dHead, T, nil)
-			attn.V[h] = mat.NewDense(attn.dHead, T, nil)
+			attn.Q[h] = mat.NewDense(attn.DHead, T, nil)
+			attn.K[h] = mat.NewDense(attn.DHead, T, nil)
+			attn.V[h] = mat.NewDense(attn.DHead, T, nil)
 			attn.Scores[h] = mat.NewDense(T, T, nil)
-			attn.O[h] = mat.NewDense(attn.dHead, T, nil)
+			attn.O[h] = mat.NewDense(attn.DHead, T, nil)
 			attn.A[h] = nil // will be set fresh (RowSoftmaxMasked allocates)
 		}
 		attn.lastT = T
@@ -81,12 +84,12 @@ func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 		} else if ar, ac := attn.A[h].Dims(); ar != T || ac != T {
 			attn.A[h] = mat.NewDense(T, T, nil)
 		}
-		RowSoftmaxMaskedInPlace(attn.A[h], attn.Scores[h], mask)
+		utils.RowSoftmaxMaskedInPlace(attn.A[h], attn.Scores[h], mask)
 		// O = V * A^T
 		attn.O[h].Mul(attn.V[h], attn.A[h].T())
 		// concat into headsCat rows
-		base := h * attn.dHead
-		dst := headsCat.Slice(base, base+attn.dHead, 0, T).(*mat.Dense)
+		base := h * attn.DHead
+		dst := headsCat.Slice(base, base+attn.DHead, 0, T).(*mat.Dense)
 		dst.Copy(attn.O[h])
 	}
 	if attn.parallel && attn.H > 1 {
@@ -98,22 +101,31 @@ func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 		}
 		wg.Wait()
 	} else {
-		for h := 0; h < attn.H; h++ { work(h) }
+		for h := 0; h < attn.H; h++ {
+			work(h)
+		}
 	}
 	attn.O_cat = headsCat
 	// Debug: quick sanity check on head 0 attention row sums.
-    if config.Debug && attn.H > 0 && attn.t%config.DebugEvery == 0 {
-        a := attn.A[0]
-        if a != nil {
-            rs := RowSums(a)
-            mn, mx := rs[0], rs[0]
-            for _, v := range rs { if v < mn { mn = v }; if v > mx { mx = v } }
-            debugf("Attn: head0 A row-sum min/max = %.4f/%.4f (T=%d)", mn, mx,
-                len(rs))
-        }
-    }
+	if params.Config.Debug && attn.H > 0 && attn.T%params.Config.DebugEvery == 0 {
+		a := attn.A[0]
+		if a != nil {
+			rs := utils.RowSums(a)
+			mn, mx := rs[0], rs[0]
+			for _, v := range rs {
+				if v < mn {
+					mn = v
+				}
+				if v > mx {
+					mx = v
+				}
+			}
+			utils.Debugf("Attn: head0 A row-sum min/max = %.4f/%.4f (T=%d)", mn, mx,
+				len(rs))
+		}
+	}
 
-	Y := toDense(dot(attn.Woutput, headsCat)) // (dModel x 1)
+	Y := utils.ToDense(utils.Dot(attn.Woutput, headsCat)) // (dModel x 1)
 	return Y
 }
 
@@ -121,35 +133,35 @@ func (attn *Attention) Forward(X *mat.Dense) *mat.Dense {
 func (attn *Attention) Backward(dY *mat.Dense) *mat.Dense {
 	dX, dWq, dWk, dWv, dWout := attn.BackwardGradsOnly(dY)
 
-	attn.t++
-	lr := attn.learningRate
+	attn.T++
+	lr := attn.LearningRate
 
 	// Global per-module grad clipping (includes all heads + Wout)
-    if config.GradClip > 0 {
-        // flatten slice for clip call
-        grads := []*mat.Dense{dWout}
-        for h := 0; h < attn.H; h++ {
-            grads = append(grads, dWq[h], dWk[h], dWv[h])
-        }
-        s := clipGrads(config.GradClip, grads...)
-        if s < 1.0 && config.Debug && attn.t%config.DebugEvery == 0 {
-            debugf("Attn: clipped grads by %.4f at step %d", s, attn.t)
-        }
-    }
+	if params.Config.GradClip > 0 {
+		// flatten slice for clip call
+		grads := []*mat.Dense{dWout}
+		for h := 0; h < attn.H; h++ {
+			grads = append(grads, dWq[h], dWk[h], dWv[h])
+		}
+		s := utils.ClipGrads(params.Config.GradClip, grads...)
+		if s < 1.0 && params.Config.Debug && attn.T%params.Config.DebugEvery == 0 {
+			utils.Debugf("Attn: clipped grads by %.4f at step %d", s, attn.T)
+		}
+	}
 
 	for h := 0; h < attn.H; h++ {
-		 adamUpdateInPlace(attn.Wquery[h], dWq[h], attn.mWq[h], attn.vWq[h],
-            attn.t, lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
-            config.WeightDecay)
-        adamUpdateInPlace(attn.Wkey[h], dWk[h], attn.mWk[h], attn.vWk[h],
-            attn.t, lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
-            config.WeightDecay)
-        adamUpdateInPlace(attn.Wvalue[h], dWv[h], attn.mWv[h], attn.vWv[h],
-            attn.t, lr, config.AdamBeta1, config.AdamBeta2, config.AdamEps,
-            config.WeightDecay)
+		optimizations.AdamUpdateInPlace(attn.Wquery[h], dWq[h], attn.MWq[h], attn.VWq[h],
+			attn.T, lr, params.Config.AdamBeta1, params.Config.AdamBeta2, params.Config.AdamEps,
+			params.Config.WeightDecay)
+		optimizations.AdamUpdateInPlace(attn.Wkey[h], dWk[h], attn.MWk[h], attn.VWk[h],
+			attn.T, lr, params.Config.AdamBeta1, params.Config.AdamBeta2, params.Config.AdamEps,
+			params.Config.WeightDecay)
+		optimizations.AdamUpdateInPlace(attn.Wvalue[h], dWv[h], attn.MWv[h], attn.VWv[h],
+			attn.T, lr, params.Config.AdamBeta1, params.Config.AdamBeta2, params.Config.AdamEps,
+			params.Config.WeightDecay)
 	}
-	adamUpdateInPlace(attn.Woutput, dWout, attn.mWo, attn.vWo, attn.t, lr,
-        config.AdamBeta1, config.AdamBeta2, config.AdamEps, config.WeightDecay)
+	optimizations.AdamUpdateInPlace(attn.Woutput, dWout, attn.MWo, attn.VWo, attn.T, lr,
+		params.Config.AdamBeta1, params.Config.AdamBeta2, params.Config.AdamEps, params.Config.WeightDecay)
 
 	return dX
 }
@@ -176,43 +188,43 @@ func (attn *Attention) BackwardGradsOnly(dY *mat.Dense) (
 	}
 
 	// dY with respect to Y = Wout * Ocat
-	dWout = toDense(dot(dY, attn.O_cat.T()))
-	dOcat := toDense(dot(attn.Woutput.T(), dY))
+	dWout = utils.ToDense(utils.Dot(dY, attn.O_cat.T()))
+	dOcat := utils.ToDense(utils.Dot(attn.Woutput.T(), dY))
 
-	dXtotal := mat.NewDense(attn.dModel, T, nil)
+	dXtotal := mat.NewDense(attn.DModel, T, nil)
 
 	row := 0
-	rescale := 1.0 / math.Sqrt(float64(attn.dHead))
+	rescale := 1.0 / math.Sqrt(float64(attn.DHead))
 
 	for h := 0; h < attn.H; h++ {
 		// slice out this head’s portion of dOcat
-		dO := dOcat.Slice(row, row+attn.dHead, 0, T).(*mat.Dense)
+		dO := dOcat.Slice(row, row+attn.DHead, 0, T).(*mat.Dense)
 
-		row += attn.dHead
+		row += attn.DHead
 
 		// O = V * A^T
-		dV := toDense(dot(dO, attn.A[h]))       // (dHead x T)
-		dA_T := toDense(dot(attn.V[h].T(), dO)) // (T x T)
+		dV := utils.ToDense(utils.Dot(dO, attn.A[h]))       // (dHead x T)
+		dA_T := utils.ToDense(utils.Dot(attn.V[h].T(), dO)) // (T x T)
 		dA := dA_T.T()
 
 		// A = softmax_row(S)
-		dS := softmaxBackward(dA, attn.A[h]) // (T x T)
+		dS := utils.SoftmaxBackward(dA, attn.A[h]) // (T x T)
 
 		// S = Q^T K / sqrt(dHead)
-		dQ := toDense(scale(rescale, dot(attn.K[h], dS.T()))) // (dHead x T)
-		dK := toDense(scale(rescale, dot(attn.Q[h], dS)))     // (dHead x T)
+		dQ := utils.ToDense(utils.Scale(rescale, utils.Dot(attn.K[h], dS.T()))) // (dHead x T)
+		dK := utils.ToDense(utils.Scale(rescale, utils.Dot(attn.Q[h], dS)))     // (dHead x T)
 
 		// Params
-		dWq[h] = toDense(dot(dQ, attn.X.T()))
-		dWk[h] = toDense(dot(dK, attn.X.T()))
-		dWv[h] = toDense(dot(dV, attn.X.T()))
+		dWq[h] = utils.ToDense(utils.Dot(dQ, attn.X.T()))
+		dWk[h] = utils.ToDense(utils.Dot(dK, attn.X.T()))
+		dWv[h] = utils.ToDense(utils.Dot(dV, attn.X.T()))
 
 		// Inputs
-		dXq := toDense(dot(attn.Wquery[h].T(), dQ))
-		dXk := toDense(dot(attn.Wkey[h].T(), dK))
-		dXv := toDense(dot(attn.Wvalue[h].T(), dV))
-		dXh := toDense(add(add(dXq, dXk), dXv))
-		dXtotal = toDense(add(dXtotal, dXh))
+		dXq := utils.ToDense(utils.Dot(attn.Wquery[h].T(), dQ))
+		dXk := utils.ToDense(utils.Dot(attn.Wkey[h].T(), dK))
+		dXv := utils.ToDense(utils.Dot(attn.Wvalue[h].T(), dV))
+		dXh := utils.ToDense(utils.Add(utils.Add(dXq, dXk), dXv))
+		dXtotal = utils.ToDense(utils.Add(dXtotal, dXh))
 	}
 	return dXtotal, dWq, dWk, dWv, dWout
 }
@@ -222,13 +234,13 @@ func (attn *Attention) BackwardGradsOnly(dY *mat.Dense) (
 type AttnKV struct {
 	K []*mat.Dense // per head: (dHead x t)
 	V []*mat.Dense // per head: (dHead x t)
-	t int
+	T int
 }
 
 func newAttnKV(H, dHead int) AttnKV {
 	k := make([]*mat.Dense, H)
 	v := make([]*mat.Dense, H)
-	return AttnKV{K: k, V: v, t: 0}
+	return AttnKV{K: k, V: v, T: 0}
 }
 
 // append column helper: returns a new matrix with one more column
@@ -257,10 +269,10 @@ func appendCol(dst, col *mat.Dense) *mat.Dense {
 // xLast: (dModel x 1), returns yLast: (dModel x 1). Updates kv in-place.
 func (attn *Attention) ForwardLastWithKV(xLast *mat.Dense, kv *AttnKV) *mat.Dense {
 	if kv.K == nil || len(kv.K) != attn.H {
-		*kv = newAttnKV(attn.H, attn.dHead)
+		*kv = newAttnKV(attn.H, attn.DHead)
 	}
-	rescale := 1.0 / math.Sqrt(float64(attn.dHead))
-	headsCatLast := mat.NewDense(attn.dModel, 1, nil)
+	rescale := 1.0 / math.Sqrt(float64(attn.DHead))
+	headsCatLast := mat.NewDense(attn.DModel, 1, nil)
 	// per-head local buffers
 	for h := 0; h < attn.H; h++ {
 		// q,k,v for last token
@@ -269,13 +281,13 @@ func (attn *Attention) ForwardLastWithKV(xLast *mat.Dense, kv *AttnKV) *mat.Dens
 		k.Mul(attn.Wkey[h], xLast)
 		v.Mul(attn.Wvalue[h], xLast)
 		// append to cache
-		kv.K[h] = appendCol(kv.K[h], toDense(&k))
-		kv.V[h] = appendCol(kv.V[h], toDense(&v))
+		kv.K[h] = appendCol(kv.K[h], utils.ToDense(&k))
+		kv.V[h] = appendCol(kv.V[h], utils.ToDense(&v))
 
 		// cap cache length to SeqLen by dropping oldest columns
-		if config.SeqLen > 0 {
-			if cols := kv.K[h].RawMatrix().Cols; cols > config.SeqLen {
-				start := cols - config.SeqLen
+		if params.Config.SeqLen > 0 {
+			if cols := kv.K[h].RawMatrix().Cols; cols > params.Config.SeqLen {
+				start := cols - params.Config.SeqLen
 				kv.K[h] = kv.K[h].Slice(0, kv.K[h].RawMatrix().Rows, start, cols).(*mat.Dense)
 				kv.V[h] = kv.V[h].Slice(0, kv.V[h].RawMatrix().Rows, start, cols).(*mat.Dense)
 			}
@@ -287,23 +299,23 @@ func (attn *Attention) ForwardLastWithKV(xLast *mat.Dense, kv *AttnKV) *mat.Dens
 		s.Scale(rescale, &s)
 		// softmax of row vector (1 x T)
 		// Reuse RowSoftmax on a 1-row matrix by wrapping
-		Arow := RowSoftmax(toDense(&s))
+		Arow := utils.RowSoftmax(utils.ToDense(&s))
 		// O_last = V * Arow^T  => (dHead x 1)
 		var o mat.Dense
 		o.Mul(kv.V[h], Arow.T())
 		// write into headsCatLast rows
-		base := h * attn.dHead
-		dst := headsCatLast.Slice(base, base+attn.dHead, 0, 1).(*mat.Dense)
-		dst.Copy(toDense(&o))
+		base := h * attn.DHead
+		dst := headsCatLast.Slice(base, base+attn.DHead, 0, 1).(*mat.Dense)
+		dst.Copy(utils.ToDense(&o))
 	}
 	// update cached length
 	if kv.K[0] != nil {
-		kv.t = kv.K[0].RawMatrix().Cols
+		kv.T = kv.K[0].RawMatrix().Cols
 	} else {
-		kv.t = 0
+		kv.T = 0
 	}
 	// output projection
 	var yLast mat.Dense
 	yLast.Mul(attn.Woutput, headsCatLast)
-	return toDense(&yLast)
+	return utils.ToDense(&yLast)
 }

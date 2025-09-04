@@ -5,6 +5,9 @@ import (
 	"math/rand"
 	"testing"
 
+	"github.com/manningwu07/GPT/params"
+	"github.com/manningwu07/GPT/transformer"
+	"github.com/manningwu07/GPT/utils"
 	"gonum.org/v1/gonum/mat"
 )
 
@@ -39,21 +42,21 @@ func TestAttentionGradCheck(t *testing.T) {
 	rand.Seed(123)
 	dModel := 4
 	nHeads := 2
-	attn := NewAttention(dModel, nHeads, 0.0)
+	attn := transformer.NewAttention(dModel, nHeads, 0.0)
 
-	x := mat.NewDense(dModel, 3, randomArray(dModel*3, float64(dModel)))
-	target := oneHot(dModel, 2)
+	x := mat.NewDense(dModel, 3, utils.RandomArray(dModel*3, float64(dModel)))
+	target := utils.OneHot(dModel, 2)
 
 	// Forward + loss
 	forward := func() float64 {
 		logits := attn.Forward(x)
-		loss, _ := CrossEntropyWithGrad(lastCol(logits), target)
+		loss, _ := utils.CrossEntropyWithGrad(utils.LastCol(logits), target)
 		return loss
 	}
 
 	// Analytic grads
 	logits := attn.Forward(x)
-	_, dL_dY := CrossEntropyWithGrad(lastCol(logits), target)
+	_, dL_dY := utils.CrossEntropyWithGrad(utils.LastCol(logits), target)
 	_, dWq, dWk, dWv, dWo := attn.BackwardGradsOnly(dL_dY)
 
 	// Check one element from each
@@ -67,100 +70,100 @@ func TestAttentionGradCheck(t *testing.T) {
 func TestMLPGradCheck(t *testing.T) {
 	rand.Seed(123)
 	dModel := 4
-	mlp := &MLP{
-		inputs:        dModel,
-		hiddens:       5,
-		outputs:       dModel,
-		learningRate:  0.0,
-		hiddenWeights: mat.NewDense(5, dModel, randomArray(5*dModel, float64(dModel))),
-		hiddenBias:    mat.NewDense(5, 1, nil),
-		outputWeights: mat.NewDense(dModel, 5, randomArray(dModel*5, float64(dModel))),
-		outputBias:    mat.NewDense(dModel, 1, nil),
+	mlp := &transformer.MLP{
+		Inputs:        dModel,
+		Hiddens:       5,
+		Outputs:       dModel,
+		LearningRate:  0.0,
+		HiddenWeights: mat.NewDense(5, dModel, utils.RandomArray(5*dModel, float64(dModel))),
+		HiddenBias:    mat.NewDense(5, 1, nil),
+		OutputWeights: mat.NewDense(dModel, 5, utils.RandomArray(dModel*5, float64(dModel))),
+		OutputBias:    mat.NewDense(dModel, 1, nil),
 	}
 
-	x := mat.NewDense(dModel, 1, randomArray(dModel, float64(dModel)))
-	target := oneHot(dModel, 2)
+	x := mat.NewDense(dModel, 1, utils.RandomArray(dModel, float64(dModel)))
+	target := utils.OneHot(dModel, 2)
 
 	forward := func() float64 {
 		logits := mlp.Forward(x)
-		loss, _ := CrossEntropyWithGrad(logits, target)
+		loss, _ := utils.CrossEntropyWithGrad(logits, target)
 		return loss
 	}
 
 	logits := mlp.Forward(x)
-	_, dL_dY := CrossEntropyWithGrad(logits, target)
+	_, dL_dY := utils.CrossEntropyWithGrad(logits, target)
 	_, dWhid, _, dWout, _ := mlp.BackwardGradsOnly(dL_dY)
 
 	// Check one element from each param
-	finiteDiffCheck(t, "hiddenWeights", mlp.hiddenWeights, dWhid, forward, 0, 0)
-	finiteDiffCheck(t, "outputWeights", mlp.outputWeights, dWout, forward, 0, 0)
+	finiteDiffCheck(t, "hiddenWeights", mlp.HiddenWeights, dWhid, forward, 0, 0)
+	finiteDiffCheck(t, "outputWeights", mlp.OutputWeights, dWout, forward, 0, 0)
 }
 
 // ---- Transformer Block ----
 func TestBlockGradCheck(t *testing.T) {
 	rand.Seed(123)
 	dModel := 4
-	block := TransformerBlock{
-		attn: NewAttention(dModel, 2, 0.0),
-		mlp: &MLP{
-			inputs:        dModel,
-			hiddens:       5,
-			outputs:       dModel,
-			learningRate:  0.0,
-			hiddenWeights: mat.NewDense(5, dModel, randomArray(5*dModel, float64(dModel))),
-			hiddenBias:    mat.NewDense(5, 1, nil),
-			outputWeights: mat.NewDense(dModel, 5, randomArray(dModel*5, float64(dModel))),
-			outputBias:    mat.NewDense(dModel, 1, nil),
+	block := transformer.TransformerBlock{
+		Attn: transformer.NewAttention(dModel, 2, 0.0),
+		Mlp: &transformer.MLP{
+			Inputs:        dModel,
+			Hiddens:       5,
+			Outputs:       dModel,
+			LearningRate:  0.0,
+			HiddenWeights: mat.NewDense(5, dModel, utils.RandomArray(5*dModel, float64(dModel))),
+			HiddenBias:    mat.NewDense(5, 1, nil),
+			OutputWeights: mat.NewDense(dModel, 5, utils.RandomArray(dModel*5, float64(dModel))),
+			OutputBias:    mat.NewDense(dModel, 1, nil),
 		},
 	}
 
-	x := mat.NewDense(dModel, 3, randomArray(dModel*3, float64(dModel)))
-	target := oneHot(dModel, 2)
+	x := mat.NewDense(dModel, 3, utils.RandomArray(dModel*3, float64(dModel)))
+	target := utils.OneHot(dModel, 2)
 
 	forward := func() float64 {
 		logits := block.Forward(x)
-		loss, _ := CrossEntropyWithGrad(lastCol(logits), target)
+		loss, _ := utils.CrossEntropyWithGrad(utils.LastCol(logits), target)
 		return loss
 	}
 
 	logits := block.Forward(x)
-	_, dL_dY := CrossEntropyWithGrad(lastCol(logits), target)
+	_, dL_dY := utils.CrossEntropyWithGrad(utils.LastCol(logits), target)
 	_, dWq, _, _, _, dWhid, _ := block.BackwardGradsOnly(dL_dY)
 
 	// Just check one param from attn and mlp
-	finiteDiffCheck(t, "Block.Wquery", block.attn.Wquery[0], dWq[0], forward, 0, 0)
-	finiteDiffCheck(t, "Block.hiddenWeights", block.mlp.hiddenWeights, dWhid, forward, 0, 0)
+	finiteDiffCheck(t, "Block.Wquery", block.Attn.Wquery[0], dWq[0], forward, 0, 0)
+	finiteDiffCheck(t, "Block.hiddenWeights", block.Mlp.HiddenWeights, dWhid, forward, 0, 0)
 }
 
 // ---- Full Transformer ----
 func TestTransformerGradCheck(t *testing.T) {
 	rand.Seed(123)
-	layers = 2
-	gpt := CreateGPT(4, 5, 4, 0.0, 0.0)
+	params.Layers = 2
+	gpt := transformer.CreateGPT(4, 5, 4, 0.0, 0.0)
 
-	x := mat.NewDense(4, 3, randomArray(12, 4))
-	target := oneHot(4, 2)
+	x := mat.NewDense(4, 3, utils.RandomArray(12, 4))
+	target := utils.OneHot(4, 2)
 
 	forward := func() float64 {
 		Y := x
-		for i := 0; i < layers; i++ {
-			Y = gpt.blocks[i].Forward(Y)
+		for i := 0; i < params.Layers; i++ {
+			Y = gpt.Blocks[i].Forward(Y)
 		}
-		loss, _ := CrossEntropyWithGrad(lastCol(Y), target)
+		loss, _ := utils.CrossEntropyWithGrad(utils.LastCol(Y), target)
 		return loss
 	}
 
 	// Analytic grads via grads-only backprop across the stack
 	Y := x
-	for i := 0; i < layers; i++ {
-		Y = gpt.blocks[i].Forward(Y)
+	for i := 0; i < params.Layers; i++ {
+		Y = gpt.Blocks[i].Forward(Y)
 	}
-	_, dL_dY := CrossEntropyWithGrad(lastCol(Y), target)
+	_, dL_dY := utils.CrossEntropyWithGrad(utils.LastCol(Y), target)
 
 	var dWq0 []*mat.Dense
 	dY := dL_dY
-	for i := layers - 1; i >= 0; i-- {
-		dX, dWq, _, _, _, _, _ := gpt.blocks[i].BackwardGradsOnly(dY)
+	for i := params.Layers - 1; i >= 0; i-- {
+		dX, dWq, _, _, _, _, _ := gpt.Blocks[i].BackwardGradsOnly(dY)
 		if i == 0 {
 			dWq0 = dWq
 		}
@@ -169,5 +172,5 @@ func TestTransformerGradCheck(t *testing.T) {
 
 	// Check one param from first block's attention
 	finiteDiffCheck(t, "Transformer.Wquery",
-		gpt.blocks[0].attn.Wquery[0], dWq0[0], forward, 0, 0)
+		gpt.Blocks[0].Attn.Wquery[0], dWq0[0], forward, 0, 0)
 }

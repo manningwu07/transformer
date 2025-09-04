@@ -1,4 +1,4 @@
-package main
+package transformer
 
 import (
 	"bytes"
@@ -6,65 +6,9 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/manningwu07/GPT/params"
 	"gonum.org/v1/gonum/mat"
 )
-type posData struct { R, C int; Data []float64 }
-
-// Predict generates text autoregressively from an English prompt.
-// It tokenizes the input, embeds it, runs it through the Transformer,
-// and predicts next tokens until <eos> or maxLen.
-func (gpt *Transformer) Predict(input string, maxLen int) []string {
-	if emb == nil {
-		panic("embeddings not initialized; call loadTrainingSet first")
-	}
-
-	// make sure <eos> is present at inference time
-	ensureEOSToken()
-	// Tokenize into 1–4 char pieces
-	toks := tokenizeENPieces(input)
-	// Start with <bos> + prompt
-	toks = append(toks, "<eos>")
-	seq := append([]string{"<bos>"}, toks...)
-	ids := make([]int, len(seq))
-	for i, t := range seq {
-		ids[i] = vocabLookup(vocab, t)
-	}
-	// Per-block KV caches
-	type blkKV struct{ attnKV AttnKV }
-	kvs := make([]blkKV, layers)
-	// Prime caches by rolling through the prompt tokens
-	var yLast *mat.Dense
-	for t := 0; t < len(ids); t++ {
-		xLast := colAsVector(emb, ids[t])
-		yLast = addPosCol(xLast, kvs[0].attnKV.t)
-		for l := 0; l < layers; l++ {
-			yLast = gpt.blocks[l].ForwardLastWithKV(yLast, &kvs[l].attnKV)
-			// For blocks >0, do NOT add positional embedding again.
-		}
-	}
-	// Generate up to maxLen new tokens
-	for steps := 0; steps < maxLen; steps++ {
-		logits := Unembed(yLast)
-		probs := ColVectorSoftmax(logits)
-		nextID := sampleFromProbs(probs, 50, 0.9)
-		nextTok := vocab.IDToToken[nextID]
-		if nextTok == "<eos>" {
-			break
-		}
-		ids = append(ids, nextID)
-		seq = append(seq, nextTok)
-		// advance one step using KV cache
-		xLast := colAsVector(emb, nextID)
-		yLast = addPosCol(xLast, kvs[0].attnKV.t)
-		for l := 0; l < layers; l++ {
-			yLast = gpt.blocks[l].ForwardLastWithKV(yLast, &kvs[l].attnKV)
-		}
-	}
-	// return generated tokens after the prompt
-	fmt.Println("Input tokens:", toks)
-	fmt.Println("Mapped IDs:", ids)
-	return seq[1+len(toks):]
-}
 
 // SaveTransformer persists a Transformer (weights only) to disk using gob.
 // It serializes numeric weights for attention (all heads), output projection,
@@ -141,14 +85,22 @@ type blockData struct {
 	Ln2MBeta, Ln2VBeta   []float64
 }
 
+// save persists the whole Transformer using the gob-based SaveTransformer.
+func Save(gpt Transformer) error {
+	_ = os.MkdirAll("models", 0o755)
+	path := "models/transformer.gob"
+	return SaveTransformer(&gpt, path)
+}
+
+
 func SaveTransformer(gpt *Transformer, filename string) error {
 	data := modelData{}
-	data.Layers = len(gpt.blocks)
-	data.Blocks = make([]blockData, len(gpt.blocks))
+	data.Layers = len(gpt.Blocks)
+	data.Blocks = make([]blockData, len(gpt.Blocks))
 
-	for i, b := range gpt.blocks {
-		attn := b.attn
-		mlp := b.mlp
+	for i, b := range gpt.Blocks {
+		attn := b.Attn
+		mlp := b.Mlp
 
 		// Heads
 		hArr := make([]headData, attn.H)
@@ -159,9 +111,9 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 				raw := mat.DenseCopyOf(attn.Wquery[h]).RawMatrix()
 				hArr[h].WqR, hArr[h].WqC = r, c
 				hArr[h].WqData = append([]float64(nil), raw.Data...)
-				if attn.mWq[h] != nil {
-					mRaw := mat.DenseCopyOf(attn.mWq[h]).RawMatrix()
-					vRaw := mat.DenseCopyOf(attn.vWq[h]).RawMatrix()
+				if attn.MWq[h] != nil {
+					mRaw := mat.DenseCopyOf(attn.MWq[h]).RawMatrix()
+					vRaw := mat.DenseCopyOf(attn.VWq[h]).RawMatrix()
 					hArr[h].MWq = append([]float64(nil), mRaw.Data...)
 					hArr[h].VWq = append([]float64(nil), vRaw.Data...)
 				}
@@ -172,9 +124,9 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 				raw := mat.DenseCopyOf(attn.Wkey[h]).RawMatrix()
 				hArr[h].WkR, hArr[h].WkC = r, c
 				hArr[h].WkData = append([]float64(nil), raw.Data...)
-				if attn.mWk[h] != nil {
-					mRaw := mat.DenseCopyOf(attn.mWk[h]).RawMatrix()
-					vRaw := mat.DenseCopyOf(attn.vWk[h]).RawMatrix()
+				if attn.MWk[h] != nil {
+					mRaw := mat.DenseCopyOf(attn.MWk[h]).RawMatrix()
+					vRaw := mat.DenseCopyOf(attn.VWk[h]).RawMatrix()
 					hArr[h].MKq = append([]float64(nil), mRaw.Data...)
 					hArr[h].VKq = append([]float64(nil), vRaw.Data...)
 				}
@@ -185,9 +137,9 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 				raw := mat.DenseCopyOf(attn.Wvalue[h]).RawMatrix()
 				hArr[h].WvR, hArr[h].WvC = r, c
 				hArr[h].WvData = append([]float64(nil), raw.Data...)
-				if attn.mWv[h] != nil {
-					mRaw := mat.DenseCopyOf(attn.mWv[h]).RawMatrix()
-					vRaw := mat.DenseCopyOf(attn.vWv[h]).RawMatrix()
+				if attn.MWv[h] != nil {
+					mRaw := mat.DenseCopyOf(attn.MWv[h]).RawMatrix()
+					vRaw := mat.DenseCopyOf(attn.VWv[h]).RawMatrix()
 					hArr[h].MVq = append([]float64(nil), mRaw.Data...)
 					hArr[h].VVq = append([]float64(nil), vRaw.Data...)
 				}
@@ -201,9 +153,9 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 			raw := mat.DenseCopyOf(attn.Woutput).RawMatrix()
 			data.Blocks[i].WoR, data.Blocks[i].WoC = r, c
 			data.Blocks[i].WoData = append([]float64(nil), raw.Data...)
-			if attn.mWo != nil {
-				mRaw := mat.DenseCopyOf(attn.mWo).RawMatrix()
-				vRaw := mat.DenseCopyOf(attn.vWo).RawMatrix()
+			if attn.MWo != nil {
+				mRaw := mat.DenseCopyOf(attn.MWo).RawMatrix()
+				vRaw := mat.DenseCopyOf(attn.VWo).RawMatrix()
 				data.Blocks[i].MWo = append([]float64(nil), mRaw.Data...)
 				data.Blocks[i].VWo = append([]float64(nil), vRaw.Data...)
 			}
@@ -211,50 +163,50 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 
 		// MLP
 		if mlp != nil {
-			if mlp.hiddenWeights != nil {
-				r, c := mlp.hiddenWeights.Dims()
-				raw := mat.DenseCopyOf(mlp.hiddenWeights).RawMatrix()
+			if mlp.HiddenWeights != nil {
+				r, c := mlp.HiddenWeights.Dims()
+				raw := mat.DenseCopyOf(mlp.HiddenWeights).RawMatrix()
 				data.Blocks[i].HiddenWR, data.Blocks[i].HiddenWC = r, c
 				data.Blocks[i].HiddenW = append([]float64(nil), raw.Data...)
-				if mlp.mHiddenW != nil {
-					mRaw := mat.DenseCopyOf(mlp.mHiddenW).RawMatrix()
-					vRaw := mat.DenseCopyOf(mlp.vHiddenW).RawMatrix()
+				if mlp.MHiddenW != nil {
+					mRaw := mat.DenseCopyOf(mlp.MHiddenW).RawMatrix()
+					vRaw := mat.DenseCopyOf(mlp.VHiddenW).RawMatrix()
 					data.Blocks[i].MHiddenW = append([]float64(nil), mRaw.Data...)
 					data.Blocks[i].VHiddenW = append([]float64(nil), vRaw.Data...)
 				}
 			}
-			if mlp.hiddenBias != nil {
-				r, c := mlp.hiddenBias.Dims()
-				raw := mat.DenseCopyOf(mlp.hiddenBias).RawMatrix()
+			if mlp.HiddenBias != nil {
+				r, c := mlp.HiddenBias.Dims()
+				raw := mat.DenseCopyOf(mlp.HiddenBias).RawMatrix()
 				data.Blocks[i].HiddenBR, data.Blocks[i].HiddenBC = r, c
 				data.Blocks[i].HiddenB = append([]float64(nil), raw.Data...)
-				if mlp.mHiddenB != nil {
-					mRaw := mat.DenseCopyOf(mlp.mHiddenB).RawMatrix()
-					vRaw := mat.DenseCopyOf(mlp.vHiddenB).RawMatrix()
+				if mlp.MHiddenB != nil {
+					mRaw := mat.DenseCopyOf(mlp.MHiddenB).RawMatrix()
+					vRaw := mat.DenseCopyOf(mlp.VHiddenB).RawMatrix()
 					data.Blocks[i].MHiddenB = append([]float64(nil), mRaw.Data...)
 					data.Blocks[i].VHiddenB = append([]float64(nil), vRaw.Data...)
 				}
 			}
-			if mlp.outputWeights != nil {
-				r, c := mlp.outputWeights.Dims()
-				raw := mat.DenseCopyOf(mlp.outputWeights).RawMatrix()
+			if mlp.OutputWeights != nil {
+				r, c := mlp.OutputWeights.Dims()
+				raw := mat.DenseCopyOf(mlp.OutputWeights).RawMatrix()
 				data.Blocks[i].OutputWR, data.Blocks[i].OutputWC = r, c
 				data.Blocks[i].OutputW = append([]float64(nil), raw.Data...)
-				if mlp.mOutputW != nil {
-					mRaw := mat.DenseCopyOf(mlp.mOutputW).RawMatrix()
-					vRaw := mat.DenseCopyOf(mlp.vOutputW).RawMatrix()
+				if mlp.MOutputW != nil {
+					mRaw := mat.DenseCopyOf(mlp.MOutputW).RawMatrix()
+					vRaw := mat.DenseCopyOf(mlp.VOutputW).RawMatrix()
 					data.Blocks[i].MOutputW = append([]float64(nil), mRaw.Data...)
 					data.Blocks[i].VOutputW = append([]float64(nil), vRaw.Data...)
 				}
 			}
-			if mlp.outputBias != nil {
-				r, c := mlp.outputBias.Dims()
-				raw := mat.DenseCopyOf(mlp.outputBias).RawMatrix()
+			if mlp.OutputBias != nil {
+				r, c := mlp.OutputBias.Dims()
+				raw := mat.DenseCopyOf(mlp.OutputBias).RawMatrix()
 				data.Blocks[i].OutputBR, data.Blocks[i].OutputBC = r, c
 				data.Blocks[i].OutputB = append([]float64(nil), raw.Data...)
-				if mlp.mOutputB != nil {
-					mRaw := mat.DenseCopyOf(mlp.mOutputB).RawMatrix()
-					vRaw := mat.DenseCopyOf(mlp.vOutputB).RawMatrix()
+				if mlp.MOutputB != nil {
+					mRaw := mat.DenseCopyOf(mlp.MOutputB).RawMatrix()
+					vRaw := mat.DenseCopyOf(mlp.VOutputB).RawMatrix()
 					data.Blocks[i].MOutputB = append([]float64(nil), mRaw.Data...)
 					data.Blocks[i].VOutputB = append([]float64(nil), vRaw.Data...)
 				}
@@ -262,31 +214,31 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 		}
 
 		// LayerNorms
-		if b.ln1 != nil {
-			gRaw := mat.DenseCopyOf(b.ln1.gamma).RawMatrix()
-			bRaw := mat.DenseCopyOf(b.ln1.beta).RawMatrix()
+		if b.Ln1 != nil {
+			gRaw := mat.DenseCopyOf(b.Ln1.Gamma).RawMatrix()
+			bRaw := mat.DenseCopyOf(b.Ln1.Beta).RawMatrix()
 			data.Blocks[i].Ln1Gamma = append([]float64(nil), gRaw.Data...)
 			data.Blocks[i].Ln1Beta  = append([]float64(nil), bRaw.Data...)
 
-			mG := mat.DenseCopyOf(b.ln1.mGamma).RawMatrix()
-			vG := mat.DenseCopyOf(b.ln1.vGamma).RawMatrix()
-			mB := mat.DenseCopyOf(b.ln1.mBeta).RawMatrix()
-			vB := mat.DenseCopyOf(b.ln1.vBeta).RawMatrix()
+			mG := mat.DenseCopyOf(b.Ln1.MGamma).RawMatrix()
+			vG := mat.DenseCopyOf(b.Ln1.VGamma).RawMatrix()
+			mB := mat.DenseCopyOf(b.Ln1.MBeta).RawMatrix()
+			vB := mat.DenseCopyOf(b.Ln1.VBeta).RawMatrix()
 			data.Blocks[i].Ln1MGamma = append([]float64(nil), mG.Data...)
 			data.Blocks[i].Ln1VGamma = append([]float64(nil), vG.Data...)
 			data.Blocks[i].Ln1MBeta  = append([]float64(nil), mB.Data...)
 			data.Blocks[i].Ln1VBeta  = append([]float64(nil), vB.Data...)
 		}
-		if b.ln2 != nil {
-			gRaw := mat.DenseCopyOf(b.ln2.gamma).RawMatrix()
-			bRaw := mat.DenseCopyOf(b.ln2.beta).RawMatrix()
+		if b.Ln2 != nil {
+			gRaw := mat.DenseCopyOf(b.Ln2.Gamma).RawMatrix()
+			bRaw := mat.DenseCopyOf(b.Ln2.Beta).RawMatrix()
 			data.Blocks[i].Ln2Gamma = append([]float64(nil), gRaw.Data...)
 			data.Blocks[i].Ln2Beta  = append([]float64(nil), bRaw.Data...)
 
-			mG := mat.DenseCopyOf(b.ln2.mGamma).RawMatrix()
-			vG := mat.DenseCopyOf(b.ln2.vGamma).RawMatrix()
-			mB := mat.DenseCopyOf(b.ln2.mBeta).RawMatrix()
-			vB := mat.DenseCopyOf(b.ln2.vBeta).RawMatrix()
+			mG := mat.DenseCopyOf(b.Ln2.MGamma).RawMatrix()
+			vG := mat.DenseCopyOf(b.Ln2.VGamma).RawMatrix()
+			mB := mat.DenseCopyOf(b.Ln2.MBeta).RawMatrix()
+			vB := mat.DenseCopyOf(b.Ln2.VBeta).RawMatrix()
 			data.Blocks[i].Ln2MGamma = append([]float64(nil), mG.Data...)
 			data.Blocks[i].Ln2VGamma = append([]float64(nil), vG.Data...)
 			data.Blocks[i].Ln2MBeta  = append([]float64(nil), mB.Data...)
@@ -295,38 +247,38 @@ func SaveTransformer(gpt *Transformer, filename string) error {
 	}
 
 	// Embeddings
-	if emb != nil {
-		r, c := emb.Dims()
-		raw := mat.DenseCopyOf(emb).RawMatrix()
+	if params.Emb != nil {
+		r, c := params.Emb.Dims()
+		raw := mat.DenseCopyOf(params.Emb).RawMatrix()
 		data.EmbR, data.EmbC = r, c
 		data.EmbData = append([]float64(nil), raw.Data...)
-		if embM != nil {
-			mRaw := mat.DenseCopyOf(embM).RawMatrix()
-			vRaw := mat.DenseCopyOf(embV).RawMatrix()
+		if params.EmbM != nil {
+			mRaw := mat.DenseCopyOf(params.EmbM).RawMatrix()
+			vRaw := mat.DenseCopyOf(params.EmbV).RawMatrix()
 			data.EmbM = append([]float64(nil), mRaw.Data...)
 			data.EmbV = append([]float64(nil), vRaw.Data...)
-			data.EmbT = embT
+			data.EmbT = params.EmbT
 		}
 	}
 
 	// Positional embeddings
-	if posEmb != nil {
-		r, c := posEmb.Dims()
-		raw := mat.DenseCopyOf(posEmb).RawMatrix()
+	if params.PosEmb != nil {
+		r, c := params.PosEmb.Dims()
+		raw := mat.DenseCopyOf(params.PosEmb).RawMatrix()
 		data.PosR, data.PosC = r, c
 		data.PosData = append([]float64(nil), raw.Data...)
-		if posM != nil {
-			mRaw := mat.DenseCopyOf(posM).RawMatrix()
-			vRaw := mat.DenseCopyOf(posV).RawMatrix()
+		if params.PosM != nil {
+			mRaw := mat.DenseCopyOf(params.PosM).RawMatrix()
+			vRaw := mat.DenseCopyOf(params.PosV).RawMatrix()
 			data.PosM = append([]float64(nil), mRaw.Data...)
 			data.PosV = append([]float64(nil), vRaw.Data...)
-			data.PosT = posT
+			data.PosT = params.PosT
 		}
 	}
 
 	// Vocab
-	if len(vocab.IDToToken) > 0 {
-		data.Vocab = append([]string(nil), vocab.IDToToken...)
+	if len(params.Vocab.IDToToken) > 0 {
+		data.Vocab = append([]string(nil), params.Vocab.IDToToken...)
 	}
 
 	// Encode
@@ -352,14 +304,14 @@ func LoadTransformer(gpt *Transformer, filename string) error {
 		return err
 	}
 
-	if len(gpt.blocks) != data.Layers {
-		return fmt.Errorf("LoadTransformer: layer mismatch (have %d, file %d)", len(gpt.blocks), data.Layers)
+	if len(gpt.Blocks) != data.Layers {
+		return fmt.Errorf("LoadTransformer: layer mismatch (have %d, file %d)", len(gpt.Blocks), data.Layers)
 	}
 
-	for i := range gpt.blocks {
-		b := &gpt.blocks[i]
-		attn := b.attn
-		mlp := b.mlp
+	for i := range gpt.Blocks {
+		b := &gpt.Blocks[i]
+		attn := b.Attn
+		mlp := b.Mlp
 		bd := data.Blocks[i]
 
 		// Heads
@@ -371,22 +323,22 @@ func LoadTransformer(gpt *Transformer, filename string) error {
 			if hd.WqR > 0 {
 				attn.Wquery[h] = mat.NewDense(hd.WqR, hd.WqC, hd.WqData)
 				if len(hd.MWq) > 0 {
-					attn.mWq[h] = mat.NewDense(hd.WqR, hd.WqC, hd.MWq)
-					attn.vWq[h] = mat.NewDense(hd.WqR, hd.WqC, hd.VWq)
+					attn.MWq[h] = mat.NewDense(hd.WqR, hd.WqC, hd.MWq)
+					attn.VWq[h] = mat.NewDense(hd.WqR, hd.WqC, hd.VWq)
 				}
 			}
 			if hd.WkR > 0 {
 				attn.Wkey[h] = mat.NewDense(hd.WkR, hd.WkC, hd.WkData)
 				if len(hd.MKq) > 0 {
-					attn.mWk[h] = mat.NewDense(hd.WkR, hd.WkC, hd.MKq)
-					attn.vWk[h] = mat.NewDense(hd.WkR, hd.WkC, hd.VKq)
+					attn.MWk[h] = mat.NewDense(hd.WkR, hd.WkC, hd.MKq)
+					attn.VWk[h] = mat.NewDense(hd.WkR, hd.WkC, hd.VKq)
 				}
 			}
 			if hd.WvR > 0 {
 				attn.Wvalue[h] = mat.NewDense(hd.WvR, hd.WvC, hd.WvData)
 				if len(hd.MVq) > 0 {
-					attn.mWv[h] = mat.NewDense(hd.WvR, hd.WvC, hd.MVq)
-					attn.vWv[h] = mat.NewDense(hd.WvR, hd.WvC, hd.VVq)
+					attn.MWv[h] = mat.NewDense(hd.WvR, hd.WvC, hd.MVq)
+					attn.VWv[h] = mat.NewDense(hd.WvR, hd.WvC, hd.VVq)
 				}
 			}
 		}
@@ -395,94 +347,94 @@ func LoadTransformer(gpt *Transformer, filename string) error {
 		if bd.WoR > 0 {
 			attn.Woutput = mat.NewDense(bd.WoR, bd.WoC, bd.WoData)
 			if len(bd.MWo) > 0 {
-				attn.mWo = mat.NewDense(bd.WoR, bd.WoC, bd.MWo)
-				attn.vWo = mat.NewDense(bd.WoR, bd.WoC, bd.VWo)
+				attn.MWo = mat.NewDense(bd.WoR, bd.WoC, bd.MWo)
+				attn.VWo = mat.NewDense(bd.WoR, bd.WoC, bd.VWo)
 			}
 		}
 
 		// MLP
 		if mlp != nil {
 			if bd.HiddenWR > 0 {
-				mlp.hiddenWeights = mat.NewDense(bd.HiddenWR, bd.HiddenWC, bd.HiddenW)
+				mlp.HiddenWeights = mat.NewDense(bd.HiddenWR, bd.HiddenWC, bd.HiddenW)
 				if len(bd.MHiddenW) > 0 {
-					mlp.mHiddenW = mat.NewDense(bd.HiddenWR, bd.HiddenWC, bd.MHiddenW)
-					mlp.vHiddenW = mat.NewDense(bd.HiddenWR, bd.HiddenWC, bd.VHiddenW)
+					mlp.MHiddenW = mat.NewDense(bd.HiddenWR, bd.HiddenWC, bd.MHiddenW)
+					mlp.VHiddenW = mat.NewDense(bd.HiddenWR, bd.HiddenWC, bd.VHiddenW)
 				}
 			}
 			if bd.HiddenBR > 0 {
-				mlp.hiddenBias = mat.NewDense(bd.HiddenBR, bd.HiddenBC, bd.HiddenB)
+				mlp.HiddenBias = mat.NewDense(bd.HiddenBR, bd.HiddenBC, bd.HiddenB)
 				if len(bd.MHiddenB) > 0 {
-					mlp.mHiddenB = mat.NewDense(bd.HiddenBR, bd.HiddenBC, bd.MHiddenB)
-					mlp.vHiddenB = mat.NewDense(bd.HiddenBR, bd.HiddenBC, bd.VHiddenB)
+					mlp.MHiddenB = mat.NewDense(bd.HiddenBR, bd.HiddenBC, bd.MHiddenB)
+					mlp.VHiddenB = mat.NewDense(bd.HiddenBR, bd.HiddenBC, bd.VHiddenB)
 				}
 			}
 			if bd.OutputWR > 0 {
-				mlp.outputWeights = mat.NewDense(bd.OutputWR, bd.OutputWC, bd.OutputW)
+				mlp.OutputWeights = mat.NewDense(bd.OutputWR, bd.OutputWC, bd.OutputW)
 				if len(bd.MOutputW) > 0 {
-					mlp.mOutputW = mat.NewDense(bd.OutputWR, bd.OutputWC, bd.MOutputW)
-					mlp.vOutputW = mat.NewDense(bd.OutputWR, bd.OutputWC, bd.VOutputW)
+					mlp.MOutputW = mat.NewDense(bd.OutputWR, bd.OutputWC, bd.MOutputW)
+					mlp.VOutputW = mat.NewDense(bd.OutputWR, bd.OutputWC, bd.VOutputW)
 				}
 			}
 			if bd.OutputBR > 0 {
-				mlp.outputBias = mat.NewDense(bd.OutputBR, bd.OutputBC, bd.OutputB)
+				mlp.OutputBias = mat.NewDense(bd.OutputBR, bd.OutputBC, bd.OutputB)
 				if len(bd.MOutputB) > 0 {
-					mlp.mOutputB = mat.NewDense(bd.OutputBR, bd.OutputBC, bd.MOutputB)
-					mlp.vOutputB = mat.NewDense(bd.OutputBR, bd.OutputBC, bd.VOutputB)
+					mlp.MOutputB = mat.NewDense(bd.OutputBR, bd.OutputBC, bd.MOutputB)
+					mlp.VOutputB = mat.NewDense(bd.OutputBR, bd.OutputBC, bd.VOutputB)
 				}
 			}
 		}
 
 		// LayerNorms
 		if len(bd.Ln1Gamma) > 0 {
-			b.ln1.gamma = mat.NewDense(b.ln1.d, 1, bd.Ln1Gamma)
-			b.ln1.beta  = mat.NewDense(b.ln1.d, 1, bd.Ln1Beta)
+			b.Ln1.Gamma = mat.NewDense(b.Ln1.D, 1, bd.Ln1Gamma)
+			b.Ln1.Beta  = mat.NewDense(b.Ln1.D, 1, bd.Ln1Beta)
 			if len(bd.Ln1MGamma) > 0 {
-				b.ln1.mGamma = mat.NewDense(b.ln1.d, 1, bd.Ln1MGamma)
-				b.ln1.vGamma = mat.NewDense(b.ln1.d, 1, bd.Ln1VGamma)
-				b.ln1.mBeta  = mat.NewDense(b.ln1.d, 1, bd.Ln1MBeta)
-				b.ln1.vBeta  = mat.NewDense(b.ln1.d, 1, bd.Ln1VBeta)
+				b.Ln1.MGamma = mat.NewDense(b.Ln1.D, 1, bd.Ln1MGamma)
+				b.Ln1.VGamma = mat.NewDense(b.Ln1.D, 1, bd.Ln1VGamma)
+				b.Ln1.MBeta  = mat.NewDense(b.Ln1.D, 1, bd.Ln1MBeta)
+				b.Ln1.VBeta  = mat.NewDense(b.Ln1.D, 1, bd.Ln1VBeta)
 			}
 		}
 		if len(bd.Ln2Gamma) > 0 {
-			b.ln2.gamma = mat.NewDense(b.ln2.d, 1, bd.Ln2Gamma)
-			b.ln2.beta  = mat.NewDense(b.ln2.d, 1, bd.Ln2Beta)
+			b.Ln2.Gamma = mat.NewDense(b.Ln2.D, 1, bd.Ln2Gamma)
+			b.Ln2.Beta  = mat.NewDense(b.Ln2.D, 1, bd.Ln2Beta)
 			if len(bd.Ln2MGamma) > 0 {
-				b.ln2.mGamma = mat.NewDense(b.ln2.d, 1, bd.Ln2MGamma)
-				b.ln2.vGamma = mat.NewDense(b.ln2.d, 1, bd.Ln2VGamma)
-				b.ln2.mBeta  = mat.NewDense(b.ln2.d, 1, bd.Ln2MBeta)
-				b.ln2.vBeta  = mat.NewDense(b.ln2.d, 1, bd.Ln2VBeta)
+				b.Ln2.MGamma = mat.NewDense(b.Ln2.D, 1, bd.Ln2MGamma)
+				b.Ln2.VGamma = mat.NewDense(b.Ln2.D, 1, bd.Ln2VGamma)
+				b.Ln2.MBeta  = mat.NewDense(b.Ln2.D, 1, bd.Ln2MBeta)
+				b.Ln2.VBeta  = mat.NewDense(b.Ln2.D, 1, bd.Ln2VBeta)
 			}
 		}
 	}
 
 	// Embeddings
 	if data.EmbR > 0 && data.EmbC > 0 {
-		emb = mat.NewDense(data.EmbR, data.EmbC, data.EmbData)
+		params.Emb = mat.NewDense(data.EmbR, data.EmbC, data.EmbData)
 		if len(data.EmbM) > 0 {
-			embM = mat.NewDense(data.EmbR, data.EmbC, data.EmbM)
-			embV = mat.NewDense(data.EmbR, data.EmbC, data.EmbV)
-			embT = data.EmbT
+			params.EmbM = mat.NewDense(data.EmbR, data.EmbC, data.EmbM)
+			params.EmbV = mat.NewDense(data.EmbR, data.EmbC, data.EmbV)
+			params.EmbT = data.EmbT
 		}
 	}
 
 	// Positional embeddings
 	if data.PosR > 0 && data.PosC > 0 {
-		posEmb = mat.NewDense(data.PosR, data.PosC, data.PosData)
+		params.PosEmb = mat.NewDense(data.PosR, data.PosC, data.PosData)
 		if len(data.PosM) > 0 {
-			posM = mat.NewDense(data.PosR, data.PosC, data.PosM)
-			posV = mat.NewDense(data.PosR, data.PosC, data.PosV)
-			posT = data.PosT
+			params.PosM = mat.NewDense(data.PosR, data.PosC, data.PosM)
+			params.PosV = mat.NewDense(data.PosR, data.PosC, data.PosV)
+			params.PosT = data.PosT
 		}
 	}
 
 	// Vocab
 	if len(data.Vocab) > 0 {
-		vocab = Vocab{
+		params.Vocab = params.Vocabulary{
 			TokenToID: map[string]int{},
 			IDToToken: append([]string(nil), data.Vocab...),
 		}
-		for i, tok := range vocab.IDToToken {
-			vocab.TokenToID[tok] = i
+		for i, tok := range params.Vocab.IDToToken {
+			params.Vocab.TokenToID[tok] = i
 		}
 	}
 

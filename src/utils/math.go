@@ -1,4 +1,4 @@
-package main
+package utils
 
 import (
 	"fmt"
@@ -17,7 +17,7 @@ import (
 // m = matrix input number 1
 // n = matrix input number 2
 
-func dot(m, n mat.Matrix) mat.Matrix {
+func Dot(m, n mat.Matrix) mat.Matrix {
 	r, _ := m.Dims()
 	_, c := n.Dims()
 	o := mat.NewDense(r, c, nil)
@@ -25,58 +25,56 @@ func dot(m, n mat.Matrix) mat.Matrix {
 	return o
 }
 
-func apply(fn func(i, j int, v float64) float64, m mat.Matrix) mat.Matrix {
+func Apply(fn func(i, j int, v float64) float64, m mat.Matrix) mat.Matrix {
 	r, c := m.Dims()
 	o := mat.NewDense(r, c, nil)
 	o.Apply(fn, m)
 	return o
 }
 
-func scale(s float64, m mat.Matrix) mat.Matrix {
+func Scale(s float64, m mat.Matrix) mat.Matrix {
 	r, c := m.Dims()
 	o := mat.NewDense(r, c, nil)
 	o.Scale(s, m)
 	return o
 }
 
-func multiply(m, n mat.Matrix) mat.Matrix {
+func Multiply(m, n mat.Matrix) mat.Matrix {
 	r, c := m.Dims()
 	o := mat.NewDense(r, c, nil)
 	o.MulElem(m, n)
 	return o
 }
 
-func add(m, n mat.Matrix) mat.Matrix {
+func Add(m, n mat.Matrix) mat.Matrix {
 	r, c := m.Dims()
 	o := mat.NewDense(r, c, nil)
 	o.Add(m, n)
 	return o
 }
 
-func subtract(m, n mat.Matrix) mat.Matrix {
+func Subtract(m, n mat.Matrix) mat.Matrix {
 	r, c := m.Dims()
 	o := mat.NewDense(r, c, nil)
 	o.Sub(m, n)
 	return o
 }
 
-func addScalar(i float64, m mat.Matrix) mat.Matrix {
+func AddScalar(i float64, m mat.Matrix) mat.Matrix {
 	r, c := m.Dims()
 	a := make([]float64, r*c)
 	for x := 0; x < r*c; x++ {
 		a[x] = i
 	}
 	n := mat.NewDense(r, c, a)
-	return add(m, n)
+	return Add(m, n)
 }
 
-func sampleFromProbs(probs *mat.Dense, topK int, topP float64) int {
+func SampleFromProbs(probs *mat.Dense, topK int, topP float64) int {
 	r, c := probs.Dims()
 	if c != 1 {
 		panic("sampleFromProbs expects column vector")
 	}
-
-	// Collect (id, prob)
 	type kv struct {
 		id  int
 		val float64
@@ -164,13 +162,13 @@ func RowSums(m *mat.Dense) []float64 {
 // - geluApply: shape-compatible with mat.Dense.Apply (i,j,v) -> value
 // - geluPrime: elementwise derivative given pre-activation matrix X
 
-func geluApply(i, j int, x float64) float64 {
+func GeluApply(i, j int, x float64) float64 {
 	const k = 0.7978845608028654 // sqrt(2/pi)
 	t := k * (x + 0.044715*x*x*x)
 	return 0.5 * x * (1.0 + math.Tanh(t))
 }
 
-func geluPrime(m mat.Matrix) *mat.Dense {
+func GeluPrime(m mat.Matrix) *mat.Dense {
 	r, c := m.Dims()
 	out := mat.NewDense(r, c, nil)
 	const k = 0.7978845608028654 // sqrt(2/pi)
@@ -194,7 +192,7 @@ func geluPrime(m mat.Matrix) *mat.Dense {
 
 // Masking stuff
 
-func addBias(m, bias *mat.Dense) *mat.Dense {
+func AddBias(m, bias *mat.Dense) *mat.Dense {
 	r, c := m.Dims()
 	rb, cb := bias.Dims()
 	if rb != r || cb != 1 {
@@ -209,7 +207,7 @@ func addBias(m, bias *mat.Dense) *mat.Dense {
 	return out
 }
 
-func lastCol(m *mat.Dense) *mat.Dense {
+func LastCol(m *mat.Dense) *mat.Dense {
 	r, c := m.Dims()
 	out := mat.NewDense(r, 1, nil)
 	for i := 0; i < r; i++ {
@@ -219,7 +217,7 @@ func lastCol(m *mat.Dense) *mat.Dense {
 }
 
 // causalMask returns (T x T) with 0 on and below diagonal, -Inf above.
-func causalMask(T int) *mat.Dense {
+func CausalMask(T int) *mat.Dense {
 	out := mat.NewDense(T, T, nil)
 	negInf := -1e30
 	for i := 0; i < T; i++ {
@@ -327,7 +325,7 @@ func ColVectorSoftmax(v *mat.Dense) *mat.Dense {
 // Softmax backward for row-wise softmax used in attention.
 // Vector-JVP form: for each row i,
 // s = sum_k dA[i,k] * A[i,k]; dS[i,j] = A[i,j] * (dA[i,j] - s)
-func softmaxBackward(dA mat.Matrix, A *mat.Dense) *mat.Dense {
+func SoftmaxBackward(dA mat.Matrix, A *mat.Dense) *mat.Dense {
 	r, c := A.Dims()
 	dS := mat.NewDense(r, c, nil)
 	for i := 0; i < r; i++ {

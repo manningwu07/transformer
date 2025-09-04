@@ -1,4 +1,4 @@
-package main
+package IO
 
 import (
 	"bufio"
@@ -11,6 +11,10 @@ import (
 	"strings"
 
 	"gonum.org/v1/gonum/mat"
+
+	"github.com/manningwu07/GPT/params"
+	"github.com/manningwu07/GPT/transformer"
+	"github.com/manningwu07/GPT/utils"
 )
 
 // TrainingRecord is a generic dataset example (inputs column vector,
@@ -20,40 +24,29 @@ type TrainingRecord struct {
 	Targets *mat.Dense
 }
 
-type Vocab struct {
-	TokenToID map[string]int
-	IDToToken []string
-}
-
-// Globals initialized on first loadTrainingSet call.
-var (
-	vocab Vocab
-	emb   *mat.Dense // (dModel x |V|)
-)
-
 // Special tokens kept at the start of the vocab
 var special = []string{"<pad>", "<bos>", "<eos>", "<unk>"}
 
 // Build vocab  initialize embeddings from the training file in a streaming pass.
 // Returns the number of lines seen (for logging) but does not load sequences into memory.
-func buildVocabAndEmbFromTrain(gpt Transformer) (int, error) {
-	if len(gpt.blocks) == 0 || gpt.blocks[0].attn == nil {
+func BuildVocabAndEmbFromTrain(gpt transformer.Transformer) (int, error) {
+	if len(gpt.Blocks) == 0 || gpt.Blocks[0].Attn == nil {
 		return 0, errors.New("model is not initialized")
 	}
-	dModel := gpt.blocks[0].attn.dModel
-	p := findTrainFile()
+	dModel := gpt.Blocks[0].Attn.DModel
+	p := FindTrainFile()
 	if p == "" {
 		return 0, errors.New("could not find training file")
 	}
 	var err error
-	vocab, _, err = buildFixedVocabFromFile(p, config.VocabSize)
+	params.Vocab, _, err = buildFixedVocabFromFile(p, params.Config.VocabSize)
 	if err != nil {
 		return 0, err
 	}
-	emb = initEmbeddings(dModel, vocab)
+	params.Emb = initEmbeddings(dModel, params.Vocab)
 
-	if posEmb == nil || posEmb.RawMatrix().Rows != dModel || posEmb.RawMatrix().Cols != config.SeqLen {
-		posEmb = mat.NewDense(dModel, config.SeqLen, randomArray(dModel*config.SeqLen, float64(dModel)))
+	if params.PosEmb == nil || params.PosEmb.RawMatrix().Rows != dModel || params.PosEmb.RawMatrix().Cols != params.Config.SeqLen {
+		params.PosEmb = mat.NewDense(dModel, params.Config.SeqLen, utils.RandomArray(dModel*params.Config.SeqLen, float64(dModel)))
 	}
 
 	// return line count for logging
@@ -66,47 +59,47 @@ func buildVocabAndEmbFromTrain(gpt Transformer) (int, error) {
 
 // Add positional embeddings to an embedded sequence X (d x T), using positions 0..T-1.
 func addPosToSequence(X *mat.Dense) *mat.Dense {
-	if posEmb == nil {
+	if params.PosEmb == nil {
 		return X
 	}
 	d, T := X.Dims()
-	if T > posEmb.RawMatrix().Cols {
-		T = posEmb.RawMatrix().Cols
+	if T > params.PosEmb.RawMatrix().Cols {
+		T = params.PosEmb.RawMatrix().Cols
 	}
 	out := mat.NewDense(d, T, nil)
 	out.Copy(X)
 	// out += posEmb[:, 0:T]
 	for i := 0; i < d; i++ {
 		for t := 0; t < T; t++ {
-			out.Set(i, t, out.At(i, t)+posEmb.At(i, t))
+			out.Set(i, t, out.At(i, t)+params.PosEmb.At(i, t))
 		}
 	}
 	return out
 }
 
 // Add positional embedding column posIdx to xCol (d x 1).
-func addPosCol(xCol *mat.Dense, posIdx int) *mat.Dense {
-	if posEmb == nil {
+func AddPosCol(xCol *mat.Dense, posIdx int) *mat.Dense {
+	if params.PosEmb == nil {
 		return xCol
 	}
 	idx := posIdx
 	if idx < 0 {
 		idx = 0
 	}
-	if idx >= posEmb.RawMatrix().Cols {
-		idx = posEmb.RawMatrix().Cols - 1
+	if idx >= params.PosEmb.RawMatrix().Cols {
+		idx = params.PosEmb.RawMatrix().Cols - 1
 	}
 	d, _ := xCol.Dims()
 	out := mat.NewDense(d, 1, nil)
 	for i := 0; i < d; i++ {
-		out.Set(i, 0, xCol.At(i, 0)+posEmb.At(i, idx))
+		out.Set(i, 0, xCol.At(i, 0)+params.PosEmb.At(i, idx))
 	}
 	return out
 }
 
 // load only token-id sequences for EVAL
 func loadEvalSequences() ([][]int, error) {
-	if len(vocab.IDToToken) == 0 {
+	if len(params.Vocab.IDToToken) == 0 {
 		return nil, errors.New("vocab not initialized; load train first")
 	}
 	p := findEvalFile()
@@ -119,19 +112,19 @@ func loadEvalSequences() ([][]int, error) {
 	}
 	seqIDs := make([][]int, len(lines))
 	for i, s := range lines {
-		toks := tokenizeENPieces(s) //ASCII Only
+		toks := TokenizeENPieces(s) //ASCII Only
 		toks = append([]string{"<bos>"}, toks...)
 		toks = append(toks, "<eos>")
 		ids := make([]int, len(toks))
 		for j, t := range toks {
-			ids[j] = vocabLookup(vocab, t) // unseen -> <unk>
+			ids[j] = VocabLookup(params.Vocab, t) // unseen -> <unk>
 		}
 		seqIDs[i] = ids
 	}
 	return seqIDs, nil
 }
 
-func findTrainFile() string {
+func FindTrainFile() string {
 	if p := findEnglishFile(); p != "" {
 		return p
 	}
@@ -165,7 +158,7 @@ func findEvalFile() string {
 }
 
 // uses eval.en and existing vocab/emb; streams examples.
-func evaluateMetrics(gpt Transformer) (int, int, float64) {
+func EvaluateMetrics(gpt transformer.Transformer) (int, int, float64) {
 	seqs, err := loadEvalSequences()
 	if err != nil || len(seqs) == 0 {
 		return 0, 0, 0
@@ -178,16 +171,16 @@ func evaluateMetrics(gpt Transformer) (int, int, float64) {
 			continue
 		}
 		// per-sequence KV caches, one per block
-		type blkKV struct{ attnKV AttnKV }
-		kvs := make([]blkKV, layers)
+		type blkKV struct{ attnKV transformer.AttnKV }
+		kvs := make([]blkKV, params.Layers)
 		// roll through the sequence once; predict next token at each step
 		// we run up to len(ids)-1 predictions
 		var yLast *mat.Dense
 		for t := 0; t+1 < len(ids); t++ {
-			xLast := colAsVector(emb, ids[t]) // (dModel x 1)
-			yLast = addPosCol(xLast, kvs[0].attnKV.t) // add position for block 0 only
-			for l := 0; l < layers; l++ {
-				yLast = gpt.blocks[l].ForwardLastWithKV(yLast, &kvs[l].attnKV)
+			xLast := ColAsVector(params.Emb, ids[t])  // (dModel x 1)
+			yLast = AddPosCol(xLast, kvs[0].attnKV.T) // add position for block 0 only
+			for l := 0; l < params.Layers; l++ {
+				yLast = gpt.Blocks[l].ForwardLastWithKV(yLast, &kvs[l].attnKV)
 			}
 			logits := Unembed(yLast) // emb^T * yLast
 			pred := argmaxVec(logits)
@@ -195,8 +188,8 @@ func evaluateMetrics(gpt Transformer) (int, int, float64) {
 				correct++
 			}
 			// accumulate CE
-			oh := oneHot(config.VocabSize, ids[t+1])
-			loss, _ := CrossEntropyWithGrad(logits, oh)
+			oh := utils.OneHot(params.Config.VocabSize, ids[t+1])
+			loss, _ := utils.CrossEntropyWithGrad(logits, oh)
 			ceSum += loss
 
 			total++
@@ -209,8 +202,8 @@ func evaluateMetrics(gpt Transformer) (int, int, float64) {
 }
 
 // loadTinyTrainIDs returns the first N training lines as BOS...EOS id sequences.
-func loadTinyTrainIDs(n int) ([][]int, error) {
-	p := findTrainFile()
+func LoadTinyTrainIDs(n int) ([][]int, error) {
+	p := FindTrainFile()
 	if p == "" {
 		return nil, errors.New("could not find training file")
 	}
@@ -220,23 +213,23 @@ func loadTinyTrainIDs(n int) ([][]int, error) {
 	}
 	out := make([][]int, 0, len(lines))
 	for _, s := range lines {
-		toks := tokenizeENPieces(s)
+		toks := TokenizeENPieces(s)
 		if len(toks) == 0 {
 			continue
 		}
 		ids := make([]int, 0, len(toks)+2)
-		ids = append(ids, vocabLookup(vocab, "<bos>"))
+		ids = append(ids, VocabLookup(params.Vocab, "<bos>"))
 		for _, t := range toks {
-			ids = append(ids, vocabLookup(vocab, t))
+			ids = append(ids, VocabLookup(params.Vocab, t))
 		}
-		ids = append(ids, vocabLookup(vocab, "<eos>"))
+		ids = append(ids, VocabLookup(params.Vocab, "<eos>"))
 		out = append(out, ids)
 	}
 	return out, nil
 }
 
 // Tokenization (ASCII-only pieces). Lowercases, drops any non 1-byte ASCII chars.
-func tokenizeENPieces(s string) []string {
+func TokenizeENPieces(s string) []string {
 	// Fast ASCII lowercase non-ASCII drop
 	b := make([]byte, 0, len(s))
 	for i := 0; i < len(s); i++ {
@@ -264,7 +257,7 @@ func tokenizeENPieces(s string) []string {
 	return out
 }
 
-func buildFixedVocabFromCounts(cnt map[string]int, size int) Vocab {
+func buildFixedVocabFromCounts(cnt map[string]int, size int) params.Vocabulary {
 	if size < len(special) {
 		panic("vocab size must be >= number of special tokens")
 	}
@@ -312,14 +305,14 @@ func buildFixedVocabFromCounts(cnt map[string]int, size int) Vocab {
 	for i, t := range idToToken {
 		tok2id[t] = i
 	}
-	return Vocab{TokenToID: tok2id, IDToToken: idToToken}
+	return params.Vocabulary{TokenToID: tok2id, IDToToken: idToToken}
 }
 
 // Streaming vocab builder from file; returns vocab and number of lines processed.
-func buildFixedVocabFromFile(path string, size int) (Vocab, int, error) {
+func buildFixedVocabFromFile(path string, size int) (params.Vocabulary, int, error) {
 	f, err := os.Open(path)
 	if err != nil {
-		return Vocab{}, 0, err
+		return params.Vocabulary{}, 0, err
 	}
 	defer f.Close()
 	r := bufio.NewReaderSize(f, 1<<20) // 1MB buffer
@@ -329,7 +322,7 @@ func buildFixedVocabFromFile(path string, size int) (Vocab, int, error) {
 		line, err := r.ReadString('\n')
 		if len(line) > 0 {
 			lines++
-			toks := tokenizeENPieces(line)
+			toks := TokenizeENPieces(line)
 			for _, t := range toks {
 				// enforce ASCII-only
 				if t == "" || !isASCIIString(t) {
@@ -342,7 +335,7 @@ func buildFixedVocabFromFile(path string, size int) (Vocab, int, error) {
 			break
 		}
 		if err != nil {
-			return Vocab{}, lines, err
+			return params.Vocabulary{}, lines, err
 		}
 	}
 	return buildFixedVocabFromCounts(counts, size), lines, nil
@@ -383,7 +376,7 @@ func findEnglishFile() string {
 	return ""
 }
 
-func vocabLookup(v Vocab, tok string) int {
+func VocabLookup(v params.Vocabulary, tok string) int {
 	if id, ok := v.TokenToID[tok]; ok {
 		return id
 	}
@@ -392,13 +385,13 @@ func vocabLookup(v Vocab, tok string) int {
 
 // Initialize embeddings with small random values.
 // Shape: (dModel x |V|)
-func initEmbeddings(dModel int, v Vocab) *mat.Dense {
-	data := randomArray(dModel*len(v.IDToToken), float64(dModel))
+func initEmbeddings(dModel int, v params.Vocabulary) *mat.Dense {
+	data := utils.RandomArray(dModel*len(v.IDToToken), float64(dModel))
 	return mat.NewDense(dModel, len(v.IDToToken), data)
 }
 
 // Column slice (copy) m[:, j] -> (r x 1)
-func colAsVector(m *mat.Dense, j int) *mat.Dense {
+func ColAsVector(m *mat.Dense, j int) *mat.Dense {
 	r, c := m.Dims()
 	if j < 0 || j >= c {
 		panic("colAsVector: column index out of range")
@@ -408,13 +401,13 @@ func colAsVector(m *mat.Dense, j int) *mat.Dense {
 		dst[i] = m.At(i, j)
 	}
 	out := mat.NewDense(r, 1, dst)
-	if posEmb != nil {
+	if params.PosEmb != nil {
 		out = addPosToSequence(out)
 	}
 	return out
 }
 
-func embedSequence(emb *mat.Dense, ids []int) *mat.Dense {
+func EmbedSequence(emb *mat.Dense, ids []int) *mat.Dense {
 	d, _ := emb.Dims()
 	T := len(ids)
 	out := mat.NewDense(d, T, nil)
@@ -427,10 +420,10 @@ func embedSequence(emb *mat.Dense, ids []int) *mat.Dense {
 }
 
 func Unembed(x *mat.Dense) *mat.Dense {
-	if emb == nil {
+	if params.Emb == nil {
 		panic("embedding not initialized; call loadTrainingSet first")
 	}
-	return toDense(dot(emb.T(), x))
+	return utils.ToDense(utils.Dot(params.Emb.T(), x))
 }
 
 func fileExists(p string) bool {
@@ -475,7 +468,7 @@ type trainLineIter struct {
 	r    *bufio.Reader
 }
 
-func newTrainLineIter(path string) (*trainLineIter, error) {
+func NewTrainLineIter(path string) (*trainLineIter, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -483,7 +476,7 @@ func newTrainLineIter(path string) (*trainLineIter, error) {
 	return &trainLineIter{path: path, f: f, r: bufio.NewReaderSize(f, 1<<20)}, nil
 }
 
-func (it *trainLineIter) close() error {
+func (it *trainLineIter) Close() error {
 	if it.f != nil {
 		return it.f.Close()
 	}
@@ -492,22 +485,22 @@ func (it *trainLineIter) close() error {
 
 // nextIDs returns the next line converted to token IDs, or nil, io.EOF when at end.
 // When EOF is reached, the iterator rewinds to the beginning to allow multiple epochs.
-func (it *trainLineIter) nextIDs() ([]int, error) {
+func (it *trainLineIter) NextIDs() ([]int, error) {
 	for {
 		line, err := it.r.ReadString('\n')
 		if len(line) > 0 {
-			toks := tokenizeENPieces(line)
+			toks := TokenizeENPieces(line)
 			if len(toks) == 0 {
 				// skip empty lines
 				continue
 			}
 			// add BOS/EOS
 			ids := make([]int, 0, len(toks)+2)
-			ids = append(ids, vocabLookup(vocab, "<bos>"))
+			ids = append(ids, VocabLookup(params.Vocab, "<bos>"))
 			for _, t := range toks {
-				ids = append(ids, vocabLookup(vocab, t))
+				ids = append(ids, VocabLookup(params.Vocab, t))
 			}
-			ids = append(ids, vocabLookup(vocab, "<eos>"))
+			ids = append(ids, VocabLookup(params.Vocab, "<eos>"))
 			return ids, nil
 		}
 		if err == io.EOF {
@@ -543,13 +536,6 @@ func countLines(path string) (int, error) {
 		}
 		n++
 	}
-}
-
-// save persists the whole Transformer using the gob-based SaveTransformer.
-func save(gpt Transformer) error {
-	_ = os.MkdirAll("models", 0o755)
-	path := "models/transformer.gob"
-	return SaveTransformer(&gpt, path)
 }
 
 // -------- Small utilities --------
