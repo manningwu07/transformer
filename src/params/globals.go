@@ -57,6 +57,8 @@ type TrainingConfig struct {
     SaveEverySteps int  // checkpoint every N optimizer steps (0=disable)
 }
 
+
+// How many times does attn --> mlp happen
 var Layers = 6
 var Config = TrainingConfig{
 	DModel:     512,

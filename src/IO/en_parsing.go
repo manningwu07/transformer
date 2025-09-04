@@ -462,21 +462,21 @@ func readLines(p string, limit int) ([]string, error) {
 }
 
 // Stream training lines -> token IDs without loading all into memory.
-type trainLineIter struct {
+type TrainLineIter struct {
 	path string
 	f    *os.File
 	r    *bufio.Reader
 }
 
-func NewTrainLineIter(path string) (*trainLineIter, error) {
+func NewTrainLineIter(path string) (*TrainLineIter, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	return &trainLineIter{path: path, f: f, r: bufio.NewReaderSize(f, 1<<20)}, nil
+	return &TrainLineIter{path: path, f: f, r: bufio.NewReaderSize(f, 1<<20)}, nil
 }
 
-func (it *trainLineIter) Close() error {
+func (it *TrainLineIter) Close() error {
 	if it.f != nil {
 		return it.f.Close()
 	}
@@ -485,7 +485,7 @@ func (it *trainLineIter) Close() error {
 
 // nextIDs returns the next line converted to token IDs, or nil, io.EOF when at end.
 // When EOF is reached, the iterator rewinds to the beginning to allow multiple epochs.
-func (it *trainLineIter) NextIDs() ([]int, error) {
+func (it *TrainLineIter) NextIDs() ([]int, error) {
 	for {
 		line, err := it.r.ReadString('\n')
 		if len(line) > 0 {
