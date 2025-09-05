@@ -88,7 +88,7 @@ type blockData struct {
 // save persists the whole Transformer using the gob-based SaveTransformer.
 func Save(gpt Transformer) error {
 	_ = os.MkdirAll("models", 0o755)
-	path := "models/transformer.gob"
+	path := "models/finished_transformer.gob"
 	return SaveTransformer(&gpt, path)
 }
 

@@ -63,22 +63,24 @@ type TrainingConfig struct {
 // How many times does attn --> mlp happen
 var Layers = 8
 var Config = TrainingConfig{
+	// These are fundemental for fine tuning (DO NOT CHANGE)
 	DModel:     768,
 	HiddenSize: 2048,
 	VocabSize:  16384, // Top number of 1-4 chars
 	NumHeads:   12,    // dHead = DModel/NumHeads
-	SeqLen:     1024,   // max context
+
+	SeqLen:     64,   // context window (num in tokens)
 	AttnLR:     0.0003,
 	MLPLR:      0.0003,
 	UnembedLR:  0.00003,
 	NormLR:     0.0003,
 
-	MaxEpochs: 100,
+	MaxEpochs: 250,
 	Patience:  15,
-	SaveEpochNumber: 10,
+	SaveEpochNumber: 25,
 	ImprovementThreshold: 0.005,
 	Epsilon:   1e-4,
-	BatchSize: 4096, // each example is one prefix
+	BatchSize: 16384, // each example is one prefix
 	ValFrac:   0.1,
 
 	WarmupSteps: 10_000,

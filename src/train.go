@@ -205,8 +205,6 @@ func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount i
 			utils.MatrixNorm(gpt.Blocks[0].Mlp.HiddenWeights),
 		)
 
-		_ = safeSaveTransformer(gpt, "models/last_epoch.gob")
-
 		// --- Early stopping logic based on loss improvement and accuracy checkpointing ---
 		// Check if the current accuracy is the best we've seen so far.
 		alreadySaved := false
@@ -222,7 +220,7 @@ func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount i
 
 		// Saves every X Epochs
 		if (e+1)%params.Config.SaveEpochNumber == 0 && !alreadySaved {
-			_ = safeSaveTransformer(gpt, fmt.Sprintf("models/epoch_%03d.gob", e+1))
+			_ = safeSaveTransformer(gpt, fmt.Sprintf("models/last_epoch.gob"))
 			fmt.Printf("Saved checkpoint at epoch %d\n", e+1)
 			alreadySaved = false
 		}
