@@ -220,7 +220,7 @@ func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount i
 
 		// Saves every X Epochs
 		if (e+1)%params.Config.SaveEpochNumber == 0 && !alreadySaved {
-			_ = safeSaveTransformer(gpt, fmt.Sprintf("models/last_epoch.gob"))
+			_ = safeSaveTransformer(gpt, "models/last_epoch.gob")
 			fmt.Printf("Saved checkpoint at epoch %d\n", e+1)
 			alreadySaved = false
 		}
