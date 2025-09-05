@@ -90,9 +90,6 @@ func main() {
 	}
 	defer iter.Close()
 
-	fmt.Printf("Train (streaming): lines≈%d  Eval: from eval.en\n", linesCount)
-
-
 	// -----------Actual training phase-----------
 
 	bestModel := TrainGPT(&gpt, iter, linesCount)

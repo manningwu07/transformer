@@ -75,12 +75,12 @@ var Config = TrainingConfig{
 	UnembedLR:  0.00003,
 	NormLR:     0.0003,
 
-	MaxEpochs: 250,
+	MaxEpochs: 1000,
 	Patience:  15,
 	SaveEpochNumber: 25,
 	ImprovementThreshold: 0.005,
 	Epsilon:   1e-4,
-	BatchSize: 16384, // each example is one prefix
+	BatchSize: 4096, // each example is one prefix
 	ValFrac:   0.1,
 
 	WarmupSteps: 10_000,

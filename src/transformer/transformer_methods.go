@@ -22,7 +22,6 @@ type TransformerBlock struct {
 }
 
 // Initalization
-
 func CreateGPT(dModel, hidden, vocabSize int, AttnRate float64, MLPRate float64) Transformer {
 	gpt := Transformer{
 		Blocks: make([]TransformerBlock, params.Layers),
@@ -172,6 +171,46 @@ func (b *TransformerBlock) BackwardGradsOnly(grad *mat.Dense) (dX *mat.Dense,
 
 	dX = utils.ToDense(utils.Add(dXres_total, dX_fromLn1))
 	return dX, dWq, dWk, dWv, dWo, dWhid, dWout
+}
+
+// BackwardGradsOnlyFull returns all grads needed for external
+// accumulation/updates (true minibatching). It includes MLP biases
+// and LayerNorm gamma/beta grads.
+func (b *TransformerBlock) BackwardGradsOnlyFull(
+    grad *mat.Dense,
+) (
+    dX *mat.Dense,
+    dWq, dWk, dWv []*mat.Dense,
+    dWo *mat.Dense,
+    dWhid, dbHidden, dWout, dbOut *mat.Dense,
+    dLn1Gamma, dLn1Beta, dLn2Gamma, dLn2Beta *mat.Dense,
+) {
+    // Ensure norms for tests that build Blocks manually.
+    if b.Mlp != nil {
+        b.EnsureNorms(b.Mlp.Inputs)
+    }
+    grad = utils.ExpandGradToSeq(grad, b.Mlp.lastInput)
+    c := 1 / math.Sqrt(2)
+
+    // MLP path with residual scaling
+    dX2_fromMLP, dWhid, dbHidden, dWout, dbOut :=
+        b.Mlp.BackwardGradsOnly(utils.ToDense(utils.Scale(c, grad)))
+    dXres_fromLn2, dLn2Gamma, dLn2Beta :=
+        b.Ln2.BackwardGradsOnly(dX2_fromMLP)
+
+    dXres_total := utils.ToDense(utils.Add(grad, dXres_fromLn2))
+
+    dX1_fromAttn, dWq, dWk, dWv, dWo :=
+        b.Attn.BackwardGradsOnly(utils.ToDense(utils.Scale(c, dXres_total)))
+
+    dX_fromLn1, dLn1Gamma, dLn1Beta :=
+        b.Ln1.BackwardGradsOnly(dX1_fromAttn)
+
+    dX = utils.ToDense(utils.Add(dXres_total, dX_fromLn1))
+    return dX,
+        dWq, dWk, dWv, dWo,
+        dWhid, dbHidden, dWout, dbOut,
+        dLn1Gamma, dLn1Beta, dLn2Gamma, dLn2Beta
 }
 
 func (b *TransformerBlock) ForwardLastWithKV(xLast *mat.Dense, kv *AttnKV) *mat.Dense {
