@@ -45,18 +45,17 @@ func TestAttentionGradCheck(t *testing.T) {
 	attn := transformer.NewAttention(dModel, nHeads, 0.0)
 
 	x := mat.NewDense(dModel, 3, utils.RandomArray(dModel*3, float64(dModel)))
-	target := utils.OneHot(dModel, 2)
 
 	// Forward + loss
 	forward := func() float64 {
 		logits := attn.Forward(x)
-		loss, _ := utils.CrossEntropyWithGrad(utils.LastCol(logits), target)
+		loss, _ := utils.CrossEntropyWithIndex(utils.LastCol(logits), 2)
 		return loss
 	}
 
 	// Analytic grads
 	logits := attn.Forward(x)
-	_, dL_dY := utils.CrossEntropyWithGrad(utils.LastCol(logits), target)
+	_, dL_dY := utils.CrossEntropyWithIndex(utils.LastCol(logits), 2)
 	_, dWq, dWk, dWv, dWo := attn.BackwardGradsOnly(dL_dY)
 
 	// Check one element from each
@@ -82,16 +81,15 @@ func TestMLPGradCheck(t *testing.T) {
 	}
 
 	x := mat.NewDense(dModel, 1, utils.RandomArray(dModel, float64(dModel)))
-	target := utils.OneHot(dModel, 2)
 
 	forward := func() float64 {
 		logits := mlp.Forward(x)
-		loss, _ := utils.CrossEntropyWithGrad(logits, target)
+		loss, _ := utils.CrossEntropyWithIndex(logits, 2)
 		return loss
 	}
 
 	logits := mlp.Forward(x)
-	_, dL_dY := utils.CrossEntropyWithGrad(logits, target)
+	_, dL_dY := utils.CrossEntropyWithIndex(logits, 2)
 	_, dWhid, _, dWout, _ := mlp.BackwardGradsOnly(dL_dY)
 
 	// Check one element from each param
@@ -118,16 +116,15 @@ func TestBlockGradCheck(t *testing.T) {
 	}
 
 	x := mat.NewDense(dModel, 3, utils.RandomArray(dModel*3, float64(dModel)))
-	target := utils.OneHot(dModel, 2)
 
 	forward := func() float64 {
 		logits := block.Forward(x)
-		loss, _ := utils.CrossEntropyWithGrad(utils.LastCol(logits), target)
+		loss, _ := utils.CrossEntropyWithIndex(utils.LastCol(logits), 2)
 		return loss
 	}
 
 	logits := block.Forward(x)
-	_, dL_dY := utils.CrossEntropyWithGrad(utils.LastCol(logits), target)
+	_, dL_dY := utils.CrossEntropyWithIndex(utils.LastCol(logits), 2)
 	_, dWq, _, _, _, dWhid, _ := block.BackwardGradsOnly(dL_dY)
 
 	// Just check one param from attn and mlp
@@ -142,14 +139,13 @@ func TestTransformerGradCheck(t *testing.T) {
 	gpt := transformer.CreateGPT(4, 5, 4, 0.0, 0.0)
 
 	x := mat.NewDense(4, 3, utils.RandomArray(12, 4))
-	target := utils.OneHot(4, 2)
 
 	forward := func() float64 {
 		Y := x
 		for i := 0; i < params.Layers; i++ {
 			Y = gpt.Blocks[i].Forward(Y)
 		}
-		loss, _ := utils.CrossEntropyWithGrad(utils.LastCol(Y), target)
+		loss, _ := utils.CrossEntropyWithIndex(utils.LastCol(Y), 2)
 		return loss
 	}
 
@@ -158,7 +154,7 @@ func TestTransformerGradCheck(t *testing.T) {
 	for i := 0; i < params.Layers; i++ {
 		Y = gpt.Blocks[i].Forward(Y)
 	}
-	_, dL_dY := utils.CrossEntropyWithGrad(utils.LastCol(Y), target)
+	_, dL_dY := utils.CrossEntropyWithIndex(utils.LastCol(Y), 2)
 
 	var dWq0 []*mat.Dense
 	dY := dL_dY

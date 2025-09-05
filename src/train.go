@@ -14,18 +14,15 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
-
-
-func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount int) transformer.Transformer {
+func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount int) *transformer.Transformer {
 	dYbuf := mat.NewDense(params.Config.DModel, params.Config.SeqLen, nil)
-    var bestAccuracy float64 = -1.0
-    var noImprovementCount int
-    bestModel := *gpt // copy initial model
+	var bestAccuracy float64 = -1.0
+	var noImprovementCount int
+	bestModel := *gpt // copy initial model
 
 	fmt.Printf("Train (streaming): lines≈%d  Eval: from eval.en\n", linesCount)
 
 	adamStep := 0
-	lastSave := time.Now()
 
 	for e := 0; e < params.Config.MaxEpochs; e++ {
 		var totalLoss float64
@@ -58,7 +55,6 @@ func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount i
 				start = i + 1 - params.Config.SeqLen
 			}
 			Xctx := IO.EmbedSequence(params.Emb, ids[start:i+1]) // (d x T)
-			target := utils.OneHot(len(params.Vocab.IDToToken), ids[i+1])
 
 			Y := Xctx
 			for i := 0; i < params.Layers; i++ {
@@ -70,7 +66,7 @@ func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount i
 			logits := IO.Unembed(yLast)
 
 			// Loss + gradient
-			loss, _ := utils.CrossEntropyWithGrad(logits, target)
+			loss, _ := utils.CrossEntropyWithIndex(logits, ids[i+1])
 
 			adamStep++
 			attnLR := utils.LRSchedule(adamStep, params.Config.AttnLR)
@@ -113,9 +109,8 @@ func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount i
 
 				// target is token at position t+1
 				goldID := ids[t+1]
-				target := utils.OneHot(params.Config.VocabSize, goldID)
 
-				loss, gradLogits := utils.CrossEntropyWithGrad(logits, target)
+				loss, gradLogits := utils.CrossEntropyWithIndex(logits, goldID)
 
 				// dY[:,t] = emb^T * (p - t)
 				dyCol := utils.ToDense(utils.Dot(params.Emb, gradLogits)) // (DModel x 1)
@@ -180,16 +175,7 @@ func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount i
 				params.Config.WeightDecay)
 			optimizations.AdamUpdateInPlace(params.PosEmb, dPos, params.PosM, params.PosV, params.PosT,
 				params.Config.PosLR, params.Config.AdamBeta1, params.Config.AdamBeta2, params.Config.AdamEps,
-				0.0) // typically no weight decay for pos embeddings
-
-			// Optional periodic checkpoint by step/time
-			if params.Config.SaveEverySteps > 0 && adamStep%params.Config.SaveEverySteps == 0 {
-				_ = safeSaveTransformer(gpt, "models/ckpt_latest.gob")
-			}
-			if time.Since(lastSave) > 10*time.Minute {
-				_ = safeSaveTransformer(gpt, "models/ckpt_latest.gob")
-				lastSave = time.Now()
-			}
+				0.0)
 		}
 
 		// Calculate average loss for the epoch
@@ -220,17 +206,25 @@ func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount i
 		)
 
 		_ = safeSaveTransformer(gpt, "models/last_epoch.gob")
-		lastSave = time.Now()
 
 		// --- Early stopping logic based on loss improvement and accuracy checkpointing ---
 		// Check if the current accuracy is the best we've seen so far.
-		if accuracy > bestAccuracy && e > 20 {
+		alreadySaved := false
+		if accuracy > bestAccuracy+ params.Config.ImprovementThreshold && e > 20 {
 			bestAccuracy = accuracy
 			_ = transformer.SaveTransformer(gpt, "models/best_model.gob")
 			bestModel = *gpt
 			noImprovementCount = 0
+			alreadySaved = true
 		} else {
 			noImprovementCount++
+		}
+
+		// Saves every X Epochs
+		if (e+1)%params.Config.SaveEpochNumber == 0 && !alreadySaved {
+			_ = safeSaveTransformer(gpt, fmt.Sprintf("models/epoch_%03d.gob", e+1))
+			fmt.Printf("Saved checkpoint at epoch %d\n", e+1)
+			alreadySaved = false
 		}
 
 		// The loop now breaks if we've seen enough epochs without a new best accuracy.
@@ -249,5 +243,5 @@ func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount i
 		// --- End Early Stopping Logic ---
 	}
 
-	return bestModel
+	return &bestModel
 }

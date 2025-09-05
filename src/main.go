@@ -66,8 +66,6 @@ func main() {
 
 	installSignalCheckpoints(&gpt)
 
-	installSignalCheckpoints(&gpt)
-
 	// Build vocab + embeddings via streaming pass (no full dataset in memory)
 	linesCount, err := IO.BuildVocabAndEmbFromTrain(gpt)
 	if err != nil {
@@ -79,7 +77,7 @@ func main() {
 
 	// Tiny overfit mode
 	if os.Getenv("OVERFIT_TINY") == "1" {
-		overfitTiny(&gpt, 100, 5000) // 100 lines, 1000 steps
+		overfitTiny(&gpt, 100, 2500) // 100 lines, 1000 steps
 		ChatCLI(&gpt)
 		return // exit after tiny test
 	}
@@ -94,13 +92,19 @@ func main() {
 
 	fmt.Printf("Train (streaming): lines≈%d  Eval: from eval.en\n", linesCount)
 
+
+	// -----------Actual training phase-----------
+
 	bestModel := TrainGPT(&gpt, iter, linesCount)
+
+	// -------------------------------------------
+
 
 	elapsed := time.Since(t1)
 	fmt.Printf("\nTime taken to train: %s\n", elapsed)
 
 	// After the training loop, save the best-performing model that was found.
-	if err := transformer.Save(bestModel); err != nil {
+	if err := transformer.Save(*bestModel); err != nil {
 		fmt.Println("Error saving model:", err)
 		return
 	} else {
@@ -136,9 +140,8 @@ func overfitTiny(gpt *transformer.Transformer, N, steps int) {
 		for t := 0; t < cols; t++ {
 			yCol := Y.Slice(0, params.Config.DModel, t, t+1).(*mat.Dense)
 			logits := utils.ToDense(utils.Dot(params.Emb.T(), yCol))
-			goldID := ids[t+1] // next token
-			oh := utils.OneHot(params.Config.VocabSize, goldID)
-			loss, gradLogits := utils.CrossEntropyWithGrad(logits, oh)
+			goldID := ids[t+1] 
+			loss, gradLogits := utils.CrossEntropyWithIndex(logits, goldID)
 			seqCE += loss
 			dyCol := utils.ToDense(utils.Dot(params.Emb, gradLogits)) // (DModel x 1)
 			for i := 0; i < params.Config.DModel; i++ {

@@ -343,18 +343,20 @@ func SoftmaxBackward(dA mat.Matrix, A *mat.Dense) *mat.Dense {
 
 // ---------- Loss ----------
 
-func CrossEntropyWithGrad(logits, target *mat.Dense) (float64, *mat.Dense) {
+func CrossEntropyWithIndex(logits *mat.Dense, gold int) (float64, *mat.Dense) {
+	r, c := logits.Dims()
+	if c != 1 {
+		panic("CrossEntropyWithIndex expects (r x 1) logits vector")
+	}
 	prob := ColVectorSoftmax(logits)
-	loss := 0.0
-	r, _ := prob.Dims()
+	if gold < 0 || gold >= r {
+		gold = 0
+	}
+	loss := -math.Log(prob.At(gold, 0) + 1e-12)
 	grad := mat.NewDense(r, 1, nil)
 	for i := 0; i < r; i++ {
-		p := prob.At(i, 0)
-		t := target.At(i, 0)
-		if t == 1.0 {
-			loss -= math.Log(p + 1e-12)
-		}
-		grad.Set(i, 0, p-t)
+		grad.Set(i, 0, prob.At(i, 0))
 	}
+	grad.Set(gold, 0, grad.At(gold, 0)-1.0)
 	return loss, grad
 }

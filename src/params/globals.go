@@ -44,6 +44,8 @@ type TrainingConfig struct {
 
 	MaxEpochs int     // maximum number of epochs
 	Patience  int     // early stopping patience
+	SaveEpochNumber int // Saves modal every X epoch (for safety)
+	ImprovementThreshold float64 // How much should the model improve before being saved
 	Epsilon   float64 // stop if loss < epsilon
 	BatchSize int     // mini-batch size
 	ValFrac   float64 // fraction of data held out for validation
@@ -59,22 +61,24 @@ type TrainingConfig struct {
 
 
 // How many times does attn --> mlp happen
-var Layers = 6
+var Layers = 8
 var Config = TrainingConfig{
-	DModel:     512,
-	HiddenSize: 1024,
-	VocabSize:  8192, // Top number of 1-4 chars
-	NumHeads:   8,    // dHead = DModel/NumHeads
-	SeqLen:     64,   // max context
+	DModel:     768,
+	HiddenSize: 2048,
+	VocabSize:  16384, // Top number of 1-4 chars
+	NumHeads:   12,    // dHead = DModel/NumHeads
+	SeqLen:     1024,   // max context
 	AttnLR:     0.0003,
 	MLPLR:      0.0003,
 	UnembedLR:  0.00003,
 	NormLR:     0.0003,
 
-	MaxEpochs: 250,
-	Patience:  25,
+	MaxEpochs: 100,
+	Patience:  15,
+	SaveEpochNumber: 10,
+	ImprovementThreshold: 0.005,
 	Epsilon:   1e-4,
-	BatchSize: 2048, // each example is one prefix
+	BatchSize: 4096, // each example is one prefix
 	ValFrac:   0.1,
 
 	WarmupSteps: 10_000,

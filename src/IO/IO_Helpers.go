@@ -22,12 +22,13 @@ func EnsureEOSToken() {
     params.Vocab.IDToToken = append(params.Vocab.IDToToken, eos)
     if params.Emb != nil {
         r, c := params.Emb.Dims()
-        if r == id { // need to grow by 1
-            ne := mat.NewDense(r+1, c, nil)
-            ne.Slice(0, r, 0, c).(*mat.Dense).Copy(params.Emb)
-            // small random row
-            for j := 0; j < c; j++ {
-                ne.Set(r, j, (rand.Float64()-0.5)*1e-3)
+        if c == id { // grow by one COLUMN for the new token
+            ne := mat.NewDense(r, c+1, nil)
+            for i := 0; i < r; i++ {
+                for j := 0; j < c; j++ {
+                    ne.Set(i, j, params.Emb.At(i, j))
+                }
+                ne.Set(i, c, (rand.Float64()-0.5)*1e-3) // small random col
             }
             params.Emb = ne
         }

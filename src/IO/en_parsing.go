@@ -57,26 +57,6 @@ func BuildVocabAndEmbFromTrain(gpt transformer.Transformer) (int, error) {
 	return lines, nil
 }
 
-// Add positional embeddings to an embedded sequence X (d x T), using positions 0..T-1.
-func addPosToSequence(X *mat.Dense) *mat.Dense {
-	if params.PosEmb == nil {
-		return X
-	}
-	d, T := X.Dims()
-	if T > params.PosEmb.RawMatrix().Cols {
-		T = params.PosEmb.RawMatrix().Cols
-	}
-	out := mat.NewDense(d, T, nil)
-	out.Copy(X)
-	// out += posEmb[:, 0:T]
-	for i := 0; i < d; i++ {
-		for t := 0; t < T; t++ {
-			out.Set(i, t, out.At(i, t)+params.PosEmb.At(i, t))
-		}
-	}
-	return out
-}
-
 // Add positional embedding column posIdx to xCol (d x 1).
 func AddPosCol(xCol *mat.Dense, posIdx int) *mat.Dense {
 	if params.PosEmb == nil {
@@ -187,9 +167,7 @@ func EvaluateMetrics(gpt transformer.Transformer) (int, int, float64) {
 			if pred == ids[t+1] {
 				correct++
 			}
-			// accumulate CE
-			oh := utils.OneHot(params.Config.VocabSize, ids[t+1])
-			loss, _ := utils.CrossEntropyWithGrad(logits, oh)
+			loss, _ := utils.CrossEntropyWithIndex(logits, ids[t+1])
 			ceSum += loss
 
 			total++
@@ -400,11 +378,8 @@ func ColAsVector(m *mat.Dense, j int) *mat.Dense {
 	for i := 0; i < r; i++ {
 		dst[i] = m.At(i, j)
 	}
-	out := mat.NewDense(r, 1, dst)
-	if params.PosEmb != nil {
-		out = addPosToSequence(out)
-	}
-	return out
+	return mat.NewDense(r, 1, dst)
+	
 }
 
 func EmbedSequence(emb *mat.Dense, ids []int) *mat.Dense {
