@@ -1,6 +1,7 @@
 package IO
 
 import (
+	"slices"
 	"bufio"
 	"errors"
 	"fmt"
@@ -122,58 +123,6 @@ func Unembed(x *mat.Dense) *mat.Dense {
 	}
 	return utils.ToDense(utils.Dot(params.Emb.T(), x))
 }
-
-func buildFixedVocabFromCounts(cnt map[string]int, size int) params.Vocabulary {
-	if size < len(special) {
-		panic("vocab size must be >= number of special tokens")
-	}
-	type kv struct {
-		k string
-		v int
-	}
-	arr := make([]kv, 0, len(cnt))
-	for k, v := range cnt {
-		arr = append(arr, kv{k, v})
-	}
-	sort.Slice(arr, func(i, j int) bool {
-		if arr[i].v == arr[j].v {
-			return arr[i].k < arr[j].k
-		}
-		return arr[i].v > arr[j].v
-	})
-	idToToken := append([]string{}, special...)
-	for _, p := range arr {
-		if len(idToToken) >= size {
-			break
-		}
-		skip := false
-		for _, s := range special {
-			if p.k == s {
-				skip = true
-				break
-			}
-		}
-		if skip {
-			continue
-		}
-		if !isASCIIString(p.k) {
-			continue
-		} // enforce 1-byte ASCII only
-		if p.k == "" {
-			continue
-		}
-		idToToken = append(idToToken, p.k)
-	}
-	for len(idToToken) < size {
-		idToToken = append(idToToken, fmt.Sprintf("<pad%d>", len(idToToken)))
-	}
-	tok2id := map[string]int{}
-	for i, t := range idToToken {
-		tok2id[t] = i
-	}
-	return params.Vocabulary{TokenToID: tok2id, IDToToken: idToToken}
-}
-
 // Streaming vocab builder from file; returns vocab and number of lines processed.
 func buildFixedVocabFromFile(path string, size int) (params.Vocabulary, int, error) {
 	f, err := os.Open(path)
@@ -207,6 +156,69 @@ func buildFixedVocabFromFile(path string, size int) (params.Vocabulary, int, err
 	return buildFixedVocabFromCounts(counts, size), lines, nil
 }
 
+// Helper function for buildFixedVocabFromFile
+func buildFixedVocabFromCounts(cnt map[string]int, size int) params.Vocabulary {
+	if size < len(special) {
+		panic("vocab size must be >= number of special tokens")
+	}
+	type kv struct {
+		k string
+		v int
+	}
+	arr := make([]kv, 0, len(cnt))
+	for k, v := range cnt {
+		arr = append(arr, kv{k, v})
+	}
+	sort.Slice(arr, func(i, j int) bool {
+		if arr[i].v == arr[j].v {
+			return arr[i].k < arr[j].k
+		}
+		return arr[i].v > arr[j].v
+	})
+	idToToken := append([]string{}, special...)
+
+    // --- NEW: ensure all printable ASCII single chars are in vocab ---
+    for c := 32; c <= 126; c++ {
+        tok := string(rune(c))
+        idToToken = append(idToToken, tok)
+    }
+
+	for _, p := range arr {
+		if len(idToToken) >= size {
+			break
+		}
+		skip := false
+		for _, s := range special {
+			if p.k == s {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		if !isASCIIString(p.k) {
+            continue
+        }
+        if p.k == "" {
+            continue
+        }
+        // don’t duplicate if already added as single ASCII
+        already := slices.Contains(idToToken, p.k)
+        if !already {
+            idToToken = append(idToToken, p.k)
+        }
+	}
+	for len(idToToken) < size {
+		idToToken = append(idToToken, fmt.Sprintf("<pad%d>", len(idToToken)))
+	}
+	tok2id := map[string]int{}
+	for i, t := range idToToken {
+		tok2id[t] = i
+	}
+	return params.Vocabulary{TokenToID: tok2id, IDToToken: idToToken}
+}
+
 // ASCII helper
 func isASCIIString(s string) bool {
 	for i := 0; i < len(s); i++ {
@@ -219,31 +231,57 @@ func isASCIIString(s string) bool {
 
 // Tokenization (ASCII-only pieces). Lowercases, drops any non 1-byte ASCII chars.
 func TokenizeENPieces(s string) []string {
-	// Fast ASCII lowercase non-ASCII drop
-	b := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c = c + 32
-		}
-		if c < 0x80 {
-			b = append(b, c)
-		} else {
-			// replace non-ascii with space to enforce splitting
-			b = append(b, ' ')
-		}
-	}
-	parts := strings.Fields(string(b))
-	out := make([]string, 0, 16)
-	for _, w := range parts {
-		// split each ASCII word into 1–4 byte pieces
-		for len(w) > 0 {
-			take := min(4, len(w))
-			out = append(out, w[:take])
-			w = w[take:]
-		}
-	}
-	return out
+	// Fast ASCII lowercase + drop non-ASCII (replace by space)
+    b := make([]byte, 0, len(s))
+    for i := 0; i < len(s); i++ {
+        c := s[i]
+        if c >= 'A' && c <= 'Z' {
+            c = c + 32
+        }
+        if c < 0x80 {
+            b = append(b, c)
+        } else {
+            b = append(b, ' ')
+        }
+    }
+    parts := strings.Fields(string(b))
+
+    // If vocab is not initialized yet (during vocab building), fall back to
+    // fixed 1–4 slicing to produce counts.
+    if params.Vocab.TokenToID == nil {
+        out := make([]string, 0, 16)
+        for _, w := range parts {
+            for len(w) > 0 {
+                take := min(4, len(w))
+                out = append(out, w[:take])
+                w = w[take:]
+            }
+        }
+        return out
+    }
+
+    // Vocab-aware greedy encoding: for each word, take the longest piece in
+    // vocab (4→3→2→1). Guarantees coverage by falling back to single chars.
+    out := make([]string, 0, 16)
+    for _, w := range parts {
+        i := 0
+        for i < len(w) {
+            take := 1
+            // try 4→3→2→1
+            for k := 4; k >= 1; k-- {
+                if i+k <= len(w) {
+                    cand := w[i : i+k]
+                    if _, ok := params.Vocab.TokenToID[cand]; ok {
+                        take = k
+                        break
+                    }
+                }
+            }
+            out = append(out, w[i:i+take])
+            i += take
+        }
+    }
+    return out
 }
 
 // Stream training lines -> token IDs without loading all into memory.

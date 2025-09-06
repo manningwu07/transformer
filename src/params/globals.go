@@ -59,15 +59,20 @@ type TrainingConfig struct {
     SaveEverySteps int  // checkpoint every N optimizer steps (0=disable)
 }
 
+// Background specs---Cosume 8/14 cores at peak height (run cmd)
+// WORKERS=4 GOMAXPROCS=8 VECLIB_MAXIMUM_THREADS=1 go run .
+
+// Overnight---Consume almost all the resources; 12/14 cores (run cmd)
+// WORKERS=4 GOMAXPROCS=12 VECLIB_MAXIMUM_THREADS=3 go run .
 
 // How many times does attn --> mlp happen
-var Layers = 8
+var Layers = 2 //8
 var Config = TrainingConfig{
 	// These are fundemental for fine tuning (DO NOT CHANGE)
-	DModel:     768,
-	HiddenSize: 2048,
+	DModel:     256, // 768
+	HiddenSize: 512, // 2048
 	VocabSize:  16384, // Top number of 1-4 chars
-	NumHeads:   12,    // dHead = DModel/NumHeads
+	NumHeads:   4, //12    // dHead = DModel/NumHeads
 
 	SeqLen:     64,   // context window (num in tokens)
 	AttnLR:     0.0003,

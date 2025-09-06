@@ -20,7 +20,6 @@ func ChatCLI(gpt *transformer.Transformer) {
 	for {
 		fmt.Print("You: ")
 		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
 		if input == "exit" {
 			break
 		}
@@ -42,8 +41,6 @@ func Predict(gpt *transformer.Transformer, input string, maxLen int) []string {
 	IO.EnsureEOSToken()
 	// Tokenize into 1–4 char pieces
 	toks := IO.TokenizeENPieces(input)
-	// Start with <bos> + prompt
-	toks = append(toks, "<eos>")
 	seq := append([]string{"<bos>"}, toks...)
 	ids := make([]int, len(seq))
 	for i, t := range seq {
@@ -66,7 +63,7 @@ func Predict(gpt *transformer.Transformer, input string, maxLen int) []string {
 	for steps := 0; steps < maxLen; steps++ {
 		logits := IO.Unembed(yLast)
 		probs := utils.ColVectorSoftmax(logits)
-		nextID := utils.SampleFromProbs(probs, 50, 0.9)
+		nextID := utils.SampleFromProbs(probs, 10, 0.9)
 		nextTok := params.Vocab.IDToToken[nextID]
 		if nextTok == "<eos>" {
 			break

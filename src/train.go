@@ -378,8 +378,15 @@ func TrainGPT(gpt *transformer.Transformer, iter *IO.TrainLineIter, linesCount i
 			accuracy = float64(corr) / float64(tot)
 			evalPPL = math.Exp(ceSum / float64(tot))
 		}
-		fmt.Printf("Epoch %d - Acc: %.4f, TrainTokLoss: %.4f, TrainPPL: %.1f, EvalPPL: %.1f, Time: %v\n",
-			e, accuracy, avgTokLoss, trainPPL, evalPPL, time.Since(start))
+
+		 // cloze metrics
+        cPrompts, cTok, cNLL := IO.EvaluateCloze(*gpt, 5000)
+        clozePPL := 0.0
+        if cTok > 0 {
+            clozePPL = math.Exp(cNLL / float64(cTok))
+        }
+		fmt.Printf("Epoch %d - Acc: %.4f, TrainTokLoss: %.4f, TrainPPL: %.1f, EvalPPL: %.1f, ClozePPL: %.1f (n=%d) Steps: %f, Time: %v\n",
+			e, accuracy, avgTokLoss, trainPPL, evalPPL, clozePPL, cPrompts, steps, time.Since(start))
 
 		// Save checkpoints
 		_ = safeSaveTransformer(gpt, "models/last_epoch.gob")
