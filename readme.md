@@ -1,8 +1,10 @@
-# ChatGPT2-super mini (57.5M params) - in GoLang
+# ChatGPT2 - in GoLang
 
 This project implements a GPT-like transformer model for text generation, written entirely in Go. It supports training from scratch, resuming from checkpoints, and interactive text generation via a CLI. The design optionally integrats Apple's Accelerate framework for performance on compatible hardware.
 
 This repository is completely meant for educational purposes. Please properly cite the author (see #Citation)
+
+*NOTE: Unfourtantely, this project does not work for large scale ML training beacuse its CPU-bound (Go doesn't have GPU ecosystem yet). However, it does still work on smaller modaling that require a transformer architecture. 
 
 ## Features
 

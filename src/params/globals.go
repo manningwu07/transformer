@@ -66,15 +66,15 @@ type TrainingConfig struct {
 // WORKERS=4 GOMAXPROCS=12 VECLIB_MAXIMUM_THREADS=3 go run .
 
 // How many times does attn --> mlp happen
-var Layers = 2 //8
+var Layers = 6
 var Config = TrainingConfig{
 	// These are fundemental for fine tuning (DO NOT CHANGE)
-	DModel:     256, // 768
-	HiddenSize: 512, // 2048
+	DModel:     512, 
+	HiddenSize: 2048, 
 	VocabSize:  16384, // Top number of 1-4 chars
-	NumHeads:   4, //12    // dHead = DModel/NumHeads
+	NumHeads:   12,   // dHead = DModel/NumHeads
 
-	SeqLen:     64,   // context window (num in tokens)
+	SeqLen:     256,   // context window (num in tokens)
 	AttnLR:     0.0003,
 	MLPLR:      0.0003,
 	UnembedLR:  0.00003,
