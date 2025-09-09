@@ -1,0 +1,16 @@
+# data
+/data/
+/data/raw/
+/data/processed/*.bin
+/data/tokenized/
+/dataExtraction/
+
+# venv
+/.venv/
+*.tar.gz
+
+# modal
+/src/models/
+
+# archived
+/src/archived

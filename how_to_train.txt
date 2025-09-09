@@ -1,0 +1,11 @@
+First run the go main
+go run . --export
+To get vocab
+
+Next, train on python
+python3 train.py --train data/test/wiki_train_ids.jsonl --eval data/test/wiki_eval_ids.jsonl --vocab data/test/vocab.json (--epochs _ for testing)
+
+
+Open up connection between the 2:
+uvicorn server:app --reload --port 8000
+go run . --cli
