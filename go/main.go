@@ -35,7 +35,7 @@ func main() {
 
         trainPrefix := "../data/test/wiki_train_ids"
         evalPrefix := "../data/test/wiki_eval_ids"
-        valPrefix := "../data/test/wiki_eval_ids"
+        valPrefix := "../data/test/wiki_val_ids"
 
         // ---- Export vocab ----
         if !fileExists(vocabPath) || forceFlag {

@@ -229,11 +229,15 @@ def main(args):
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             logits, _ = model(x)
-            loss = F.cross_entropy(
+            criterion = torch.nn.CrossEntropyLoss(
+                ignore_index=pad_id,
+                label_smoothing=0.1,   # 🆕 smooth labels
+            )
+            loss = criterion(
                 logits.view(-1, vocab_size),
                 y.view(-1),
-                ignore_index=pad_id,
             ) / Config.gradAccumSteps
+            
             loss.backward()
 
             if (global_step + 1) % Config.gradAccumSteps == 0:
@@ -248,8 +252,7 @@ def main(args):
 
             if Config.debug and global_step % Config.debug_every == 0:
                 avg_tok_loss = total_loss / total_tokens
-                ppl = math.exp(avg_tok_loss)
-                print(f"Step {global_step} - Train tokLoss={avg_tok_loss:.4f}, PPL={ppl:.2f}")
+                print(f"Step {global_step} - Train tokLoss={avg_tok_loss:.4f}")
                 total_loss, total_tokens = 0.0, 0
 
             # ---- Validation ----
