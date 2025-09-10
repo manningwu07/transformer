@@ -1,31 +1,26 @@
 # params.py
 from dataclasses import dataclass
 
-
 @dataclass
 class TrainingConfig:
     # Core transformer parameters
-    d_model: int = 768         # model width
-    hidden_size: int = 2048    # MLP hidden dim
-    vocab_size: int = 16_384    # |V|
-    num_heads: int = 12        # attention heads
-    seq_len: int = 1024        # context length
-    n_layers: int = 8          # number of transformer blocks
-
-    # Learning rates
-    attn_lr: float = 3e-4
-    mlp_lr: float = 3e-4
-    unembed_lr: float = 3e-4
-    norm_lr: float = 3e-4
+    d_model: int = 768         # model width (CORE)
+    hidden_size: int = 2048    # MLP hidden dim (CORE)
+    vocab_size: int = 16_384    # |V| (CORE)
+    num_heads: int = 12        # attention heads (CORE)
+    seq_len: int = 512        # context length (CORE)
+    n_layers: int = 8          # number of transformer blocks (CORE)
+    lr: float = 3e-4
 
     # Optimization
-    max_epochs: int = 128_000
-    patience: int = 15
-    save_epoch_number: int = 5
-    improvement_threshold: float = 0.0005
-    epsilon: float = 1e-4
-    batch_size: int = 32       # keep small for debugging, raise later
-    val_frac: float = 0.1
+    max_epochs: int = 2 # number of passes through the dataset
+    patience: int = 32
+    improvement_threshold: float = 0.005
+    batch_size: int = 2
+    epsilon: int = 1e-5
+    gradAccumSteps: int = 2 # batchsize * gradAccumSteps = effective batchsize
+    eval_every_steps = 25_000
+    save_every_steps = 100_000
 
     # Adam/Optimizer
     warmup_steps: int = 10_000
@@ -38,8 +33,7 @@ class TrainingConfig:
 
     # Debug
     debug: bool = True
-    debug_every: int = 100     # print every N steps
-    save_every_steps: int = 10000
+    debug_every: int = 1_000     # print every N steps
 
 
 Config = TrainingConfig()

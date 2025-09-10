@@ -1,8 +1,8 @@
 package IO
 
 import (
+	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,36 +47,24 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-// nextIDs returns the next line converted to token IDs, or nil, io.EOF when at end.
-// When EOF is reached, the iterator rewinds to the beginning to allow multiple epochs.
-func (it *TrainLineIter) NextIDs() ([]int, error) {
-	for {
-		line, err := it.r.ReadString('\n')
-		if len(line) > 0 {
-			toks := TokenizeENPieces(line)
-			if len(toks) == 0 {
-				// skip empty lines
-				continue
-			}
-			// add BOS/EOS
-			ids := make([]int, 0, len(toks)+2)
-			ids = append(ids, VocabLookup(params.Vocab, "<bos>"))
-			for _, t := range toks {
-				ids = append(ids, VocabLookup(params.Vocab, t))
-			}
-			ids = append(ids, VocabLookup(params.Vocab, "<eos>"))
-			return ids, nil
-		}
-		if err == io.EOF {
-			// rewind for next epoch
-			if _, err2 := it.f.Seek(0, io.SeekStart); err2 != nil {
-				return nil, err2
-			}
-			it.r.Reset(it.f)
-			return nil, io.EOF
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
+// ImportVocabJSON loads vocab.json into params.Vocab
+func ImportVocabJSON(path string) error {
+    f, err := os.Open(path)
+    if err != nil {
+        return err
+    }
+    defer f.Close()
+    var data struct {
+        TokenToID map[string]int `json:"TokenToID"`
+        IDToToken []string       `json:"IDToToken"`
+    }
+    if err := json.NewDecoder(f).Decode(&data); err != nil {
+        return err
+    }
+    params.Vocab = params.Vocabulary{
+        TokenToID: data.TokenToID,
+        IDToToken: data.IDToToken,
+    }
+    return nil
 }
+

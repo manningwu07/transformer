@@ -4,9 +4,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"time"
-
-	"github.com/manningwu07/GPT/params"
 	"gonum.org/v1/gonum/mat"
 )
 
@@ -90,29 +87,6 @@ func MatrixNorm(m *mat.Dense) float64 {
 	return math.Sqrt(s)
 }
 
-// ------- LR schedule: linear warmup, then cosine decay --------
-func LRSchedule(step int, peak float64) float64 {
-	if step <= 0 {
-		return 0
-	}
-	wu := params.Config.WarmupSteps
-	dec := params.Config.DecaySteps
-	if wu > 0 && step < wu {
-		return peak * float64(step) / float64(wu)
-	}
-	if dec > 0 {
-		x := float64(step-wu) / float64(dec)
-		if x > 1 {
-			x = 1
-		} else if x < 0 {
-			x = 0
-		}
-		scale := 0.5 * (1 + math.Cos(math.Pi*x))
-		return peak * scale
-	}
-	return peak
-}
-
 // debugging and clipping.
 
 // clipGrads scales all grads so their combined norm <= maxNorm.
@@ -166,16 +140,6 @@ func scaleInPlace(a *mat.Dense, s float64) {
 	}
 }
 
-// gated debug print
-func Debugf(format string, args ...any) {
-	if !params.Config.Debug {
-		return
-	}
-	// timestamp to help correlate across goroutines
-	ts := time.Now().Format("15:04:05.000")
-	fmt.Printf("[DBG %s] %s\n", ts, fmt.Sprintf(format, args...))
-}
-
 func OnesLike(a *mat.Dense) *mat.Dense {
 	r, c := a.Dims()
 	out := mat.NewDense(r, c, nil)
@@ -185,12 +149,4 @@ func OnesLike(a *mat.Dense) *mat.Dense {
 		}
 	}
 	return out
-}
-
-// Utility: add gradient column gCol (d x 1) into a matrix target at column j.
-func addCol(target *mat.Dense, gCol *mat.Dense, j int) {
-	d, _ := gCol.Dims()
-	for i := 0; i < d; i++ {
-		target.Set(i, j, target.At(i, j)+gCol.At(i, 0))
-	}
 }

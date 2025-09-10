@@ -3,9 +3,14 @@ go run . --export
 To get vocab
 
 Next, train on python
-python3 train.py --train data/test/wiki_train_ids.jsonl --eval data/test/wiki_eval_ids.jsonl --vocab data/test/vocab.json (--epochs _ for testing)
+python3 train.py --train data/test/wiki_train_ids --eval data/test/wiki_eval_ids --vocab data/test/vocab.json (--epochs _ for testing)
 
 
 Open up connection between the 2:
 uvicorn server:app --reload --port 8000
 go run . --cli
+
+
+Check if data is good:
+
+python3 -c "import numpy as np; a=np.memmap('data/test/wiki_train_ids-000.bin',dtype=np.int32,mode='r'); import json; t=json.load(open('data/test/vocab.json')); print('pad id=', t['TokenToID']['<pad>']); print(np.unique(a[:100000], return_counts=True))"

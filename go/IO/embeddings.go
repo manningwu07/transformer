@@ -67,10 +67,13 @@ func BuildVocabAndEmbFromTrainDummy(dModel, vocabSize int) (int, error) {
 }
 
 func VocabLookup(v params.Vocabulary, tok string) int {
-	if id, ok := v.TokenToID[tok]; ok {
-		return id
-	}
-	return v.TokenToID["<unk>"]
+	 if v.TokenToID == nil {
+        panic("VocabLookup called with nil vocab. Load/build vocab first.")
+    }
+    if id, ok := v.TokenToID[tok]; ok {
+        return id
+    }
+    return v.TokenToID["<unk>"]
 }
 
 // Initialize embeddings with small random values.
@@ -94,7 +97,7 @@ func buildFixedVocabFromFile(path string, size int) (params.Vocabulary, int, err
 		line, err := r.ReadString('\n')
 		if len(line) > 0 {
 			lines++
-			toks := TokenizeENPieces(line)
+			toks := TokenizeForVocab(line)
 			for _, t := range toks {
 				// enforce ASCII-only
 				if t == "" || !isASCIIString(t) {
@@ -115,65 +118,92 @@ func buildFixedVocabFromFile(path string, size int) (params.Vocabulary, int, err
 
 // Helper function for buildFixedVocabFromFile
 func buildFixedVocabFromCounts(cnt map[string]int, size int) params.Vocabulary {
-	if size < len(special) {
-		panic("vocab size must be >= number of special tokens")
-	}
-	type kv struct {
-		k string
-		v int
-	}
-	arr := make([]kv, 0, len(cnt))
-	for k, v := range cnt {
-		arr = append(arr, kv{k, v})
-	}
-	sort.Slice(arr, func(i, j int) bool {
-		if arr[i].v == arr[j].v {
-			return arr[i].k < arr[j].k
-		}
-		return arr[i].v > arr[j].v
-	})
-	idToToken := append([]string{}, special...)
+    if size < len(special) {
+        panic("vocab size must be >= number of special tokens")
+    }
 
-	// --- NEW: ensure all printable ASCII single chars are in vocab ---
-	for c := 32; c <= 126; c++ {
-		tok := string(rune(c))
-		idToToken = append(idToToken, tok)
-	}
+    type kv struct {
+        k string
+        v int
+    }
 
-	for _, p := range arr {
-		if len(idToToken) >= size {
-			break
-		}
-		skip := false
-		for _, s := range special {
-			if p.k == s {
-				skip = true
-				break
-			}
-		}
-		if skip {
-			continue
-		}
-		if !isASCIIString(p.k) {
-			continue
-		}
-		if p.k == "" {
-			continue
-		}
-		// don’t duplicate if already added as single ASCII
-		already := slices.Contains(idToToken, p.k)
-		if !already {
-			idToToken = append(idToToken, p.k)
-		}
-	}
-	for len(idToToken) < size {
-		idToToken = append(idToToken, fmt.Sprintf("<pad%d>", len(idToToken)))
-	}
-	tok2id := map[string]int{}
-	for i, t := range idToToken {
-		tok2id[t] = i
-	}
-	return params.Vocabulary{TokenToID: tok2id, IDToToken: idToToken}
+    // Buckets: length → list of (token,count)
+    buckets := map[int][]kv{
+        1: {}, 2: {}, 3: {}, 4: {},
+    }
+
+    // --- cutoff ---
+    const minCount = 10 // 🛑 frequency cutoff: skip n-grams < 5 occurrences
+
+    for k, v := range cnt {
+        L := len(k)
+        if L >= 1 && L <= 4 && v >= minCount {
+            buckets[L] = append(buckets[L], kv{k, v})
+        }
+    }
+
+    // Sort each bucket by frequency desc
+    for L := 1; L <= 4; L++ {
+        sort.Slice(buckets[L], func(i, j int) bool {
+            if buckets[L][i].v == buckets[L][j].v {
+                return buckets[L][i].k < buckets[L][j].k
+            }
+            return buckets[L][i].v > buckets[L][j].v
+        })
+    }
+
+    // Start vocab with specials
+    idToToken := append([]string{}, special...)
+
+    // Always guarantee ASCII single chars are in vocab
+    for c := 32; c <= 126; c++ {
+        tok := string(rune(c))
+        idToToken = append(idToToken, tok)
+    }
+
+    // Compute remaining budget
+    remaining := size - len(idToToken)
+    if remaining <= 0 {
+        return finalizeVocab(idToToken, size)
+    }
+
+    // Divide evenly across lengths 2,3,4
+    share := remaining / 3
+    target2 := len(idToToken) + share
+    target3 := target2 + share
+    target4 := target3 + share
+
+    addBucket := func(L int, limit int) {
+        for _, p := range buckets[L] {
+            if len(idToToken) >= limit || len(idToToken) >= size {
+                return
+            }
+            if !isASCIIString(p.k) || p.k == "" {
+                continue
+            }
+            if slices.Contains(idToToken, p.k) {
+                continue
+            }
+            idToToken = append(idToToken, p.k)
+        }
+    }
+
+    addBucket(2, target2)
+    addBucket(3, target3)
+    addBucket(4, target4)
+
+    return finalizeVocab(idToToken, size)
+}
+
+func finalizeVocab(idToToken []string, size int) params.Vocabulary {
+    for len(idToToken) < size {
+        idToToken = append(idToToken, fmt.Sprintf("<pad%d>", len(idToToken)))
+    }
+    tok2id := make(map[string]int, len(idToToken))
+    for i, t := range idToToken {
+        tok2id[t] = i
+    }
+    return params.Vocabulary{TokenToID: tok2id, IDToToken: idToToken}
 }
 
 // ASCII helper
@@ -186,13 +216,14 @@ func isASCIIString(s string) bool {
 	return true
 }
 
-// Tokenization (ASCII-only pieces). Lowercases, drops any non 1-byte ASCII chars.
-func TokenizeENPieces(s string) []string {
-    // Lowercase & clean non‑ASCII
+// TokenizeForVocab is used during vocab building.
+// It lowercases, removes non-ASCII, and greedily emits substrings of length 1..4.
+func TokenizeForVocab(s string) []string {
+    // Lowercase & clean to ASCII
     b := make([]rune, 0, len(s))
     for _, c := range s {
         if c >= 'A' && c <= 'Z' {
-            c = c + 32
+            c += 32
         }
         if c < 0x80 {
             b = append(b, c)
@@ -202,7 +233,6 @@ func TokenizeENPieces(s string) []string {
     }
     text := string(b)
 
-    // --- main change: don't strings.Fields; scan char by char
     out := make([]string, 0, len(text))
     i := 0
     for i < len(text) {
@@ -211,7 +241,47 @@ func TokenizeENPieces(s string) []string {
         for k := 4; k >= 1; k-- {
             if i+k <= len(text) {
                 piece := text[i : i+k]
-                if params.Vocab.TokenToID != nil { // ensure vocab init
+                // just take the substring as a vocab candidate
+                out = append(out, piece)
+                i += k
+                matched = true
+                break
+            }
+        }
+        if !matched {
+            // shouldn't ever happen, but safety
+            i++
+        }
+    }
+    return out
+}
+
+// TokenizeENPieces is used at runtime after vocab has been built.
+// It attempts greedy matching against existing vocab; if not found, falls back.
+func TokenizeENPieces(s string) []string {
+    // Lowercase & clean to ASCII
+    b := make([]rune, 0, len(s))
+    for _, c := range s {
+        if c >= 'A' && c <= 'Z' {
+            c += 32
+        }
+        if c < 0x80 {
+            b = append(b, c)
+        } else {
+            b = append(b, ' ')
+        }
+    }
+    text := string(b)
+
+    out := make([]string, 0, len(text))
+    i := 0
+    for i < len(text) {
+        matched := false
+        // Greedy: try token lengths 4→1
+        for k := 4; k >= 1; k-- {
+            if i+k <= len(text) {
+                piece := text[i : i+k]
+                if params.Vocab.TokenToID != nil {
                     if _, ok := params.Vocab.TokenToID[piece]; ok {
                         out = append(out, piece)
                         i += k
@@ -222,7 +292,7 @@ func TokenizeENPieces(s string) []string {
             }
         }
         if !matched {
-            // default: single char (covers space too)
+            // fallback: single char (or could map to <unk>)
             out = append(out, text[i:i+1])
             i++
         }

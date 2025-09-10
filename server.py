@@ -10,8 +10,8 @@ import json
 
 # ---------- Config ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VOCAB_PATH = os.path.join(BASE_DIR, "vocab.json")
-MODEL_PATH = os.path.join(BASE_DIR, "models", "checkpoint_epoch1.pt") #change this if nessecary
+VOCAB_PATH = os.path.join(BASE_DIR, "data/test/vocab.json")
+MODEL_PATH = os.path.join(BASE_DIR, "models", "curr_model.pt") #change this if nessecary
 
 # ---------- Load vocab ----------
 print("CWD:", os.getcwd())
@@ -37,7 +37,8 @@ model = GPT2LikeLM(
     eos_id=tok2id["<eos>"],
     unk_id=tok2id["<unk>"],
 )
-model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"))
+ckpt = torch.load(MODEL_PATH, map_location="cpu")
+model.load_state_dict(ckpt["model_state"])
 model.eval()
 model.eos_id = eos_id
 

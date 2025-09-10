@@ -8,9 +8,11 @@
 # venv
 /.venv/
 *.tar.gz
+/__pycache__/
 
 # modal
 /src/models/
+/models/
 
 # archived
 /src/archived

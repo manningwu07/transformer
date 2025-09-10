@@ -27,9 +27,15 @@ func main() {
     if exportFlag {
         fmt.Println("Building vocab & exporting datasets...")
 
-        vocabPath := "../data/test/vocab.json"   // fixed extension
+        vocabPath := "../data/test/vocab.json"
+
+        trainText := "../data/raw/wiki_train.txt" 
+        evalText := "../data/raw/wiki_eval.txt"
+        valText := "../data/raw/wiki_val.txt"
+
         trainPrefix := "../data/test/wiki_train_ids"
         evalPrefix := "../data/test/wiki_eval_ids"
+        valPrefix := "../data/test/wiki_eval_ids"
 
         // ---- Export vocab ----
         if !fileExists(vocabPath) || forceFlag {
@@ -47,19 +53,37 @@ func main() {
 
         // ---- Export train shards ----
         if shardMissing(trainPrefix) || forceFlag {
-            maxShardSize := int64(10 * 1024 * 1024 * 1024) // 10GB per shard
-            if err := IO.ExportTokenIDsBinary("../data/raw/wiki_train.txt", trainPrefix, maxShardSize); err != nil {
+            maxShardSize := int64(5 * 1024 * 1024 * 1024) // 5GB per shard
+            if err := IO.ExportTokenIDsBinary(trainText, trainPrefix, maxShardSize); err != nil {
                 panic(err)
             }
             fmt.Println("✅ Exported train ID shards")
         } else {
             fmt.Println("⚡ Using cached train shards")
+            if err := IO.ImportVocabJSON(vocabPath); err != nil {
+                panic(err)
+            }
+        }
+
+        // ---- Export validation shards ----
+        if fileExists(valText) {
+            if shardMissing(valPrefix) || forceFlag {
+                maxShardSize := int64(2 * 1024 * 1024 * 1024)
+                if err := IO.ExportTokenIDsBinary(valText, valPrefix, maxShardSize); err != nil {
+                    panic(err)
+                }
+                fmt.Println("✅ Exported validation ID shards")
+            } else {
+                fmt.Println("⚡ Using cached validation shards")
+            }
+        } else {
+            fmt.Println("⚠️ No wiki_val.txt found, skipping validation export")
         }
 
         // ---- Export eval shards ----
         if shardMissing(evalPrefix) || forceFlag {
             maxShardSize := int64(2 * 1024 * 1024 * 1024) // 2GB per shard
-            if err := IO.ExportTokenIDsBinary("../data/raw/wiki_eval.txt", evalPrefix, maxShardSize); err != nil {
+            if err := IO.ExportTokenIDsBinary(evalText, evalPrefix, maxShardSize); err != nil {
                 panic(err)
             }
             fmt.Println("✅ Exported eval ID shards")

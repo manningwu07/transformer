@@ -26,7 +26,7 @@ func ChatCLI() {
 		}
 
 		// Tokenize user input
-		toks := IO.TokenizeENPieces(input)
+		toks := IO.TokenizeForVocab(input)
 		ids := make([]int, 0, len(toks)+2)
 		ids = append(ids, params.Vocab.TokenToID["<bos>"])
 		for _, t := range toks {

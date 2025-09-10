@@ -17,6 +17,9 @@ import (
 //
 // It will split into shards <= maxShardBytes (e.g. 10 GB).
 func ExportTokenIDsBinary(inPath, outPrefix string, maxShardBytes int64) error {
+	if params.Vocab.TokenToID == nil || len(params.Vocab.IDToToken) == 0 {
+        return fmt.Errorf("vocab is not initialized; load or build vocab before exporting")
+    }
 	inF, err := os.Open(inPath)
 	if err != nil {
 		return err
