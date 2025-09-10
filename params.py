@@ -3,13 +3,13 @@ from dataclasses import dataclass
 
 @dataclass
 class TrainingConfig:
-    # Core transformer parameters
-    d_model: int = 768         # model width (CORE)
-    hidden_size: int = 2048    # MLP hidden dim (CORE)
-    vocab_size: int = 16_384    # |V| (CORE)
-    num_heads: int = 12        # attention heads (CORE)
-    seq_len: int = 512        # context length (CORE)
-    n_layers: int = 8          # number of transformer blocks (CORE)
+    # Core transformer parameters (MUST MATCH OR ELSE IT WILL FAIL)
+    d_model: int = 768         # model width 
+    hidden_size: int = 2048    # MLP hidden dim 
+    vocab_size: int = 16_384    # |V| 
+    num_heads: int = 12        # attention heads 
+    seq_len: int = 512        # context length 
+    n_layers: int = 8          # number of transformer blocks 
     lr: float = 3e-4
 
     # Optimization

@@ -187,15 +187,9 @@ def main(args):
         args.max_steps,
         min_lr=Config.epsilon,
     )
-
-    # --- Eval ---
-    if args.eval and os.path.exists(args.evalPath):
-        print(f"Evaluation mode. Currently evaulating on {args.evalPath}")
-        evaluate(model, test_loader, vocab_size, pad_id, device, "Eval")
-        sys.exit("Evaulation done")
         
     # ---- Resume ----
-    if args.resume and os.path.exists(args.resumePath):
+    if os.path.exists(args.resumePath):
         print(f"Resuming from checkpoint: {args.resumePath}")
         ckpt = torch.load(args.resumePath, map_location=device)
         model.load_state_dict(ckpt["model_state"])
@@ -205,6 +199,12 @@ def main(args):
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         global_step = ckpt.get("step", 0)
         print(f"✔️ Resumed at step {global_step} (best_val_loss={best_val_loss:.4f})")
+        
+     # --- Eval ---
+    if os.path.exists(args.evalPath) and args.evalSubset > 0:
+        print(f"Evaluation mode. Currently evaulating on {args.evalPath} with {args.evalSubset * 100}% of eval set used.")
+        evaluate(model, test_loader, vocab_size, pad_id, device, "Eval", args.evalSubset)
+        sys.exit("Evaulation done")
 
     # ---- Training loop ----
     noImprovement = 0
@@ -243,7 +243,7 @@ def main(args):
 
             # ---- Validation ----
             if global_step % args.eval_every_steps == 0:
-                val_loss = evaluate(model, val_loader, vocab_size, pad_id, device, "VAL")
+                val_loss = evaluate(model, val_loader, vocab_size, pad_id, device, "VAL", 0.15)
                 if val_loss < best_val_loss - Config.improvement_threshold:
                     best_val_loss = val_loss
                     noImprovement = 0
@@ -265,7 +265,7 @@ def main(args):
                 break
 
     # ---- Final test evaluation ----
-    test_loss = evaluate(model, test_loader, vocab_size, pad_id, device, "TEST")
+    test_loss = evaluate(model, test_loader, vocab_size, pad_id, device, "TEST", 1.0)
     print(f"✅ Training complete. Final Test Loss={test_loss:.4f}")
 
 
@@ -285,12 +285,12 @@ if __name__ == "__main__":
     parser.add_argument("--eval_every_steps", type=int, default=Config.eval_every_steps)
     parser.add_argument("--save_every_steps", type=int, default=Config.save_every_steps)
 
-    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    # Resume
     parser.add_argument("--resumePath", type=str, default="models/last_save_state.pt")
     
     # Eval only
-    parser.add_argument("--eval", action="store_true", help="Evaulates modal on eval dataset")
     parser.add_argument("--evalPath", type=str, default="models/best_model.pt")
+    parser.add_argument("--evalSubset", type=float, default=0.1)
     args = parser.parse_args()
 
     main(args)
