@@ -8,9 +8,9 @@ import signal
 import sys
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
+from eval import evaluate
 from transformer import GPT2LikeLM
 from params import Config
 
@@ -128,26 +128,6 @@ scheduler = None
 global_step = 0
 
 
-def evaluate(model, loader, vocab_size, pad_id, device, split="VAL"):
-    model.eval()
-    total_loss, total_tokens = 0.0, 0
-    with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            logits, _ = model(x)
-            loss = F.cross_entropy(
-                logits.view(-1, vocab_size),
-                y.view(-1),
-                ignore_index=pad_id,
-            )
-            total_loss += loss.item() * x.numel()
-            total_tokens += x.numel()
-    tok_loss = total_loss / total_tokens
-    ppl = math.exp(tok_loss)
-    print(f"[{split}] tokLoss={tok_loss:.4f}, PPL={ppl:.2f}")
-    return tok_loss
-
-
 def main(args):
     global model, optimizer, scheduler, best_val_loss, global_step
 
@@ -208,6 +188,12 @@ def main(args):
         min_lr=Config.epsilon,
     )
 
+    # --- Eval ---
+    if args.eval and os.path.exists(args.evalPath):
+        print(f"Evaluation mode. Currently evaulating on {args.evalPath}")
+        evaluate(model, test_loader, vocab_size, pad_id, device, "Eval")
+        sys.exit("Evaulation done")
+        
     # ---- Resume ----
     if args.resume and os.path.exists(args.resumePath):
         print(f"Resuming from checkpoint: {args.resumePath}")
@@ -231,7 +217,7 @@ def main(args):
             logits, _ = model(x)
             criterion = torch.nn.CrossEntropyLoss(
                 ignore_index=pad_id,
-                label_smoothing=0.1,   # 🆕 smooth labels
+                label_smoothing=0.1,
             )
             loss = criterion(
                 logits.view(-1, vocab_size),
@@ -301,6 +287,10 @@ if __name__ == "__main__":
 
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
     parser.add_argument("--resumePath", type=str, default="models/last_save_state.pt")
+    
+    # Eval only
+    parser.add_argument("--eval", action="store_true", help="Evaulates modal on eval dataset")
+    parser.add_argument("--evalPath", type=str, default="models/best_model.pt")
     args = parser.parse_args()
 
     main(args)

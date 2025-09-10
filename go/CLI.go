@@ -26,8 +26,17 @@ func ChatCLI() {
 		}
 
 		// Tokenize user input
-		toks := IO.TokenizeForVocab(input)
+		toks := IO.TokenizeENPieces(input)
 		ids := make([]int, 0, len(toks)+2)
+		// Pull TokenToID and IDToToken from vocab.json
+
+		if params.Vocab.TokenToID == nil || len(params.Vocab.IDToToken) == 0 || forceFlag {
+			vocabPath := "../data/test/vocab.json"
+			if err := IO.ImportVocabJSON(vocabPath); err != nil {
+				panic(fmt.Sprintf("Failed to load vocab.json: %v", err))
+			}
+		}
+
 		ids = append(ids, params.Vocab.TokenToID["<bos>"])
 		for _, t := range toks {
 			ids = append(ids, IO.VocabLookup(params.Vocab, t))
@@ -37,8 +46,8 @@ func ChatCLI() {
 		req := map[string]any{
 			"ids":         ids,
 			"max_tokens":  30, // adjust as you want
-			"top_k":       10,
-			"temperature": 0.9,
+			"top_k":       5,
+			"temperature": 0.95,
 		}
 		body, _ := json.Marshal(req)
 

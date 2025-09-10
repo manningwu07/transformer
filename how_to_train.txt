@@ -10,7 +10,8 @@ Open up connection between the 2:
 uvicorn server:app --reload --port 8000
 go run . --cli
 
+Use --resume & --resumePath path to continue training process
+use --eval & --eval path to see effectiveness of model
 
 Check if data is good:
-
 python3 -c "import numpy as np; a=np.memmap('data/test/wiki_train_ids-000.bin',dtype=np.int32,mode='r'); import json; t=json.load(open('data/test/vocab.json')); print('pad id=', t['TokenToID']['<pad>']); print(np.unique(a[:100000], return_counts=True))"

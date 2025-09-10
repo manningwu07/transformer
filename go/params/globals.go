@@ -30,16 +30,7 @@ type TrainingConfig struct {
 	VocabSize  int // |V|
 	NumHeads   int // attention heads
 	SeqLen     int // max prefix length (context length)
-	AttnLR     float64
-	MLPLR      float64
-	UnembedLR  float64
 }
-
-// Background specs---Cosume 8/14 cores at peak height (run cmd)
-// WORKERS=4 GOMAXPROCS=8 VECLIB_MAXIMUM_THREADS=1 go run .
-
-// Overnight---Consume almost all the resources; 12/14 cores (run cmd)
-// WORKERS=4 GOMAXPROCS=12 VECLIB_MAXIMUM_THREADS=3 go run .
 
 // How many times does attn --> mlp happen
 var Layers = 8
@@ -49,9 +40,5 @@ var Config = TrainingConfig{
 	HiddenSize: 2048, 
 	VocabSize:  16384, // Top number of 1-4 chars
 	NumHeads:   12,   // dHead = DModel/NumHeads
-
 	SeqLen:     1024,   // context window (num in tokens)
-	AttnLR:     0.0003,
-	MLPLR:      0.0003,
-	UnembedLR:  0.00003,
 }

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"math/rand/v2"
 	"os"
 	"slices"
 	"sort"
@@ -13,7 +15,6 @@ import (
 	"gonum.org/v1/gonum/mat"
 
 	"github.com/manningwu07/GPT/params"
-	"github.com/manningwu07/GPT/utils"
 )
 
 // TrainingRecord is a generic dataset example (inputs column vector,
@@ -55,7 +56,7 @@ func BuildVocabAndEmbFromTrainDummy(dModel, vocabSize int) (int, error) {
     params.Emb = initEmbeddings(dModel, params.Vocab)
 
     if params.PosEmb == nil || params.PosEmb.RawMatrix().Rows != dModel || params.PosEmb.RawMatrix().Cols != params.Config.SeqLen {
-        params.PosEmb = mat.NewDense(dModel, params.Config.SeqLen, utils.RandomArray(dModel*params.Config.SeqLen, float64(dModel)))
+        params.PosEmb = mat.NewDense(dModel, params.Config.SeqLen, randomArray(dModel*params.Config.SeqLen, float64(dModel)))
     }
 
     // return line count for logging
@@ -79,7 +80,7 @@ func VocabLookup(v params.Vocabulary, tok string) int {
 // Initialize embeddings with small random values.
 // Shape: (dModel x |V|)
 func initEmbeddings(dModel int, v params.Vocabulary) *mat.Dense {
-	data := utils.RandomArray(dModel*len(v.IDToToken), float64(dModel))
+	data := randomArray(dModel*len(v.IDToToken), float64(dModel))
 	return mat.NewDense(dModel, len(v.IDToToken), data)
 }
 
@@ -300,12 +301,6 @@ func TokenizeENPieces(s string) []string {
     return out
 }
 
-// Stream training lines -> token IDs without loading all into memory.
-type TrainLineIter struct {
-	f    *os.File
-	r    *bufio.Reader
-}
-
 // countLines returns number of lines in file (used for logging).
 func countLines(path string) (int, error) {
 	f, err := os.Open(path)
@@ -325,4 +320,16 @@ func countLines(path string) (int, error) {
 		}
 		n++
 	}
+}
+
+
+// Helper function
+func randomArray(size int, v float64) []float64 {
+	min := -1.0 / math.Sqrt(v+1e-12)
+	max := 1.0 / math.Sqrt(v+1e-12)
+	out := make([]float64, size)
+	for i := 0; i < size; i++ {
+		out[i] = min + (max-min)*rand.Float64()
+	}
+	return out
 }

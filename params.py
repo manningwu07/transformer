@@ -16,9 +16,9 @@ class TrainingConfig:
     max_epochs: int = 2 # number of passes through the dataset
     patience: int = 32
     improvement_threshold: float = 0.005
-    batch_size: int = 2
+    batch_size: int = 4
     epsilon: int = 1e-5
-    gradAccumSteps: int = 2 # batchsize * gradAccumSteps = effective batchsize
+    gradAccumSteps: int = 4 # batchsize * gradAccumSteps = effective batchsize
     eval_every_steps = 25_000
     save_every_steps = 100_000
 
