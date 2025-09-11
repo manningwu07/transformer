@@ -85,11 +85,7 @@ def main():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--shardNumber", type=int, default="0")
-    parser.add_argument(
-        "--model", type=str, required=True, help="Path to .pt checkpoint file"
-    )
-    parser.add_argument(
-        "--vocab", type=str, required=True, help="Vocab JSON path (to get vocab size)"
-    )
+    parser.add_argument("--shardNumber", type=int, default=-1)
+    parser.add_argument("--model", type=str, default="", help="Path to .pt checkpoint file")
+    parser.add_argument("--vocab", type=str, default="", help="Vocab JSON path (to get vocab size)")
     args = parser.parse_args()

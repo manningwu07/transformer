@@ -38,7 +38,8 @@ model = GPT2LikeLM(
     unk_id=tok2id["<unk>"],
 )
 ckpt = torch.load(MODEL_PATH, map_location="cpu")
-model.load_state_dict(ckpt["model_state"])
+state = ckpt.get("model_state", ckpt)
+model.load_state_dict(state, strict=False)
 model.eval()
 model.eos_id = eos_id
 

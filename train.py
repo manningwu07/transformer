@@ -75,6 +75,7 @@ def load_vocab(path):
 # --------------------
 
 def save_model_state(model, optimizer, scheduler, step, path, msg=""):
+    print("Saving model state...")
     torch.save(
         {
             "step": step,
@@ -188,28 +189,46 @@ def main(args):
         min_lr=Config.epsilon,
     )
         
-    # ---- Resume ----
-    if os.path.exists(args.resumePath):
+   # ---- Resume ----
+    if args.resumePath and os.path.exists(args.resumePath):
         print(f"Resuming from checkpoint: {args.resumePath}")
         ckpt = torch.load(args.resumePath, map_location=device)
-        model.load_state_dict(ckpt["model_state"])
-        optimizer.load_state_dict(ckpt["optimizer_state"])
+        state = ckpt.get("model_state", ckpt)
+        model.load_state_dict(state)
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
         if ckpt.get("scheduler_state") and scheduler:
             scheduler.load_state_dict(ckpt["scheduler_state"])
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         global_step = ckpt.get("step", 0)
         print(f"✔️ Resumed at step {global_step} (best_val_loss={best_val_loss:.4f})")
-        
-     # --- Eval ---
-    if os.path.exists(args.evalPath) and args.evalSubset > 0:
-        print(f"Evaluation mode. Currently evaulating on {args.evalPath} with {args.evalSubset * 100}% of eval set used.")
-        evaluate(model, test_loader, vocab_size, pad_id, device, "Eval", args.evalSubset)
-        sys.exit("Evaulation done")
+
+    # --- Eval-only mode ---
+    if args.evalPath and os.path.exists(args.evalPath) and args.evalSubset > 0:
+        print(
+            f"Evaluation mode. Evaluating {args.evalPath} with "
+            f"{args.evalSubset * 100:.1f}% of eval set."
+        )
+        ckpt = torch.load(args.evalPath, map_location=device)
+        state = ckpt.get("model_state", ckpt)
+        model.load_state_dict(state)
+        model.eval()
+        evaluate(
+            model,
+            test_loader,
+            vocab_size,
+            pad_id,
+            device,
+            "EVAL",
+            max_batches=None,
+            shard_frac=args.evalSubset,
+        )
+        sys.exit("Evaluation done")
 
     # ---- Training loop ----
     noImprovement = 0
     model.train()
-    total_loss, total_tokens = 0.0, 0
+    total_loss_sum, total_tokens = 0.0, 0
 
     while global_step < args.max_steps:
         for x, y in train_loader:
@@ -217,7 +236,8 @@ def main(args):
             logits, _ = model(x)
             criterion = torch.nn.CrossEntropyLoss(
                 ignore_index=pad_id,
-                label_smoothing=0.1,
+                label_smoothing=Config.label_smoothing,
+                reduction="mean",
             )
             loss = criterion(
                 logits.view(-1, vocab_size),
@@ -233,17 +253,31 @@ def main(args):
                 optimizer.zero_grad()
 
             global_step += 1
-            total_loss += loss.item() * x.numel()
-            total_tokens += x.numel()
+            # Logging token-avg loss (accounting for gradAccum scaling)
+            with torch.no_grad():
+                valid = (y != pad_id).sum().item()
+                # loss.item() is mean CE / gradAccumSteps; undo the division:
+                mean_ce = loss.item() * Config.gradAccumSteps
+                total_loss_sum += mean_ce * valid
+                total_tokens += valid
 
             if Config.debug and global_step % Config.debug_every == 0:
-                avg_tok_loss = total_loss / total_tokens
+                avg_tok_loss = total_loss_sum / total_tokens
                 print(f"Step {global_step} - Train tokLoss={avg_tok_loss:.4f}")
-                total_loss, total_tokens = 0.0, 0
+                total_loss_sum, total_tokens = 0.0, 0
 
             # ---- Validation ----
             if global_step % args.eval_every_steps == 0:
-                val_loss = evaluate(model, val_loader, vocab_size, pad_id, device, "VAL", 0.15)
+                val_loss = evaluate(
+                    model,
+                    val_loader,
+                    vocab_size,
+                    pad_id,
+                    device,
+                    "VAL",
+                    max_batches=1000,
+                    shard_frac=0.003,
+                )
                 if val_loss < best_val_loss - Config.improvement_threshold:
                     best_val_loss = val_loss
                     noImprovement = 0
@@ -265,7 +299,9 @@ def main(args):
                 break
 
     # ---- Final test evaluation ----
-    test_loss = evaluate(model, test_loader, vocab_size, pad_id, device, "TEST", 1.0)
+    test_loss = evaluate(
+        model, test_loader, vocab_size, pad_id, device, "TEST", max_batches=None, shard_frac=1.0
+    )
     print(f"✅ Training complete. Final Test Loss={test_loss:.4f}")
 
 
@@ -290,7 +326,7 @@ if __name__ == "__main__":
     
     # Eval only
     parser.add_argument("--evalPath", type=str, default="models/best_model.pt")
-    parser.add_argument("--evalSubset", type=float, default=0.1)
+    parser.add_argument("--evalSubset", type=float, default=-0.1)
     args = parser.parse_args()
 
     main(args)

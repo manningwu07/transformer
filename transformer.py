@@ -16,8 +16,8 @@ class CausalSelfAttention(nn.Module):
         self.resid_drop = nn.Dropout(dropout)
 
         # Register a causal mask (upper triangular)
-        mask = torch.tril(torch.ones(max_len, max_len))
-        self.register_buffer("mask", mask.view(1, 1, max_len, max_len))
+        mask = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool))
+        self.register_buffer("mask", mask.view(1, 1, max_len, max_len), persistent=False)
 
     def forward(self, x, past_kv=None):
         # x: (B, T, d_model)
@@ -41,10 +41,12 @@ class CausalSelfAttention(nn.Module):
 
         # attention scores
         att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B,h,T,T_total)
-        # apply causal mask (to the whole length)
-        T_total = k.size(2)
-        mask = self.mask[:, :, T_total - T : T_total, :T_total]  # only need relevant slice
-        att = att.masked_fill(mask[:, :, :T, :T_total] == 0, float("-inf"))
+        # apply causal mask
+        T_q = q.size(2)
+        T_k = k.size(2)
+        mask = self.mask[:, :, :T_q, :T_k]  # (1,1,T_q,T_k)
+        # use a large negative for numerical stability on MPS
+        att = att.masked_fill(~mask, -1e9)
 
         att = F.softmax(att, dim=-1)
         att = self.attn_drop(att)
@@ -111,7 +113,11 @@ class GPT2LikeLM(nn.Module):
 
     def forward(self, idx, past_kvs=None):
         B, T = idx.size()
-        pos = torch.arange(0, T, device=idx.device).unsqueeze(0)
+        past_len = 0
+        if past_kvs is not None and len(past_kvs) > 0 and past_kvs[0] is not None:
+            # past_kvs[0][0] is k: (B,h,T_past,d)
+            past_len = past_kvs[0][0].size(2)
+        pos = torch.arange(past_len, past_len + T, device=idx.device).unsqueeze(0)
         x = self.tok_emb(idx) + self.pos_emb(pos)
 
         new_kvs = []
@@ -133,12 +139,12 @@ class GPT2LikeLM(nn.Module):
 
             # Mask unwanted tokens
             for tok in [self.pad_id, self.unk_id, self.bos_id]:
-                logits[:, tok] = -float("inf")
+                logits[:, tok] = -1e9
 
             # Apply top-k
             if top_k is not None:
                 v, _ = torch.topk(logits, top_k)
-                logits[logits < v[:, [-1]]] = -float("inf")
+                logits[logits < v[:, [-1]]] = -1e9
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)

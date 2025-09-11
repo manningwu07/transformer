@@ -3,7 +3,7 @@ go run . --export
 To get vocab
 
 Next, train on python
-python3 train.py --train data/test/wiki_train_ids --eval data/test/wiki_eval_ids --vocab data/test/vocab.json (--epochs _ for testing)
+python3 train.py --train data/test/wiki_train_ids --test data/test/wiki_eval_ids --val data/test/wiki_val_ids --vocab data/test/vocab.json
 
 
 Open up connection between the 2:
