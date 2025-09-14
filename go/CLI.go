@@ -27,7 +27,6 @@ func ChatCLI() {
 
 		// Tokenize user input
 		toks := IO.TokenizeENPieces(input)
-		ids := make([]int, 0, len(toks)+2)
 		// Pull TokenToID and IDToToken from vocab.json
 
 		if params.Vocab.TokenToID == nil || len(params.Vocab.IDToToken) == 0 || forceFlag {
@@ -37,17 +36,18 @@ func ChatCLI() {
 			}
 		}
 
-		ids = append(ids, params.Vocab.TokenToID["<bos>"])
+		ids := []int{params.Vocab.TokenToID["<bos>"]}
 		for _, t := range toks {
 			ids = append(ids, IO.VocabLookup(params.Vocab, t))
 		}
 
-		// Create request body
 		req := map[string]any{
-			"ids":         ids,
-			"max_tokens":  30, // adjust as you want
-			"top_k":       5,
-			"temperature": 0.95,
+			"ids":                ids,
+			"max_tokens":         40,
+			"top_k":              15,
+			"top_p":              0.9,
+			"temperature":        0.7,
+			"repetition_penalty": 1.3,
 		}
 		body, _ := json.Marshal(req)
 
@@ -61,6 +61,7 @@ func ChatCLI() {
 
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		fmt.Println("Raw response:", string(bodyBytes))
+		fmt.Println("Num of tokens:", len(string(bodyBytes)))
 
 		var result map[string]any
 		if err := json.Unmarshal(bodyBytes, &result); err != nil {

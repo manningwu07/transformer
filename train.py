@@ -167,6 +167,7 @@ def main(args):
         n_heads=Config.num_heads,
         n_layers=Config.n_layers,
         d_ff=Config.hidden_size,
+        dropout=Config.dropout,
         max_len=Config.seq_len,
         pad_id=pad_id,
         bos_id=tok2id["<bos>"],
@@ -195,10 +196,27 @@ def main(args):
         ckpt = torch.load(args.resumePath, map_location=device)
         state = ckpt.get("model_state", ckpt)
         model.load_state_dict(state)
-        if "optimizer_state" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer_state"])
-        if ckpt.get("scheduler_state") and scheduler:
-            scheduler.load_state_dict(ckpt["scheduler_state"])
+        if not args.override_hparams:
+            if "optimizer_state" in ckpt:
+                optimizer.load_state_dict(ckpt["optimizer_state"])
+            if ckpt.get("scheduler_state") and scheduler:
+                scheduler.load_state_dict(ckpt["scheduler_state"])
+        else:
+            print("⚡ Overriding hyperparameters: using new optimizer/scheduler")
+            # re-init optimizer, scheduler with current Config
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=args.lr,
+                betas=(Config.adam_beta1, Config.adam_beta2),
+                eps=Config.adam_eps,
+                weight_decay=Config.weight_decay,
+            )
+            scheduler = get_lr_scheduler(
+                optimizer,
+                Config.warmup_steps,
+                args.max_steps,
+                min_lr=Config.epsilon,
+            )
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         global_step = ckpt.get("step", 0)
         print(f"✔️ Resumed at step {global_step} (best_val_loss={best_val_loss:.4f})")
@@ -275,7 +293,7 @@ def main(args):
                     pad_id,
                     device,
                     "VAL",
-                    max_batches=1000,
+                    max_batches=Config.max_batches,
                     shard_frac=0.003,
                 )
                 if val_loss < best_val_loss - Config.improvement_threshold:
@@ -323,10 +341,13 @@ if __name__ == "__main__":
 
     # Resume
     parser.add_argument("--resumePath", type=str, default="models/last_save_state.pt")
+    parser.add_argument("--override_hparams", action="store_true",
+        help="Ignore optimizer/scheduler state from checkpoint, use new Config hyperparams")
     
     # Eval only
     parser.add_argument("--evalPath", type=str, default="models/best_model.pt")
     parser.add_argument("--evalSubset", type=float, default=-0.1)
+    
     args = parser.parse_args()
 
     main(args)

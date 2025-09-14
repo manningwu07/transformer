@@ -130,26 +130,73 @@ class GPT2LikeLM(nn.Module):
         return logits, new_kvs
 
     @torch.no_grad()
-    def generate(self, idx, max_tokens=50, top_k=None, temperature=1.0):
+    def generate(
+        self,
+        idx,
+        max_tokens=20,
+        top_k=15,
+        top_p=0.9,
+        temperature=0.7,
+        repetition_penalty=1.3,
+    ):
+        """
+        Incremental decoding with KV cache.
+        - First step uses the full prompt to build cache.
+        - Subsequent steps feed only the last token.
+        - Supports top-k, top-p, repetition penalty, temperature.
+        """
         self.eval()
+        device = next(self.parameters()).device
+        generated = idx.to(device)
         past_kvs = None
-        for _ in range(max_tokens):
-            logits, past_kvs = self(idx[:, -1:], past_kvs)
-            logits = logits[:, -1, :] / temperature
 
-            # Mask unwanted tokens
-            for tok in [self.pad_id, self.unk_id, self.bos_id]:
-                logits[:, tok] = -1e9
-
-            # Apply top-k
-            if top_k is not None:
+        def filter_top_k_p(logits, top_k, top_p):
+            if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, top_k)
-                logits[logits < v[:, [-1]]] = -1e9
+                logits = torch.where(
+                    logits < v[:, [-1]], torch.full_like(logits, -float("inf")), logits
+                )
+            if top_p is not None and 0.0 < top_p < 1.0:
+                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+                probs = F.softmax(sorted_logits, dim=-1)
+                cum = torch.cumsum(probs, dim=-1)
+                to_remove = cum > top_p
+                to_remove[:, 1:] = to_remove[:, :-1].clone()
+                to_remove[:, 0] = 0
+                mask = torch.zeros_like(logits, dtype=torch.bool)
+                mask.scatter_(1, sorted_idx, to_remove)
+                logits = logits.masked_fill(mask, -float("inf"))
+            return logits
+
+        for _ in range(max_tokens):
+            # Build cache with full prompt once; then incremental
+            if past_kvs is None:
+                logits, past_kvs = self(generated)
+            else:
+                logits, past_kvs = self(generated[:, -1:], past_kvs)
+
+            logits = logits[:, -1, :] / max(1e-5, float(temperature))
+
+            # Never sample special BOS/UNK/PAD
+            bad = [self.pad_id, self.unk_id, self.bos_id]
+            logits[:, bad] = -float("inf")
+
+            # Repetition penalty (vectorized on unique tokens)
+            if repetition_penalty is not None and repetition_penalty > 1.0:
+                uniq = torch.unique(generated[0])
+                logits[:, uniq] /= repetition_penalty
+
+            # Top-k / top-p
+            logits = filter_top_k_p(logits, top_k, top_p)
 
             probs = F.softmax(logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat([idx, next_token], dim=1)
+            generated = torch.cat([generated, next_token], dim=1)
 
+            # Stop if EOS or would overflow max_len
             if next_token.item() == self.eos_id:
                 break
-        return idx
+            if generated.size(1) >= self.max_len:
+                break
+
+        return generated

@@ -4,14 +4,15 @@ from typing import Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
 import torch
-from transformer import GPT2LikeLM 
+import torch.nn.functional as F
+from transformer import GPT2LikeLM
 from params import Config
 import json
 
 # ---------- Config ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VOCAB_PATH = os.path.join(BASE_DIR, "data/test/vocab.json")
-MODEL_PATH = os.path.join(BASE_DIR, "models", "curr_model.pt") #change this if nessecary
+MODEL_PATH = os.path.join(BASE_DIR, "models", "base_model.pt")  # change if needed
 
 # ---------- Load vocab ----------
 print("CWD:", os.getcwd())
@@ -51,8 +52,33 @@ class InferRequest(BaseModel):
     ids: list[int]
     max_tokens: int = 20
     top_k: Optional[int] = 10
+    top_p: Optional[float] = None
     temperature: float = 1.0
+    repetition_penalty: float = 1.0  # default = no penalty
 
+
+# helper: filtering logits
+def filter_logits(logits, top_k=0, top_p=0.0):
+    """Apply top-k and/or nucleus (top-p) filtering to logits"""
+    if top_k > 0:
+        values, _ = torch.topk(logits, top_k)
+        min_values = values[:, -1].unsqueeze(1)
+        logits = torch.where(logits < min_values, torch.full_like(logits, -float("inf")), logits)
+
+    if top_p > 0.0 and top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+
+        # remove tokens with cumulative prob above top_p
+        sorted_indices_to_remove = cumulative_probs > top_p
+        # shift right to keep first above threshold
+        sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+        sorted_indices_to_remove[:, 0] = 0
+
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits = logits.masked_fill(indices_to_remove, -float("inf"))
+
+    return logits
 
 @app.post("/generate")
 def generate(req: InferRequest):
@@ -60,20 +86,22 @@ def generate(req: InferRequest):
         ids = torch.tensor([req.ids], dtype=torch.long)
         with torch.no_grad():
             out = model.generate(
-                ids,
-                max_tokens=req.max_tokens,
-                top_k=req.top_k,
-                temperature=req.temperature,
-            )
+            ids,
+            max_tokens=req.max_tokens,
+            top_k=req.top_k,
+            top_p=req.top_p,
+            temperature=req.temperature,
+            repetition_penalty=req.repetition_penalty,
+        )
         out_ids = out[0].tolist()
-        
-        tokens = [id2tok[i] for i in out_ids]
 
+        tokens = [id2tok[i] for i in out_ids]
         specials = {"<pad>", "<bos>", "<unk>"}
         decoded = "".join(tok if tok not in specials else "" for tok in tokens)
-        
+
         return {"ids": out_ids, "text": decoded.strip()}
     except Exception as e:
         import traceback
+
         traceback.print_exc()
         return {"error": str(e)}
