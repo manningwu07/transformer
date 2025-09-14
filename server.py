@@ -96,8 +96,11 @@ def generate(req: InferRequest):
         out_ids = out[0].tolist()
 
         tokens = [id2tok[i] for i in out_ids]
-        specials = {"<pad>", "<bos>", "<unk>"}
-        decoded = "".join(tok if tok not in specials else "" for tok in tokens)
+        specials = {"<pad>", "<bos>", "<unk>", "<eos>"}
+        # Basic detok for BPE/SentencePiece-like markers
+        text = "".join(tok for tok in tokens if tok not in specials)
+        text = text.replace("Ġ", " ").replace("▁", " ").replace("Ċ", "\n")
+        decoded = " ".join(text.split())
 
         return {"ids": out_ids, "text": decoded.strip()}
     except Exception as e:
