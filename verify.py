@@ -29,7 +29,7 @@ def verifyModel():
         n_heads=Config.num_heads,
         n_layers=Config.n_layers,
         d_ff=Config.hidden_size,
-        max_len=Config.seq_len,
+        max_len=Config.max_len,
         pad_id=vocab["TokenToID"]["<pad>"],
         bos_id=vocab["TokenToID"]["<bos>"],
         eos_id=vocab["TokenToID"]["<eos>"],

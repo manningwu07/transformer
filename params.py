@@ -9,6 +9,7 @@ class TrainingConfig:
     vocab_size: int = 16_384    # |V| 
     num_heads: int = 12        # attention heads 
     seq_len: int = 512        # context length 
+    max_len: int = 512
     n_layers: int = 8          # number of transformer blocks 
     lr: float = 1e-5 # Was 3e-4 but too slow, so bumping it up to x2 training speed. 
 

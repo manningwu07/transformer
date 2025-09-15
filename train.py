@@ -25,7 +25,7 @@ class IndexedBinaryDataset(torch.utils.data.IterableDataset):
     Each example = (x, y), where x is input seq, y is target seq.
     """
 
-    def __init__(self, prefix, seq_len, repeat=False, shuffle=False):
+    def __init__(self, prefix, seq_len, repeat=False, shuffle=False, pad_id=0):
         self.prefix = prefix
         self.seq_len = seq_len
         self.repeat = repeat
@@ -35,8 +35,8 @@ class IndexedBinaryDataset(torch.utils.data.IterableDataset):
 
     def _iter_shard(self, idx_path):
         bin_path = idx_path.replace(".idx", ".bin")
-        idx_arr = np.fromfile(idx_path, dtype=np.int64).reshape(-1, 2)
-        data = np.memmap(bin_path, dtype=np.int32, mode="r")
+        idx_arr = np.fromfile(idx_path, dtype=np.uint64).reshape(-1, 2)
+        data = np.memmap(bin_path, dtype=np.uint32, mode="r")
 
         order = np.arange(len(idx_arr))
         if self.shuffle:
@@ -152,13 +152,14 @@ def main(args):
     pad_id = tok2id["<pad>"]
 
     # ---- Datasets ----
-    train_ds = IndexedBinaryDataset(args.train, Config.seq_len, shuffle=True, repeat=True)
-    val_ds   = IndexedBinaryDataset(args.val,   Config.seq_len, shuffle=False, repeat=False)
-    test_ds  = IndexedBinaryDataset(args.test,  Config.seq_len, shuffle=False, repeat=False)
+    train_ds = IndexedBinaryDataset(args.train, Config.seq_len, shuffle=True,  repeat=True,  pad_id=pad_id)
+    val_ds   = IndexedBinaryDataset(args.val,   Config.seq_len, shuffle=False, repeat=False, pad_id=pad_id)
+    test_ds  = IndexedBinaryDataset(args.test,  Config.seq_len, shuffle=False, repeat=False, pad_id=pad_id)
 
-    train_loader = DataLoader(train_ds, batch_size=Config.batch_size, num_workers=2)
-    val_loader   = DataLoader(val_ds,   batch_size=Config.batch_size, num_workers=1)
-    test_loader  = DataLoader(test_ds,  batch_size=Config.batch_size, num_workers=1)
+    pin = (device == "cuda")
+    train_loader = DataLoader(train_ds, batch_size=Config.batch_size, num_workers=2, pin_memory=pin, persistent_workers=True)
+    val_loader   = DataLoader(val_ds,   batch_size=Config.batch_size, num_workers=1, pin_memory=pin)
+    test_loader  = DataLoader(test_ds,  batch_size=Config.batch_size, num_workers=1, pin_memory=pin)
 
     # ---- Model ----
     model = GPT2LikeLM(
@@ -168,7 +169,7 @@ def main(args):
         n_layers=Config.n_layers,
         d_ff=Config.hidden_size,
         dropout=Config.dropout,
-        max_len=Config.seq_len,
+        max_len=Config.max_len,
         pad_id=pad_id,
         bos_id=tok2id["<bos>"],
         eos_id=tok2id["<eos>"],

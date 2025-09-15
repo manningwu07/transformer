@@ -8,11 +8,13 @@ import torch.nn.functional as F
 from transformer import GPT2LikeLM
 from params import Config
 import json
+from tokenizers import Tokenizer as HFTokenizer
 
 # ---------- Config ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VOCAB_PATH = os.path.join(BASE_DIR, "data/test/vocab.json")
 MODEL_PATH = os.path.join(BASE_DIR, "models", "base_model.pt")  # change if needed
+TOK_PATH = os.path.join(BASE_DIR, "data/test/tokenizer.json")
 
 # ---------- Load vocab ----------
 print("CWD:", os.getcwd())
@@ -20,9 +22,11 @@ print("Looking for vocab:", os.path.abspath(VOCAB_PATH))
 
 with open(VOCAB_PATH, "r") as f:
     vocab = json.load(f)
+    
 tok2id = vocab["TokenToID"]
 id2tok = vocab["IDToToken"]
 eos_id = tok2id["<eos>"]
+hf_tok = HFTokenizer.from_file(TOK_PATH)
 
 # ---------- Model ----------
 vocab_size = len(id2tok)
@@ -32,7 +36,7 @@ model = GPT2LikeLM(
     n_heads=Config.num_heads,
     n_layers=Config.n_layers,
     d_ff=Config.hidden_size,
-    max_len=Config.seq_len,
+    max_len=Config.max_len,
     pad_id=tok2id["<pad>"],
     bos_id=tok2id["<bos>"],
     eos_id=tok2id["<eos>"],
@@ -95,12 +99,8 @@ def generate(req: InferRequest):
         )
         out_ids = out[0].tolist()
 
-        tokens = [id2tok[i] for i in out_ids]
-        specials = {"<pad>", "<bos>", "<unk>", "<eos>"}
-        # Basic detok for BPE/SentencePiece-like markers
-        text = "".join(tok for tok in tokens if tok not in specials)
-        text = text.replace("Ġ", " ").replace("▁", " ").replace("Ċ", "\n")
-        decoded = " ".join(text.split())
+        # Robust byte-level decoding with the trained tokenizer
+        decoded = hf_tok.decode(out_ids, skip_special_tokens=True)
 
         return {"ids": out_ids, "text": decoded.strip()}
     except Exception as e:

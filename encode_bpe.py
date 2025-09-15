@@ -1,56 +1,71 @@
-#!/usr/bin/env python3
-from tokenizers import Tokenizer
-import struct
 import os
+import struct
+import numpy as np
+from tokenizers import Tokenizer
 
 tok_json = "data/test/tokenizer.json"
 tokenizer = Tokenizer.from_file(tok_json)
 
-def encode_file(in_path, prefix, max_shard_bytes=2*1024*1024*1024):
+def encode_file(
+    in_path,
+    prefix,
+    max_shard_bytes=2 * 1024 * 1024 * 1024,
+    batch_size=8192,
+):
     """
     Write .bin + .idx shards given an input .txt file.
     Same binary format as Go ExportTokenIDsBinary.
     """
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
     os.makedirs(os.path.dirname(prefix), exist_ok=True)
 
     shard_id = 0
     cur_bytes = 0
-    data_bin = open(f"{prefix}-{shard_id:03d}.bin", "wb")
-    data_idx = open(f"{prefix}-{shard_id:03d}.idx", "wb")
+    data_bin = open(f"{prefix}-{shard_id:03d}.bin", "wb", buffering=1024 * 1024)
+    data_idx = open(f"{prefix}-{shard_id:03d}.idx", "wb", buffering=1024 * 1024)
 
+    bos_id = tokenizer.token_to_id("<bos>")
+    eos_id = tokenizer.token_to_id("<eos>")
+    assert bos_id is not None and eos_id is not None, "Missing BOS/EOS in tokenizer"
+    
     with open(in_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            # Encode with BPE
-            enc = tokenizer.encode(line)
-            ids = [tokenizer.token_to_id("<bos>")] + enc.ids + [tokenizer.token_to_id("<eos>")]
+        buffer = []
+        for raw in f:
+            # Preserve leading/trailing spaces inside the line; drop only newline
+            line = raw.rstrip("\n")
+            if line == "":
+                continue  # skip empty examples to avoid degenerate sequences
+            buffer.append(line)
+            if len(buffer) >= batch_size:
+                cur_bytes = _flush_batch(buffer, tokenizer, data_bin, data_idx, cur_bytes, bos_id, eos_id)
+                buffer.clear()
+                if cur_bytes >= max_shard_bytes:
+                    data_bin.close(); data_idx.close()
+                    shard_id += 1; cur_bytes = 0
+                    data_bin = open(f"{prefix}-{shard_id:03d}.bin", "wb", buffering=1024*1024)
+                    data_idx = open(f"{prefix}-{shard_id:03d}.idx", "wb", buffering=1024*1024)
 
-            # compute start offset
-            start = cur_bytes
-            length = len(ids)
-
-            # write idx: (start, length) as uint64
-            data_idx.write(struct.pack("<Q", start))
-            data_idx.write(struct.pack("<Q", length))
-
-            # write bin: token IDs as uint32
-            for i in ids:
-                data_bin.write(struct.pack("<I", i))
-            cur_bytes += 4 * length
-
-            # rollover if shard is too big
-            if cur_bytes >= max_shard_bytes:
-                data_bin.close()
-                data_idx.close()
-                shard_id += 1
-                data_bin = open(f"{prefix}-{shard_id:03d}.bin", "wb")
-                data_idx = open(f"{prefix}-{shard_id:03d}.idx", "wb")
-                cur_bytes = 0
+        if buffer:
+            cur_bytes = _flush_batch(buffer, tokenizer, data_bin, data_idx, cur_bytes, bos_id, eos_id)
+            buffer.clear()
 
     data_bin.close()
     data_idx.close()
+
+def _flush_batch(lines, tok, data_bin, data_idx, cur_bytes, bos_id, eos_id):
+    # Batch encode with internal parallelism (rust rayon)
+    encs = tok.encode_batch(lines)
+    for enc in encs:
+        ids = [bos_id] + enc.ids + [eos_id]
+        start = cur_bytes
+        length = len(ids)
+        # idx: two uint64 values
+        data_idx.write(struct.pack("<QQ>", start, length))
+        # bin: contiguous uint32 array
+        arr = np.asarray(ids, dtype=np.uint32)
+        data_bin.write(arr.tobytes())
+        cur_bytes += 4 * length
+    return cur_bytes
 
 if __name__ == "__main__":
     # example usage

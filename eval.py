@@ -36,7 +36,11 @@ def evaluate(
             selected = random.sample(all_shards, n_selected)
 
         sub_ds = loader.dataset.__class__(
-            loader.dataset.prefix, loader.dataset.seq_len, repeat=False, shuffle=False
+            loader.dataset.prefix,
+            loader.dataset.seq_len,
+            repeat=False,
+            shuffle=False,
+            pad_id=getattr(loader.dataset, "pad_id", pad_id),
         )
         sub_ds.shards = selected
         num_workers = getattr(loader, "num_workers", 0) or 0
