@@ -60,7 +60,7 @@ def _flush_batch(lines, tok, data_bin, data_idx, cur_bytes, bos_id, eos_id):
         start = cur_bytes
         length = len(ids)
         # idx: two uint64 values
-        data_idx.write(struct.pack("<QQ>", start, length))
+        data_idx.write(struct.pack("<QQ", start, length))
         # bin: contiguous uint32 array
         arr = np.asarray(ids, dtype=np.uint32)
         data_bin.write(arr.tobytes())
@@ -69,7 +69,10 @@ def _flush_batch(lines, tok, data_bin, data_idx, cur_bytes, bos_id, eos_id):
 
 if __name__ == "__main__":
     # example usage
-    encode_file("data/test/wiki_train.txt", "data/test/wiki_train_ids")
-    encode_file("data/test/wiki_val.txt", "data/test/wiki_val_ids")
-    encode_file("data/test/wiki_eval.txt", "data/test/wiki_eval_ids")
+    encode_file("data/raw/wiki_train.txt", "data/test/wiki_train_ids")
+    print("Done with wiki train")
+    encode_file("data/raw/wiki_val.txt", "data/test/wiki_val_ids")
+    print("Done with wiki val")
+    encode_file("data/raw/wiki_eval.txt", "data/test/wiki_eval_ids")
+    print("Done with wiki eval")
     print("✅ All text files encoded into .bin/.idx shards")

@@ -1,7 +1,7 @@
 import math
 import random
 import torch
-
+from params import Config
 
 def evaluate(
     model,
@@ -12,6 +12,8 @@ def evaluate(
     split="VAL",
     max_batches=None,
     shard_frac=1.0,
+    log_random_sample = Config.log_random_sample,
+    random_batches = Config.random_samples
 ):
     """
     Evaluate model on a subset of shards.
@@ -29,6 +31,7 @@ def evaluate(
     if use_subset:
         all_shards = list(loader.dataset.shards)
         n_total = len(all_shards)
+        selected = all_shards
         n_selected = max(1, int(round(n_total * float(shard_frac))))
         if n_selected >= n_total:
             selected = all_shards
@@ -79,4 +82,39 @@ def evaluate(
     avg_loss = total_loss_sum / max(1, total_tokens)
     ppl = math.exp(avg_loss) if total_tokens > 0 else float("inf")
     print(f"\n[{split}] tokLoss={avg_loss:.4f}, PPL={ppl:.2f}")
+    
+    if log_random_sample:
+        # Build a fresh dataset with shuffle=True just for random sample
+        rand_ds = loader.dataset.__class__(
+            loader.dataset.prefix,
+            loader.dataset.seq_len,
+            pad_id=getattr(loader.dataset, "pad_id", pad_id),
+            repeat=False,
+            shuffle=True,
+        )
+
+        rand_loader = torch.utils.data.DataLoader(
+            rand_ds,
+            batch_size=loader.batch_size,
+            num_workers=getattr(loader, "num_workers", 0) or 0,
+        )
+
+        rs_loss_sum, rs_total_tokens = 0.0, 0
+        with torch.no_grad():
+            for i, (x, y) in enumerate(rand_loader):
+                x, y = x.to(device), y.to(device)
+                logits, _ = model(x)
+                
+                loss_sum = criterion(logits.view(-1, vocab_size), y.view(-1)).item()
+                tokens = (y != pad_id).sum().item()
+                rs_loss_sum += loss_sum
+                rs_total_tokens += tokens
+
+                if i + 1 >= random_batches:
+                    break
+
+        rs_avg = rs_loss_sum / max(1, rs_total_tokens)
+        rs_ppl = math.exp(rs_avg) if rs_total_tokens > 0 else float("inf")
+        print(f"[{split}-RANDOM] {random_batches} batches → tokLoss={rs_avg:.4f}, PPL={rs_ppl:.2f}")
+        
     return avg_loss

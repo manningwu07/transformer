@@ -8,7 +8,7 @@ from tokenizers import (
     decoders,
 )
 
-train_file = "data/raw/wiki_train.txt"   # your large corpus
+train_file = "data/raw/wiki_train.txt"
 tok_json = "data/test/tokenizer.json"
 vocab_json = "data/test/vocab.json"
 

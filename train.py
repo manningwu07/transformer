@@ -30,6 +30,7 @@ class IndexedBinaryDataset(torch.utils.data.IterableDataset):
         self.seq_len = seq_len
         self.repeat = repeat
         self.shuffle = shuffle
+        self.pad_id = pad_id
         self.shards = sorted(glob.glob(prefix + "-*.idx"))
         assert self.shards, f"No shards found for prefix {prefix}"
 
