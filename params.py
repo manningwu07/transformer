@@ -11,33 +11,30 @@ class TrainingConfig:
     seq_len: int = 512        # context length 
     max_len: int = 512
     n_layers: int = 8          # number of transformer blocks 
-    lr: float = 5e-5 # Was 3e-4 but too slow, so bumping it up to x2 training speed. 
+    lr: float = 8e-4 # 3e-3 for finetuning (LoRA)
 
     # Optimization
     max_epochs: int = 5 # number of passes through the dataset
-    patience: int = 16
+    patience: int = 10
     improvement_threshold: float = 0.01
-    batch_size: int = 8
-    epsilon: int = 1e-5
-    gradAccumSteps: int = 16 # batchsize * gradAccumSteps = effective batchsize
-    eval_every_steps = 500
-    save_every_steps = 2000
+    batch_size: int = 256
+    epsilon: int = 1e-4
+    gradAccumSteps: int = 2 # batchsize * gradAccumSteps = effective batchsize
+    eval_every_steps = 2_000
+    max_batches: int = 500
+    save_every_steps = 10_000
+    label_smoothing: float = 0.0
+    dropout: float = 0.05
 
-    # Adam/Optimizer
+    # AdaFactor
     warmup_steps: int = 100
     decay_steps: int = 10_000
-    adam_beta1: float = 0.90
-    adam_beta2: float = 0.999
-    adam_eps: float = 1e-8
     grad_clip: float = 1.0
-    weight_decay: float = 0.01
-    label_smoothing: float = 0.0
-    max_batches: int = 250
-    dropout: float = 0.05
+    
 
     # Debug
     debug: bool = True
-    debug_every: int = 200     # print every N steps
+    debug_every: int = 1_000     # print every N steps
     log_random_sample: bool = False
     random_samples: int = 250
 

@@ -55,14 +55,13 @@ def main():
     )
     device="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     model=model.to(device)
-    opt=torch.optim.AdamW(model.parameters(),lr=3e-4)
     crit=torch.nn.CrossEntropyLoss(ignore_index=pad_id)
     
     for step,(x,y) in enumerate(loader):
         x,y=x.to(device),y.to(device)
         logits,_=model(x)
         loss=crit(logits.view(-1,logits.size(-1)),y.view(-1))
-        opt.zero_grad(); loss.backward(); opt.step()
+        loss.backward()
         if step % 50==0: print(f"step {step} loss={loss.item():.4f}")
         if step>500: break   # quick overfit
         

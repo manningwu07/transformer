@@ -177,12 +177,12 @@ def main(args):
         unk_id=tok2id["<unk>"],
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
+    optimizer = torch.optim.Adafactor(
         model.parameters(),
-        lr=args.lr,
-        betas=(Config.adam_beta1, Config.adam_beta2),
-        eps=Config.adam_eps,
-        weight_decay=Config.weight_decay,
+        relative_step=False,
+        scale_parameter=False,
+        warmup_init=False,
+        lr=Config.lr
     )
 
     scheduler = get_lr_scheduler(
@@ -206,12 +206,12 @@ def main(args):
         else:
             print("⚡ Overriding hyperparameters: using new optimizer/scheduler")
             # re-init optimizer, scheduler with current Config
-            optimizer = torch.optim.AdamW(
+            optimizer = torch.optim.Adafactor(
                 model.parameters(),
-                lr=args.lr,
-                betas=(Config.adam_beta1, Config.adam_beta2),
-                eps=Config.adam_eps,
-                weight_decay=Config.weight_decay,
+                relative_step=False,
+                scale_parameter=False,
+                warmup_init=False,
+                lr=Config.lr
             )
             scheduler = get_lr_scheduler(
                 optimizer,
