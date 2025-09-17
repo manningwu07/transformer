@@ -18,13 +18,9 @@ def ensure_punkt():
         nltk.download("punkt")
 
 
-def ascii_clean(text: str) -> str:
-    # Lowercase, keep ASCII (replace non-ASCII with space), collapse whitespace.
-    text = text.lower()
-    text = "".join(ch if ord(ch) < 128 else " " for ch in text)
-    # normalize whitespace and strip
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+def clean_spaces(text: str) -> str:
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
 def sent_ok(s: str, min_chars: int = 20, min_alpha_ratio: float = 0.6) -> bool:
@@ -38,26 +34,24 @@ def sent_ok(s: str, min_chars: int = 20, min_alpha_ratio: float = 0.6) -> bool:
     return True
 
 
-def chunk_sentences(
-    sentences: List[str], max_chars: int
-) -> Iterable[str]:
-    """Yield chunks up to max_chars without breaking sentence order."""
-    buf: List[str] = []
-    cur = 0
-    for s in sentences:
-        if not s:
-            continue
-        # +1 for space when joining
-        add = len(s) + (1 if buf else 0)
-        if buf and cur + add > max_chars:
-            yield " ".join(buf)
-            buf = [s]
-            cur = len(s)
-        else:
-            buf.append(s)
-            cur += add
-    if buf:
-        yield " ".join(buf)
+def chunk_by_chars(text: str, max_chars: int = 3000) -> list[str]:
+    """
+    Greedy split of article text into ~max_chars chars per chunk.
+    Preserves sequence continuity but ensures chunks are close
+    to 1024 tokens when passed through BPE.
+    """
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_chars, len(text))
+        if end < len(text):
+            # try to cut at last space before end
+            space = text.rfind(" ", start, end)
+            if space != -1 and space > start + max_chars // 2:
+                end = space
+        chunks.append(text[start:end].strip())
+        start = end
+    return [c for c in chunks if c]
 
 
 def split_bucket(title: str, eval_frac: float, seed: int) -> str:
@@ -78,7 +72,7 @@ def process_article(
     raw_sents = nltk.sent_tokenize(text)
     cleaned = []
     for s in raw_sents:
-        s = ascii_clean(s)
+        s = clean_spaces(s)
         if not s:
             continue
         if drop_short_sent and not sent_ok(
@@ -88,8 +82,8 @@ def process_article(
         cleaned.append(s)
     if not cleaned:
         return []
-    # Chunk in sentence order
-    return list(chunk_sentences(cleaned, max_chars=max_chars))
+    article_text = " ".join(cleaned)
+    return chunk_by_chars(article_text, max_chars=max_chars)
 
 
 def write_docs(out_path: str, docs: Iterable[str]):

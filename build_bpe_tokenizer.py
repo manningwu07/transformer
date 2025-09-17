@@ -23,7 +23,7 @@ def main():
     trainer = trainers.BpeTrainer(
         vocab_size=16384,
         min_frequency=2,
-        special_tokens=["<pad>", "<bos>", "<eos>", "<unk>"],
+        special_tokens=["<pad>", "<bos>", "<eos>", "<unk>", "<doc>"],
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
 

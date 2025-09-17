@@ -6,73 +6,69 @@ from tokenizers import Tokenizer
 tok_json = "data/test/tokenizer.json"
 tokenizer = Tokenizer.from_file(tok_json)
 
-def encode_file(
+def encode_file_gptstyle(
     in_path,
     prefix,
+    seq_len=512,
     max_shard_bytes=2 * 1024 * 1024 * 1024,
-    batch_size=8192,
 ):
     """
-    Write .bin + .idx shards given an input .txt file.
-    Same binary format as Go ExportTokenIDsBinary.
+    GPT-style dataset creation:
+    - Concatenate all text lines with <doc>/<eos> markers
+    - Tokenize once
+    - Slice into exact fixed-length (seq_len) blocks
+    - Write into .bin/.idx shards (like Megatron, GPT-2)
     """
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
     os.makedirs(os.path.dirname(prefix), exist_ok=True)
 
-    shard_id = 0
-    cur_bytes = 0
-    data_bin = open(f"{prefix}-{shard_id:03d}.bin", "wb", buffering=1024 * 1024)
-    data_idx = open(f"{prefix}-{shard_id:03d}.idx", "wb", buffering=1024 * 1024)
-
     bos_id = tokenizer.token_to_id("<bos>")
     eos_id = tokenizer.token_to_id("<eos>")
-    assert bos_id is not None and eos_id is not None, "Missing BOS/EOS in tokenizer"
-    
-    with open(in_path, "r", encoding="utf-8") as f:
-        buffer = []
-        for raw in f:
-            # Preserve leading/trailing spaces inside the line; drop only newline
-            line = raw.rstrip("\n")
-            if line == "":
-                continue  # skip empty examples to avoid degenerate sequences
-            buffer.append(line)
-            if len(buffer) >= batch_size:
-                cur_bytes = _flush_batch(buffer, tokenizer, data_bin, data_idx, cur_bytes, bos_id, eos_id)
-                buffer.clear()
-                if cur_bytes >= max_shard_bytes:
-                    data_bin.close(); data_idx.close()
-                    shard_id += 1; cur_bytes = 0
-                    data_bin = open(f"{prefix}-{shard_id:03d}.bin", "wb", buffering=1024*1024)
-                    data_idx = open(f"{prefix}-{shard_id:03d}.idx", "wb", buffering=1024*1024)
+    doc_id = tokenizer.token_to_id("<doc>") if tokenizer.token_to_id("<doc>") is not None else eos_id
+    assert bos_id is not None and eos_id is not None
 
-        if buffer:
-            cur_bytes = _flush_batch(buffer, tokenizer, data_bin, data_idx, cur_bytes, bos_id, eos_id)
-            buffer.clear()
+    # Collect text corpus into one long string
+    texts = []
+    with open(in_path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            # prepend <doc> per line/article (since build_wiki already chunks per article)
+            texts.append("<doc> " + line)
+
+    full_text = "\n".join(texts)
+    enc = tokenizer.encode(full_text)
+    ids = [bos_id] + enc.ids + [eos_id]
+
+    # Now slice into fixed seq_len blocks
+    shard_id = 0
+    cur_bytes = 0
+    data_bin = open(f"{prefix}-{shard_id:03d}.bin", "wb", buffering=1024*1024)
+    data_idx = open(f"{prefix}-{shard_id:03d}.idx", "wb", buffering=1024*1024)
+
+    for i in range(0, len(ids) - seq_len, seq_len):
+        window = ids[i:i+seq_len]
+        start = cur_bytes
+        length = len(window)
+        data_idx.write(struct.pack("<QQ", start, length))
+        arr = np.asarray(window, dtype=np.uint32)
+        data_bin.write(arr.tobytes())
+        cur_bytes += 4 * length
+        if cur_bytes >= max_shard_bytes:
+            data_bin.close(); data_idx.close()
+            shard_id += 1; cur_bytes = 0
+            data_bin = open(f"{prefix}-{shard_id:03d}.bin", "wb", buffering=1024*1024)
+            data_idx = open(f"{prefix}-{shard_id:03d}.idx", "wb", buffering=1024*1024)
 
     data_bin.close()
     data_idx.close()
 
-def _flush_batch(lines, tok, data_bin, data_idx, cur_bytes, bos_id, eos_id):
-    # Batch encode with internal parallelism (rust rayon)
-    encs = tok.encode_batch(lines)
-    for enc in encs:
-        ids = [bos_id] + enc.ids + [eos_id]
-        start = cur_bytes
-        length = len(ids)
-        # idx: two uint64 values
-        data_idx.write(struct.pack("<QQ", start, length))
-        # bin: contiguous uint32 array
-        arr = np.asarray(ids, dtype=np.uint32)
-        data_bin.write(arr.tobytes())
-        cur_bytes += 4 * length
-    return cur_bytes
 
 if __name__ == "__main__":
-    # example usage
-    encode_file("data/raw/wiki_train.txt", "data/test/wiki_train_ids")
-    print("Done with wiki train")
-    encode_file("data/raw/wiki_val.txt", "data/test/wiki_val_ids")
-    print("Done with wiki val")
-    encode_file("data/raw/wiki_eval.txt", "data/test/wiki_eval_ids")
-    print("Done with wiki eval")
-    print("✅ All text files encoded into .bin/.idx shards")
+    encode_file_gptstyle("data/test/wiki_train.txt", "data/test/wiki_train_ids", seq_len=512)
+    print("Done with wiki train (gpt-style)")
+    encode_file_gptstyle("data/test/wiki_val.txt", "data/test/wiki_val_ids", seq_len=512)
+    print("Done with wiki val (gpt-style)")
+    encode_file_gptstyle("data/test/wiki_eval.txt", "data/test/wiki_eval_ids", seq_len=512)
+    print("Done with wiki eval (gpt-style)")
