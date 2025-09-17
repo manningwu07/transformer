@@ -13,7 +13,7 @@ from tokenizers import Tokenizer as HFTokenizer
 # ---------- Config ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VOCAB_PATH = os.path.join(BASE_DIR, "data/test/vocab.json")
-MODEL_PATH = os.path.join(BASE_DIR, "models", "curr_model.pt")  # change if needed
+MODEL_PATH = os.path.join(BASE_DIR, "models", "best_model.pt")  # change if needed
 TOK_PATH = os.path.join(BASE_DIR, "data/test/tokenizer.json")
 
 # ---------- Load vocab ----------

@@ -2,7 +2,6 @@
 # build_wiki_corpus.py
 import argparse
 import hashlib
-import io
 import os
 import re
 from typing import Iterable, List
@@ -14,6 +13,7 @@ import nltk
 def ensure_punkt():
     try:
         nltk.data.find("tokenizers/punkt")
+        nltk.data.find("tokenizers/punkt_tab")
     except LookupError:
         nltk.download("punkt")
 
@@ -36,22 +36,22 @@ def sent_ok(s: str, min_chars: int = 20, min_alpha_ratio: float = 0.6) -> bool:
 
 def chunk_by_chars(text: str, max_chars: int = 3000) -> list[str]:
     """
-    Greedy split of article text into ~max_chars chars per chunk.
-    Preserves sequence continuity but ensures chunks are close
-    to 1024 tokens when passed through BPE.
+    Greedy split of article into ~max_chars chunks.
+    Always respects max_chars upper bound.
     """
     chunks = []
     start = 0
     while start < len(text):
         end = min(start + max_chars, len(text))
         if end < len(text):
-            # try to cut at last space before end
             space = text.rfind(" ", start, end)
-            if space != -1 and space > start + max_chars // 2:
-                end = space
-        chunks.append(text[start:end].strip())
+            if space != -1 and space > start:
+                end = space   # prefer to cut at last space
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
         start = end
-    return [c for c in chunks if c]
+    return chunks
 
 
 def split_bucket(title: str, eval_frac: float, seed: int) -> str:
@@ -110,14 +110,14 @@ def main():
         "--eval-out", default="data/test/wiki_eval.txt", help="Eval output path"
     )
     parser.add_argument(
-        "--eval-frac", type=float, default=0.01, help="Eval fraction (default 1%)"
+        "--eval-frac", type=float, default=0.02, help="Eval fraction (default 2%)"
     )
     parser.add_argument("--seed", type=int, default=0, help="Split seed")
     parser.add_argument(
         "--max-chars",
         type=int,
-        default=8000,
-        help="Max chars per document line (keeps context; ~few KB)",
+        default=2800,
+        help="Max chars per document line (capped around ~1024 tokens)",
     )
     parser.add_argument(
         "--drop-short-sent",

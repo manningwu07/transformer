@@ -6,7 +6,7 @@ class TrainingConfig:
     # Core transformer parameters (MUST MATCH OR ELSE IT WILL FAIL)
     d_model: int = 768         # model width 
     hidden_size: int = 2048    # MLP hidden dim 
-    vocab_size: int = 16_384    # |V| 
+    vocab_size: int = 32_768   # |V| 
     num_heads: int = 12 # attention heads 
     seq_len: int = 512        # context length 
     max_len: int = 512

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import re
 import struct
 import json
 import numpy as np
@@ -35,8 +36,12 @@ def encode_jsonl(
             obj = json.loads(raw)
             human, bot = obj["human"].strip(), obj["bot"].strip()
             
+            human = re.sub(r"\s+", " ", human)
+            bot   = re.sub(r"\s+", " ", bot)
+            
             # Build a single training string
-            text = f"Human: {human}\nAssistant: {bot}"
+            text = f"<bos>User: {human} <NL> Assistant: {bot}<eos>"
+            text = re.sub(r"\s+", " ", text).strip()
             buffer.append(text)
 
             if len(buffer) >= batch_size:
