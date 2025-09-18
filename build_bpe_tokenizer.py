@@ -9,7 +9,7 @@ from tokenizers import (
 
 from params import Config
 
-tok_train_file = "data/test/wiki_train.txt"
+tok_train_file = "data/raw/wiki_train.txt"
 tok_json = "data/test/tokenizer.json"
 vocab_json = "data/test/vocab.json"
 
