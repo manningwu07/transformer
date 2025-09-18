@@ -8,7 +8,7 @@ class TrainingConfig:
     hidden_size: int = 2048    # MLP hidden dim 
     vocab_size: int = 32_768   # |V| 
     num_heads: int = 12 # attention heads 
-    seq_len: int = 512        # context length 
+    seq_len: int = 128        # context length 
     max_len: int = 512
     n_layers: int = 8          # number of transformer blocks 
     lr: float = 1e-3 # 3e-3 for finetuning (LoRA)
@@ -19,7 +19,7 @@ class TrainingConfig:
     improvement_threshold: float = 0.01
     batch_size: int = 256
     epsilon: int = 1e-4
-    gradAccumSteps: int = 2 # batchsize * gradAccumSteps = effective batchsize
+    gradAccumSteps: int = 4 # batchsize * gradAccumSteps = effective batchsize
     eval_every_steps = 1_000
     max_batches: int = 500
     save_every_steps = 10_000

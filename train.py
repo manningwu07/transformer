@@ -4,6 +4,7 @@ import glob
 import json
 import math
 import os
+import random
 import signal
 import sys
 import numpy as np
@@ -13,7 +14,7 @@ from torch.utils.data import DataLoader
 from eval import evaluate
 from transformer import GPT2LikeLM
 from params import Config
-
+from transformers import Adafactor
 
 # --------------------
 # Dataset utilities
@@ -54,11 +55,38 @@ class IndexedBinaryDataset(torch.utils.data.IterableDataset):
             yield ids[:-1], ids[1:]
 
     def __iter__(self):
-        while True:
-            for shard in self.shards:
-                yield from self._iter_shard(shard)
-            if not self.repeat:
-                break
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
+        # choose 1 shard per epoch (you can rotate if you want)
+        shard = random.choice(self.shards) if self.shuffle else self.shards[0]
+
+        # load shard
+        idx_path = shard
+        bin_path = idx_path.replace(".idx", ".bin")
+        idx_arr = np.fromfile(idx_path, dtype=np.uint64).reshape(-1, 2)
+        data = np.memmap(bin_path, dtype=np.uint32, mode="r")
+
+        # assign each worker a strided slice of the index array
+        total = len(idx_arr)
+        per_worker = total // num_workers
+        start = worker_id * per_worker
+        end = total if worker_id == num_workers - 1 else (worker_id + 1) * per_worker
+        order = np.arange(start, end)
+
+        if self.shuffle:
+            np.random.shuffle(order)
+
+        for j in order:
+            start, length = idx_arr[j]
+            arr = data[start // 4 : start // 4 + length]
+            ids = torch.from_numpy(arr.astype(np.int64))
+            ids = ids[: self.seq_len]
+            if len(ids) < self.seq_len:
+                pad = torch.full((self.seq_len - len(ids),), self.pad_id, dtype=torch.long)
+                ids = torch.cat([ids, pad])
+            yield ids[:-1], ids[1:]
 
 
 # --------------------
@@ -132,6 +160,7 @@ global_step = 0
 
 def main(args):
     global model, optimizer, scheduler, best_val_loss, global_step
+    torch.set_num_threads(os.cpu_count() - 2 if os.cpu_count() > 2 else 0)
 
     # Handle Ctrl-C / SIGTERM
     signal.signal(signal.SIGINT, crash_handler)
@@ -158,9 +187,9 @@ def main(args):
     test_ds  = IndexedBinaryDataset(args.test,  Config.seq_len, shuffle=False, repeat=False, pad_id=pad_id)
 
     pin = (device == "cuda")
-    train_loader = DataLoader(train_ds, batch_size=Config.batch_size, num_workers=2, pin_memory=pin, persistent_workers=True)
-    val_loader   = DataLoader(val_ds,   batch_size=Config.batch_size, num_workers=1, pin_memory=pin)
-    test_loader  = DataLoader(test_ds,  batch_size=Config.batch_size, num_workers=1, pin_memory=pin)
+    train_loader = DataLoader(train_ds, batch_size=Config.batch_size, num_workers=6, pin_memory=pin, persistent_workers=True)
+    val_loader   = DataLoader(val_ds,   batch_size=Config.batch_size, num_workers=3, pin_memory=pin)
+    test_loader  = DataLoader(test_ds,  batch_size=Config.batch_size, num_workers=3, pin_memory=pin)
 
     # ---- Model ----
     model = GPT2LikeLM(
@@ -177,7 +206,7 @@ def main(args):
         unk_id=tok2id["<unk>"],
     ).to(device)
 
-    optimizer = torch.optim.Adafactor(
+    optimizer = Adafactor(
         model.parameters(),
         relative_step=False,
         scale_parameter=False,
@@ -206,7 +235,7 @@ def main(args):
         else:
             print("⚡ Overriding hyperparameters: using new optimizer/scheduler")
             # re-init optimizer, scheduler with current Config
-            optimizer = torch.optim.Adafactor(
+            optimizer = Adafactor(
                 model.parameters(),
                 relative_step=False,
                 scale_parameter=False,
@@ -253,16 +282,17 @@ def main(args):
     while global_step < args.max_steps:
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
-            logits, _ = model(x)
-            criterion = torch.nn.CrossEntropyLoss(
-                ignore_index=pad_id,
-                label_smoothing=Config.label_smoothing,
-                reduction="mean",
-            )
-            loss = criterion(
-                logits.view(-1, vocab_size),
-                y.view(-1),
-            ) / Config.gradAccumSteps
+            with torch.autocast(device_type=device, dtype=torch.bfloat16): # Change to float32 when finetuning + close to end of training
+                logits, _ = model(x)
+                criterion = torch.nn.CrossEntropyLoss(
+                    ignore_index=pad_id,
+                    label_smoothing=Config.label_smoothing,
+                    reduction="mean",
+                )
+                loss = criterion(
+                    logits.view(-1, vocab_size),
+                    y.view(-1),
+                ) / Config.gradAccumSteps
             
             loss.backward()
 
