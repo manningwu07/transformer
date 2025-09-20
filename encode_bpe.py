@@ -2,6 +2,8 @@ import struct
 import numpy as np
 from tokenizers import Tokenizer
 
+from params import Config
+
 tok_json = "data/test/tokenizer.json"
 tokenizer = Tokenizer.from_file(tok_json)
 
@@ -67,9 +69,9 @@ def _flush(lines, tok, data_bin, data_idx, seq_len, cur_bytes, bos_id, eos_id):
     return cur_bytes
 
 if __name__ == "__main__":
-    encode_file_gptstyle("data/raw/wiki_train.txt", "data/test/wiki_train_ids", seq_len=512)
-    print("Done with wiki train (gpt-style)")
-    encode_file_gptstyle("data/raw/wiki_val.txt", "data/test/wiki_val_ids", seq_len=512)
+    encode_file_gptstyle("data/raw/wiki_val_2400.txt", "data/test/wiki_val_ids", seq_len=Config.max_len)
     print("Done with wiki val (gpt-style)")
-    encode_file_gptstyle("data/raw/wiki_eval.txt", "data/test/wiki_eval_ids", seq_len=512)
+    encode_file_gptstyle("data/raw/wiki_eval_2400.txt", "data/test/wiki_eval_ids", seq_len=Config.max_len)
     print("Done with wiki eval (gpt-style)")
+    encode_file_gptstyle("data/raw/wiki_train_2400.txt", "data/test/wiki_train_ids", seq_len=Config.max_len)
+    print("Done with wiki train (gpt-style)")

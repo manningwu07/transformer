@@ -187,9 +187,9 @@ def main(args):
     test_ds  = IndexedBinaryDataset(args.test,  Config.seq_len, shuffle=False, repeat=False, pad_id=pad_id)
 
     pin = (device == "cuda")
-    train_loader = DataLoader(train_ds, batch_size=Config.batch_size, num_workers=6, pin_memory=pin, persistent_workers=True)
-    val_loader   = DataLoader(val_ds,   batch_size=Config.batch_size, num_workers=3, pin_memory=pin)
-    test_loader  = DataLoader(test_ds,  batch_size=Config.batch_size, num_workers=3, pin_memory=pin)
+    train_loader = DataLoader(train_ds, batch_size=Config.batch_size, num_workers=2, pin_memory=pin, persistent_workers=True)
+    val_loader   = DataLoader(val_ds,   batch_size=Config.batch_size, num_workers=1, pin_memory=pin)
+    test_loader  = DataLoader(test_ds,  batch_size=Config.batch_size, num_workers=1, pin_memory=pin)
 
     # ---- Model ----
     model = GPT2LikeLM(

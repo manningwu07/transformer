@@ -46,7 +46,7 @@ def evaluate(
             pad_id=getattr(loader.dataset, "pad_id", pad_id),
         )
         sub_ds.shards = selected
-        num_workers = getattr(loader, "num_workers", 0) or 0
+        num_workers = getattr(loader, "num_workers", 2) or 0
         sub_loader = torch.utils.data.DataLoader(
             sub_ds, batch_size=loader.batch_size, num_workers=num_workers
         )
@@ -73,7 +73,7 @@ def evaluate(
             batches_run += 1
             if max_batches is not None and batches_run >= int(max_batches):
                 break
-            if i % 100 == 0:
+            if i % 50 == 0:
                 print(
                     f"[{split}] {batches_run} batches, {total_tokens} non-pad tokens",
                     end="\r",

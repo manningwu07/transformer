@@ -27,7 +27,6 @@ def main():
         special_tokens=["<pad>", "<bos>", "<eos>", "<unk>", "<user>", "<assistant>", "<doc>", "<NL>"],
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
-
     
     tokenizer.train([tok_train_file], trainer)
     tokenizer.save(tok_json)

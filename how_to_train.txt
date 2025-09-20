@@ -8,7 +8,7 @@ python3 train.py --train data/test/wiki_train_ids --test data/test/wiki_eval_ids
 
 Open up connection between the 2:
 uvicorn server:app --reload --port 8000
-go run . --cli
+python3 CLI.py
 
 Use --resume & --resumePath path to continue training process
 use --eval & --eval path to see effectiveness of model
