@@ -3,14 +3,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from lora import LoRALinear
+
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1, max_len=2048):
+    def __init__(self, d_model, n_heads, dropout=0.1, max_len=2048, lora_r=None):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model)  # query,key,value
+        qkv = nn.Linear(d_model, 3 * d_model)
+        if lora_r:
+            # split into q, k, v projections
+            q_layer = nn.Linear(d_model, d_model)
+            k_layer = nn.Linear(d_model, d_model)
+            v_layer = nn.Linear(d_model, d_model)
+            # LoRA only on q and v
+            self.q_proj = LoRALinear(q_layer, r=lora_r)
+            self.k_proj = k_layer
+            self.v_proj = LoRALinear(v_layer, r=lora_r)
+            self.merge = nn.Linear(3 * d_model, 3 * d_model)
+        else:
+            self.qkv = qkv
+
         self.out = nn.Linear(d_model, d_model)
         self.attn_drop = nn.Dropout(dropout)
         self.resid_drop = nn.Dropout(dropout)
@@ -22,8 +37,13 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x, past_kv=None):
         # x: (B, T, d_model)
         B, T, C = x.size()
-        qkv = self.qkv(x)  # (B,T,3*d)
-        q, k, v = qkv.split(C, dim=2)
+        if hasattr(self, "qkv"):  # normal mode
+            qkv = self.qkv(x)  # (B,T,3*d)
+            q, k, v = qkv.split(C, dim=2)
+        else:  # LoRA mode
+            q = self.q_proj(x)
+            k = self.k_proj(x)
+            v = self.v_proj(x)
 
         # reshape into heads
         q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)  # (B,h,T,d)

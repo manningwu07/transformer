@@ -249,7 +249,7 @@ def main(args):
                 min_lr=Config.epsilon,
             )
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        global_step = ckpt.get("step", 0)
+        global_step = 0 # ckpt.get("step", 0)
         print(f"✔️ Resumed at step {global_step} (best_val_loss={best_val_loss:.4f})")
 
     # --- Eval-only mode ---
@@ -282,7 +282,7 @@ def main(args):
     while global_step < args.max_steps:
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
-            with torch.autocast(device_type=device, dtype=torch.bfloat16): # Change to float32 when finetuning + close to end of training
+            with torch.autocast(device_type=device, dtype=torch.float32):
                 logits, _ = model(x)
                 criterion = torch.nn.CrossEntropyLoss(
                     ignore_index=pad_id,
