@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lora import LoRALinear
-from params import config
+from params import Config
 
 
 class CausalSelfAttention(nn.Module):
@@ -62,7 +62,7 @@ class CausalSelfAttention(nn.Module):
         # save for cache
         present = (k, v)
 
-        if (config.seqlen <= 256):
+        if (Config.seqlen <= 256):
             # Manually calculate attention vanilla because less overhead
             # attention scores
             att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B,h,T,T_total)
@@ -81,7 +81,7 @@ class CausalSelfAttention(nn.Module):
             # use PyTorch built-in function (faster on GPU)
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=self.mask[:, :, :T, :T_k], 
-                dropout_p=config.attn_pdrop if self.training else 0.0, 
+                dropout_p=Config.attn_pdrop if self.training else 0.0, 
                 is_causal=False
             )
         

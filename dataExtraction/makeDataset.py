@@ -67,36 +67,47 @@ def main():
     lengths = {k: [] for k in writers}
 
     with open(args.corpus, "r", encoding="utf-8") as f:
+        buffer = []
         for line in tqdm(f, desc="Encoding → shards"):
-            text = line.strip()
-            if not text:
-                continue
-            enc = tok.encode(text)
-            full_ids = [bos_id] + enc.ids + [eos_id]
+            stripped = line.rstrip("\n")
 
-            # Decide split once per record
-            p = random.random()
-            if p < r_train:
-                split = "train"
-            elif p < r_train + r_val:
-                split = "val"
-            else:
-                split = "test"
-
-            # Optionally cap or drop long examples
-            if args.seq_len and len(full_ids) > args.seq_len:
-                if args.truncate_policy == "truncate":
-                    full_ids = full_ids[:args.seq_len]
-                else:
-                    # drop
+            # Accumulate all lines until we hit a closing top‑level tag
+            buffer.append(stripped)
+            if stripped.startswith("</") and stripped.endswith(">") and stripped.count("/") == 1:
+                # Reached block boundary — flush the buffer
+                text = "\n".join(buffer).strip()
+                buffer.clear()
+                if not text:
                     continue
 
-            w = writers[split]
-            if w["cur"] >= args.max_shard_bytes:
-                next_w(w)
-            write_seq(w, full_ids)
-            counts[split] += 1
-            lengths[split].append(len(full_ids))
+                # ---------------- Encode entire record ----------------
+                enc = tok.encode(text)
+                full_ids = [bos_id] + enc.ids + [eos_id]
+
+                # Decide split once per record
+                p = random.random()
+                if p < r_train:
+                    split = "train"
+                elif p < r_train + r_val:
+                    split = "val"
+                else:
+                    split = "test"
+
+                # Optionally cap or drop long records
+                if args.seq_len and len(full_ids) > args.seq_len:
+                    if args.truncate_policy == "truncate":
+                        full_ids = full_ids[:args.seq_len]
+                    else:
+                        continue  # drop too‑long one
+
+                # --------------- Write to shard ----------------
+                w = writers[split]
+                if w["cur"] >= args.max_shard_bytes:
+                    next_w(w)
+                write_seq(w, full_ids)
+                counts[split] += 1
+                lengths[split].append(len(full_ids))
+        # (end loop)
 
     for s in writers:
         w = writers[s]

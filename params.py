@@ -1,80 +1,111 @@
-from dataclasses import dataclass
 # params.py
+from dataclasses import dataclass
+
+# Choose a profile by setting ACTIVE = "local" / "debug" / "lora"
+ACTIVE = "local"
 
 @dataclass
-class TrainingConfig:
-    # Core transformer parameters (MUST MATCH OR ELSE IT WILL FAIL)
-    d_model: int = 768         # model width 
-    hidden_size: int = 2048    # MLP hidden dim 
-    vocab_size: int = 65_536   # |V| 
-    num_heads: int = 12 # attention heads 
-    seq_len: int = 64        # context length 
-    max_len: int = 512
-    n_layers: int = 12          # number of transformer blocks 
-    lr: float = 1e-3
+class BaseConfig:
+    # Core transformer parameters (must match any loaded checkpoint)
+    d_model: int = 768         # model width
+    hidden_size: int = 2048    # MLP hidden dim (typically 2-4x d_model)
+    vocab_size: int = 65_536   # |V|
+    num_heads: int = 12        # attention heads (d_model % num_heads == 0)
+    seq_len: int = 64          # training context length (shorter = less memory)
+    max_len: int = 512         # generation max context
+    n_layers: int = 12         # number of transformer blocks
+    lr: float = 1e-3           # base learning rate (may be overridden per profile)
 
-    # Optimization
-    max_epochs: int = 3 # number of passes through the dataset
+    # Optimization & scheduling
+    max_epochs: int = 3
     patience: int = 10
     improvement_threshold: float = 0.02
     batch_size: int = 24
-    epsilon: int = 1e-5
-    gradAccumSteps: int = 24 # batchsize * gradAccumSteps = effective batchsize
-    eval_every_steps = 2_500
+    epsilon: float = 1e-5
+    gradAccumSteps: int = 24          # effective batch = batch_size * gradAccumSteps
+    eval_every_steps: int = 2_500
     max_batches: int = 250
-    save_every_steps = 10_000
+    save_every_steps: int = 10_000
     label_smoothing: float = 0.0
     dropout: float = 0.0
 
-    # AdaFactor
+    # Adafactor / LR schedule
     warmup_steps: int = 1_000
     decay_steps: int = 5_000
     grad_clip: float = 1.0
 
     # Debug
     debug: bool = True
-    debug_every: int = 500     # print every N steps
+    debug_every: int = 500
     log_random_sample: bool = False
     random_samples: int = 250
 
+# Profile overrides ---------------------------------------------------------
+@dataclass
+class DebugProfile(BaseConfig):
+    # fast iteration / overfit checks
+    seq_len: int = 64
+    n_layers: int = 2
+    d_model: int = 512
+    hidden_size: int = 1536
+    batch_size: int = 4
+    gradAccumSteps: int = 1
+    lr: float = 5e-4
+    eval_every_steps: int = 200
+    save_every_steps: int = 1000
+    max_batches: int = 50
+    warmup_steps: int = 100
+    decay_steps: int = 1_000
+    dropout: float = 0.0
+    debug: bool = True
+    debug_every: int = 50
 
-Config = TrainingConfig()
+@dataclass
+class LocalProfile(BaseConfig):
+    # target for M4 Pro, ~200M param model training locally
+    seq_len: int = 512
+    n_layers: int = 12
+    d_model: int = 768
+    hidden_size: int = 2048
+    batch_size: int = 16
+    gradAccumSteps: int = 16         # effective batch ~256
+    lr: float = 6e-4
+    
+    warmup_steps: int = 10_000
+    decay_steps: int = 200_000
+    eval_every_steps: int = 2_500
+    save_every_steps: int = 10_000
+    max_batches: int = 250
+    dropout: float = 0.1
+    label_smoothing: float = 0.0
+    debug: bool = False
+    debug_every: int = 250
 
+@dataclass
+class LoRAProfile(BaseConfig):
+    # LoRA finetuning: only adapter params updated so memory / batch can be bigger
+    seq_len: int = 256
+    n_layers: int = 12
+    d_model: int = 768
+    hidden_size: int = 2048
+    batch_size: int = 4
+    gradAccumSteps: int = 8          # effective batch = 32
+    lr: float = 2e-3                 # LoRA often uses higher LR
+    
+    warmup_steps: int = 100
+    decay_steps: int = 3_000
+    eval_every_steps: int = 250
+    save_every_steps: int = 1_000
+    dropout: float = 0.0
+    debug: bool = False
 
+# Export the chosen Config
+if ACTIVE == "debug":
+    Config = DebugProfile()
+elif ACTIVE == "lora":
+    Config = LoRAProfile()
+else:
+    Config = LocalProfile()
 
-# # LORA
-
-# @dataclass
-# class TrainingConfig:
-#     # Core model architecture must match pretraining checkpoint
-#     d_model: int = 768
-#     hidden_size: int = 2048
-#     vocab_size: int = 65_536
-#     num_heads: int = 12
-#     seq_len: int = 64
-#     max_len: int = 448
-#     n_layers: int = 12
-
-#     # === Finetuning hyperparameters (LoRA) ===
-#     lr: float = 1e-3           # higher LR, since only LoRA adapters train
-#     batch_size: int = 4        # keep modest for stability on MPS
-#     gradAccumSteps: int = 8    # effective batch_size = 32 (4*8)
-#     max_steps: int = 3000      # LoRA converges fast, 1-3k is often enough
-#     warmup_steps: int = 100    # much shorter warmup than pretrain
-#     decay_steps: int = 3000    # cosine decay for full fine-run
-#     epsilon: float = 1e-8
-#     grad_clip: float = 1.0
-
-#     # === Regularization (keep minimal in finetune) ===
-#     dropout: float = 0.0       # better to switch off for instruction tuning
-#     label_smoothing: float = 0.0
-#     patience: int = 5          # earlier stop allowed
-#     improvement_threshold: float = 0.002
-
-#     # Debug/logging
-#     debug: bool = True
-#     debug_every: int = 50
-#     log_random_sample: bool = False
-#     random_samples: int = 100
-
-# Config = TrainingConfig()
+# Backwards compatibility: expose lowercase name if some modules import 'config'
+config = Config
