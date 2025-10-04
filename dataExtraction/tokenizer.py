@@ -63,6 +63,35 @@ def main():
     print(f"Saved vocab map → {vocab_path}")
 
     print("Special IDs:", {t: tok.token_to_id(t) for t in SPECIAL_TOKENS})
+    
+    # === Collect "bad" tokens (special & delimiters) for generation masking ===
+    print("Scanning special tokens to build bad_id list...")
 
+    bad_ids = []
+    # Iterate only over the first chunk of tokens (specials are front‑loaded)
+    for i, (tok_str, tok_id) in enumerate(tok.get_vocab().items()):
+        if i >= 1024:  # skip normal tokens to save time
+            break
+        if tok_str.startswith("<") and tok_str.endswith(">") and len(tok_str) > 2:
+            bad_ids.append(tok_id)
+
+    # Also always mask the base special tokens if they exist
+    for special in ("<pad>", "<unk>", "<bos>"):
+        try:
+            tok_id = tok.token_to_id(special)
+            if tok_id is not None:
+                bad_ids.append(tok_id)
+        except KeyError:
+            pass
+
+    # Deduplicate and sort
+    bad_ids = sorted(set(bad_ids))
+
+    # Save alongside tokenizer and vocab files
+    bad_path = os.path.join(args.out, "data/json/bad_ids.json")
+    with open(bad_path, "w") as f:
+        json.dump({"BadTokenIDs": bad_ids}, f, indent=2)
+
+    print(f"✅ Saved bad token IDs to {bad_path} ({len(bad_ids)} entries)")
 if __name__ == "__main__":
     main()

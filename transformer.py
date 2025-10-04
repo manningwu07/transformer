@@ -1,4 +1,6 @@
+import json
 import math
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -142,11 +144,6 @@ class GPT2LikeLM(nn.Module):
         d_ff=2048,
         max_len=1024,
         dropout=0.1,
-        pad_id: int = 0,
-        bos_id: int = 1,
-        eos_id: int = 2,
-        unk_id: int = 3,
-        tok2id: dict | None = None,
     ):
         super().__init__()
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -157,22 +154,6 @@ class GPT2LikeLM(nn.Module):
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.max_len = max_len
-        
-        # store basic special token IDs
-        self.pad_id = pad_id
-        self.bos_id = bos_id
-        self.eos_id = eos_id
-        self.unk_id = unk_id
-
-        # dynamic discovery of all tag‑style special tokens
-        if tok2id is not None:
-            self.special_token_dict = {
-                name: idx for name, idx in tok2id.items() if name.startswith("<")
-            }
-            self.special_ids = list(self.special_token_dict.values())
-        else:
-            self.special_token_dict = {}
-            self.special_ids = []
             
         # --- Tie token embedding & output head ---
         self.head.weight = self.tok_emb.weight
@@ -217,8 +198,9 @@ class GPT2LikeLM(nn.Module):
         generated = idx.to(device)
         past_kvs = None
         
-        # fall back to “special” list if not provided
-        bad_ids = bad_ids or [self.pad_id, self.unk_id, self.bos_id] + self.special_ids
+        bad_ids = (lambda p: json.load(open(p)).get("BadTokenIDs", []) if os.path.exists(p) else [])("data/test/bad_ids.json")
+        if not bad_ids:
+            FileNotFoundError("Bad IDs file not found or isn't correct. Please run the tokenizer script to generate bad_ids.json")
 
         def filter_top_k_p(logits, top_k, top_p):
             if top_k is not None and top_k > 0:

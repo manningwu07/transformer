@@ -46,11 +46,7 @@ def main():
         n_heads=Config.num_heads,
         n_layers=2,           # small for test
         d_ff=Config.hidden_size,
-        max_len=512,
-        pad_id=pad_id,
-        bos_id=vocab["TokenToID"]["<bos>"],
-        eos_id=vocab["TokenToID"]["<eos>"],
-        unk_id=vocab["TokenToID"]["<unk>"],
+        max_len=512
     )
     device="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     model=model.to(device)

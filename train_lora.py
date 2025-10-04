@@ -34,11 +34,7 @@ def main(args):
         n_layers=Config.n_layers,
         d_ff=Config.hidden_size,
         dropout=Config.dropout,
-        max_len=Config.max_len,
-        pad_id=pad_id,
-        bos_id=tok2id["<bos>"],
-        eos_id=tok2id["<eos>"],
-        unk_id=tok2id["<unk>"],
+        max_len=Config.max_len
     ).to(device)
 
     # --- Load base weights ---

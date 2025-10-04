@@ -22,18 +22,14 @@ def verifyModel():
     ckpt = torch.load(args.model, map_location="cpu")
     model_state = ckpt.get("model_state", ckpt)  # support raw state_dict
 
-    # Build model with config (params.py)
+    # Build model with config
     model = GPT2LikeLM(
         vocab_size=vocab_size,
         d_model=Config.d_model,
         n_heads=Config.num_heads,
         n_layers=Config.n_layers,
         d_ff=Config.hidden_size,
-        max_len=Config.max_len,
-        pad_id=vocab["TokenToID"]["<pad>"],
-        bos_id=vocab["TokenToID"]["<bos>"],
-        eos_id=vocab["TokenToID"]["<eos>"],
-        unk_id=vocab["TokenToID"]["<unk>"],
+        max_len=Config.max_len
     )
 
     model.load_state_dict(model_state, strict=False)

@@ -1,44 +1,5 @@
-# # LORA
-
-# from dataclasses import dataclass
-
-# @dataclass
-# class TrainingConfig:
-#     # Core model architecture must match pretraining checkpoint
-#     d_model: int = 768
-#     hidden_size: int = 2048
-#     vocab_size: int = 65_536
-#     num_heads: int = 12
-#     seq_len: int = 64
-#     max_len: int = 512
-#     n_layers: int = 12
-
-#     # === Finetuning hyperparameters (LoRA) ===
-#     lr: float = 1e-3           # higher LR, since only LoRA adapters train
-#     batch_size: int = 4        # keep modest for stability on MPS
-#     gradAccumSteps: int = 8    # effective batch_size = 32 (4*8)
-#     max_steps: int = 3000      # LoRA converges fast, 1-3k is often enough
-#     warmup_steps: int = 100    # much shorter warmup than pretrain
-#     decay_steps: int = 3000    # cosine decay for full fine-run
-#     epsilon: float = 1e-8
-#     grad_clip: float = 1.0
-
-#     # === Regularization (keep minimal in finetune) ===
-#     dropout: float = 0.0       # better to switch off for instruction tuning
-#     label_smoothing: float = 0.0
-#     patience: int = 5          # earlier stop allowed
-#     improvement_threshold: float = 0.002
-
-#     # Debug/logging
-#     debug: bool = True
-#     debug_every: int = 50
-#     log_random_sample: bool = False
-#     random_samples: int = 100
-
-# Config = TrainingConfig()
-
-# params.py
 from dataclasses import dataclass
+# params.py
 
 @dataclass
 class TrainingConfig:
@@ -78,3 +39,42 @@ class TrainingConfig:
 
 
 Config = TrainingConfig()
+
+
+
+# # LORA
+
+# @dataclass
+# class TrainingConfig:
+#     # Core model architecture must match pretraining checkpoint
+#     d_model: int = 768
+#     hidden_size: int = 2048
+#     vocab_size: int = 65_536
+#     num_heads: int = 12
+#     seq_len: int = 64
+#     max_len: int = 512
+#     n_layers: int = 12
+
+#     # === Finetuning hyperparameters (LoRA) ===
+#     lr: float = 1e-3           # higher LR, since only LoRA adapters train
+#     batch_size: int = 4        # keep modest for stability on MPS
+#     gradAccumSteps: int = 8    # effective batch_size = 32 (4*8)
+#     max_steps: int = 3000      # LoRA converges fast, 1-3k is often enough
+#     warmup_steps: int = 100    # much shorter warmup than pretrain
+#     decay_steps: int = 3000    # cosine decay for full fine-run
+#     epsilon: float = 1e-8
+#     grad_clip: float = 1.0
+
+#     # === Regularization (keep minimal in finetune) ===
+#     dropout: float = 0.0       # better to switch off for instruction tuning
+#     label_smoothing: float = 0.0
+#     patience: int = 5          # earlier stop allowed
+#     improvement_threshold: float = 0.002
+
+#     # Debug/logging
+#     debug: bool = True
+#     debug_every: int = 50
+#     log_random_sample: bool = False
+#     random_samples: int = 100
+
+# Config = TrainingConfig()

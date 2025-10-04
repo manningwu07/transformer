@@ -36,11 +36,7 @@ model = GPT2LikeLM(
     n_heads=Config.num_heads,
     n_layers=Config.n_layers,
     d_ff=Config.hidden_size,
-    max_len=Config.max_len,
-    pad_id=tok2id["<pad>"],
-    bos_id=tok2id["<bos>"],
-    eos_id=tok2id["<eos>"],
-    unk_id=tok2id["<unk>"],
+    max_len=Config.max_len
 )
 ckpt = torch.load(MODEL_PATH, map_location="cpu")
 state = ckpt.get("model_state", ckpt)
