@@ -50,15 +50,15 @@ class TrainingConfig:
     seq_len: int = 64        # context length 
     max_len: int = 512
     n_layers: int = 12          # number of transformer blocks 
-    lr: float = 1e-3 # 3e-3 for finetuning (LoRA)
+    lr: float = 1e-3
 
     # Optimization
     max_epochs: int = 5 # number of passes through the dataset
     patience: int = 10
     improvement_threshold: float = 0.02
-    batch_size: int = 16
+    batch_size: int = 12
     epsilon: int = 1e-5
-    gradAccumSteps: int = 16 # batchsize * gradAccumSteps = effective batchsize
+    gradAccumSteps: int = 12 # batchsize * gradAccumSteps = effective batchsize
     eval_every_steps = 2_000
     max_batches: int = 250
     save_every_steps = 10_000

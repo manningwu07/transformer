@@ -31,11 +31,11 @@ def write_seq(w, ids):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--corpus", type=str, default="blended_corpus.txt")
-    ap.add_argument("--tokenizer", type=str, default="data/test/tokenizer.json")
+    ap.add_argument("--corpus", type=str, default="data/raw/blended_corpus.txt")
+    ap.add_argument("--tokenizer", type=str, default="data/json/tokenizer.json")
     ap.add_argument("--outdir", type=str, default="data/shards")
     ap.add_argument("--seq_len", type=int, default=1024)
-    ap.add_argument("--max_shard_bytes", type=int, default=1 * 1024 * 1024 * 1024)
+    ap.add_argument("--max_shard_bytes", type=int, default=1 * 1024 * 1024 * 1024) # 1GB
     ap.add_argument("--splits", type=str, default="0.90,0.05,0.05")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()

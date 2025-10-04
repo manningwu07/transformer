@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from lora import LoRALinear
+from params import config
 
 
 class CausalSelfAttention(nn.Module):
@@ -59,19 +60,29 @@ class CausalSelfAttention(nn.Module):
         # save for cache
         present = (k, v)
 
-        # attention scores
-        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B,h,T,T_total)
-        # apply causal mask
-        T_q = q.size(2)
-        T_k = k.size(2)
-        mask = self.mask[:, :, :T_q, :T_k]  # (1,1,T_q,T_k)
-        # use a large negative for numerical stability on MPS
-        att = att.masked_fill(~mask, -1e9)
+        if (config.seqlen <= 256):
+            # Manually calculate attention vanilla because less overhead
+            # attention scores
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B,h,T,T_total)
+            # apply causal mask
+            T_q = q.size(2)
+            T_k = k.size(2)
+            mask = self.mask[:, :, :T_q, :T_k]  # (1,1,T_q,T_k)
+            # use a large negative for numerical stability on MPS
+            att = att.masked_fill(~mask, -1e9)
 
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
+            att = F.softmax(att, dim=-1)
+            att = self.attn_drop(att)
 
-        y = att @ v  # (B,h,T,d)
+            y = att @ v  # (B,h,T,d)    
+        else:
+            # use PyTorch built-in function (faster on GPU)
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=self.mask[:, :, :T, :T_k], 
+                dropout_p=config.attn_pdrop if self.training else 0.0, 
+                is_causal=False
+            )
+        
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # back to (B,T,C)
         y = self.resid_drop(self.out(y))  # linear out proj
 

@@ -21,10 +21,10 @@ SPECIAL_TOKENS = [
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--corpus", type=str, default="blended_corpus.txt")
-    p.add_argument("--out", type=str, default="data/test")
+    p.add_argument("--corpus", type=str, default="data/raw/blended_corpus.txt")
+    p.add_argument("--out", type=str, default="data/json")
     p.add_argument("--vocab_size", type=int, default=65536)
-    p.add_argument("--min_freq", type=int, default=2)
+    p.add_argument("--min_freq", type=int, default=4)
     args = p.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
