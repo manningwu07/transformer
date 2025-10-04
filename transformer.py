@@ -92,20 +92,42 @@ class CausalSelfAttention(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, d_model, n_heads, d_ff, dropout, max_len):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
+        class RMSNorm(nn.Module):
+            def __init__(self, dim, eps=1e-6):
+                super().__init__()
+                self.scale = nn.Parameter(torch.ones(dim))
+                self.eps = eps
+            def forward(self, x):
+                norm = x.pow(2).mean(-1, keepdim=True)
+                return self.scale * x / torch.sqrt(norm + self.eps)
+
+        # --- SwiGLU MLP: efficient and higher‑quality
+        class SwiGLU(nn.Module):
+            def __init__(self, d_model, d_ff, dropout):
+                super().__init__()
+                self.fc1 = nn.Linear(d_model, 2 * d_ff)
+                self.fc2 = nn.Linear(d_ff, d_model)
+                self.drop = nn.Dropout(dropout)
+            def forward(self, x):
+                x_gated = self.fc1(x)
+                x_g, x_v = x_gated.chunk(2, dim=-1)
+                return self.drop(self.fc2(F.silu(x_g) * x_v))
+
+        self.ln1 = RMSNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, dropout, max_len)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, d_ff),
-            nn.GELU(),
-            nn.Linear(d_ff, d_model),
-            nn.Dropout(dropout),
-        )
+        self.ln2 = RMSNorm(d_model)
+        self.mlp = SwiGLU(d_model, d_ff, dropout)
 
     def forward(self, x, past_kv=None):
-        a, present = self.attn(self.ln1(x), past_kv)
+        # ---- Gradient checkpointing for memory saving ----
+        def attn_forward(layer_input):
+            a, present = self.attn(self.ln1(layer_input), past_kv)
+            return a, present
+
+        a, present = torch.utils.checkpoint.checkpoint(lambda t: attn_forward(t)[0], x)
         x = x + a
-        m = self.mlp(self.ln2(x))
+
+        m = torch.utils.checkpoint.checkpoint(self.mlp, self.ln2(x))
         x = x + m
         return x, present
 
@@ -120,10 +142,11 @@ class GPT2LikeLM(nn.Module):
         d_ff=2048,
         max_len=1024,
         dropout=0.1,
-        pad_id=0,
-        bos_id=1,
-        eos_id=2,
-        unk_id=3,
+        pad_id: int = 0,
+        bos_id: int = 1,
+        eos_id: int = 2,
+        unk_id: int = 3,
+        tok2id: dict | None = None,
     ):
         super().__init__()
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -135,12 +158,25 @@ class GPT2LikeLM(nn.Module):
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.max_len = max_len
         
-        
-        # store special token IDs
+        # store basic special token IDs
         self.pad_id = pad_id
         self.bos_id = bos_id
         self.eos_id = eos_id
         self.unk_id = unk_id
+
+        # dynamic discovery of all tag‑style special tokens
+        if tok2id is not None:
+            self.special_token_dict = {
+                name: idx for name, idx in tok2id.items() if name.startswith("<")
+            }
+            self.special_ids = list(self.special_token_dict.values())
+        else:
+            self.special_token_dict = {}
+            self.special_ids = []
+            
+        # --- Tie token embedding & output head ---
+        self.head.weight = self.tok_emb.weight
+    
 
     def forward(self, idx, past_kvs=None):
         B, T = idx.size()
@@ -180,6 +216,9 @@ class GPT2LikeLM(nn.Module):
         device = next(self.parameters()).device
         generated = idx.to(device)
         past_kvs = None
+        
+        # fall back to “special” list if not provided
+        bad_ids = bad_ids or [self.pad_id, self.unk_id, self.bos_id] + self.special_ids
 
         def filter_top_k_p(logits, top_k, top_p):
             if top_k is not None and top_k > 0:
@@ -207,10 +246,8 @@ class GPT2LikeLM(nn.Module):
                 logits, past_kvs = self(generated[:, -1:], past_kvs)
 
             logits = logits[:, -1, :] / max(1e-5, float(temperature))
-
-            # Never sample special BOS/UNK/PAD
-            bad = [self.pad_id, self.unk_id, self.bos_id]
-            logits[:, bad] = -float("inf")
+            # Dont sample the tags and especially pad/unk/bos
+            logits[:, bad_ids] = -float("inf")
 
             # Repetition penalty (vectorized on unique tokens)
             if repetition_penalty is not None and repetition_penalty > 1.0:

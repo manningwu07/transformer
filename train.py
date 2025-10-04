@@ -205,6 +205,12 @@ def main(args):
         eos_id=tok2id["<eos>"],
         unk_id=tok2id["<unk>"],
     ).to(device)
+    
+    try:
+        model = torch.compile(model, mode="max-autotune")
+        print("✅ torch.compile enabled")
+    except Exception as e:
+        print("⚠️ torch.compile not available:", e)
 
     optimizer = Adafactor(
         model.parameters(),
@@ -278,30 +284,41 @@ def main(args):
     noImprovement = 0
     model.train()
     total_loss_sum, total_tokens = 0.0, 0
+    # 🧮 AMP GradScaler for mixed precision (bf16 on MPS, fp16 on CUDA)
+    amp_dtype = torch.bfloat16 if device == "mps" else torch.float16
+    scaler = torch.cuda.amp.GradScaler("cuda") if device == "cuda" else None
 
     while global_step < args.max_steps:
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
-            with torch.autocast(device_type=device, dtype=torch.float32):
+            criterion = torch.nn.CrossEntropyLoss(
+                ignore_index=pad_id,
+                label_smoothing=Config.label_smoothing,
+                reduction="mean",
+            )
+
+            with torch.autocast(device_type=device, dtype=amp_dtype):
                 logits, _ = model(x)
-                criterion = torch.nn.CrossEntropyLoss(
-                    ignore_index=pad_id,
-                    label_smoothing=Config.label_smoothing,
-                    reduction="mean",
-                )
-                loss = criterion(
-                    logits.view(-1, vocab_size),
-                    y.view(-1),
-                ) / Config.gradAccumSteps
-            
-            loss.backward()
+                loss = criterion(logits.view(-1, vocab_size),
+                                 y.view(-1)) / Config.gradAccumSteps
 
-            if (global_step + 1) % Config.gradAccumSteps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-
+            # --- AMP + grad accumulation ---
+            if device == "cuda":
+                scaler.scale(loss).backward()
+                if (global_step + 1) % Config.gradAccumSteps == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+            else:
+                loss.backward()
+                if (global_step + 1) % Config.gradAccumSteps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
             global_step += 1
             # Logging token-avg loss (accounting for gradAccum scaling)
             with torch.no_grad():

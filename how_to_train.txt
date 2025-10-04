@@ -1,5 +1,13 @@
-First run the go main
-go run . --export
+Launch with python
+python3 -m venv .venv
+source .venv/bin/activate
+pip3 install -r requirements.text
+
+Run the python files in dataExtraction folder
+
+python3 dataExtraction/getData.py
+python3 dataExtraction/tokenizer.py
+python3 dataExtraction/makeDataset.py
 To get vocab
 
 Next, train on python
