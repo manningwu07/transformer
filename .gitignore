@@ -12,6 +12,8 @@
 # modal
 /src/models/
 /models/
+/oldModels/
+/dataExtraction/old/
 
 # archived
 /src/archived
