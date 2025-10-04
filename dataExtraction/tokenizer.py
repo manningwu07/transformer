@@ -88,7 +88,7 @@ def main():
     bad_ids = sorted(set(bad_ids))
 
     # Save alongside tokenizer and vocab files
-    bad_path = os.path.join(args.out, "data/json/bad_ids.json")
+    bad_path = os.path.join(args.out, "bad_ids.json")
     with open(bad_path, "w") as f:
         json.dump({"BadTokenIDs": bad_ids}, f, indent=2)
 

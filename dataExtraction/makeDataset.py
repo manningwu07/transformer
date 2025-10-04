@@ -34,10 +34,14 @@ def main():
     ap.add_argument("--corpus", type=str, default="data/raw/blended_corpus.txt")
     ap.add_argument("--tokenizer", type=str, default="data/json/tokenizer.json")
     ap.add_argument("--outdir", type=str, default="data/shards")
-    ap.add_argument("--seq_len", type=int, default=1024)
+    # Optional cap: if >0, truncate long examples; if 0, keep full length
+    ap.add_argument("--seq_len", type=int, default=0)
     ap.add_argument("--max_shard_bytes", type=int, default=1 * 1024 * 1024 * 1024) # 1GB
     ap.add_argument("--splits", type=str, default="0.90,0.05,0.05")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--truncate_policy", type=str, default="truncate",
+                    choices=["truncate","drop"],
+                    help="When seq_len>0 and example is longer: truncate or drop")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -60,6 +64,7 @@ def main():
         next_w(writers[s])
 
     counts = {k: 0 for k in writers}
+    lengths = {k: [] for k in writers}
 
     with open(args.corpus, "r", encoding="utf-8") as f:
         for line in tqdm(f, desc="Encoding → shards"):
@@ -67,24 +72,31 @@ def main():
             if not text:
                 continue
             enc = tok.encode(text)
-            ids = [bos_id] + enc.ids + [eos_id]
+            full_ids = [bos_id] + enc.ids + [eos_id]
 
-            for i in range(0, max(1, len(ids) - 1), args.seq_len):
-                window = ids[i : i + args.seq_len]
+            # Decide split once per record
+            p = random.random()
+            if p < r_train:
+                split = "train"
+            elif p < r_train + r_val:
+                split = "val"
+            else:
+                split = "test"
 
-                p = random.random()
-                if p < r_train:
-                    split = "train"
-                elif p < r_train + r_val:
-                    split = "val"
+            # Optionally cap or drop long examples
+            if args.seq_len and len(full_ids) > args.seq_len:
+                if args.truncate_policy == "truncate":
+                    full_ids = full_ids[:args.seq_len]
                 else:
-                    split = "test"
+                    # drop
+                    continue
 
-                w = writers[split]
-                if w["cur"] >= args.max_shard_bytes:
-                    next_w(w)
-                write_seq(w, window)
-                counts[split] += 1
+            w = writers[split]
+            if w["cur"] >= args.max_shard_bytes:
+                next_w(w)
+            write_seq(w, full_ids)
+            counts[split] += 1
+            lengths[split].append(len(full_ids))
 
     for s in writers:
         w = writers[s]
@@ -93,6 +105,16 @@ def main():
             w["idx"].close()
 
     print("✅ Done. Sequences:", counts)
+    # Report stats (mean/std) per split
+    import math
+    def stat(xs):
+        if not xs:
+            return (0.0, 0.0, 0.0, 0.0)
+        arr = np.asarray(xs, dtype=np.float64)
+        return (arr.mean(), arr.std(ddof=0), np.median(arr), np.percentile(arr, 90))
+    for split in ("train","val","test"):
+        mu, sd, p50, p90 = stat(lengths[split])
+        print(f"[{split}] tokens: mean={mu:.1f}, std={sd:.1f}, p50={p50:.1f}, p90={p90:.1f}, n={len(lengths[split])}")
     print(f"Shards at: {args.outdir}")
 
 if __name__ == "__main__":

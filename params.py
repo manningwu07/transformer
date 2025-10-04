@@ -14,13 +14,13 @@ class TrainingConfig:
     lr: float = 1e-3
 
     # Optimization
-    max_epochs: int = 5 # number of passes through the dataset
+    max_epochs: int = 3 # number of passes through the dataset
     patience: int = 10
     improvement_threshold: float = 0.02
-    batch_size: int = 12
+    batch_size: int = 24
     epsilon: int = 1e-5
-    gradAccumSteps: int = 12 # batchsize * gradAccumSteps = effective batchsize
-    eval_every_steps = 2_000
+    gradAccumSteps: int = 24 # batchsize * gradAccumSteps = effective batchsize
+    eval_every_steps = 2_500
     max_batches: int = 250
     save_every_steps = 10_000
     label_smoothing: float = 0.0
@@ -52,7 +52,7 @@ Config = TrainingConfig()
 #     vocab_size: int = 65_536
 #     num_heads: int = 12
 #     seq_len: int = 64
-#     max_len: int = 512
+#     max_len: int = 448
 #     n_layers: int = 12
 
 #     # === Finetuning hyperparameters (LoRA) ===
