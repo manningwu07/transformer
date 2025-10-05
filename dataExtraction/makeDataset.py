@@ -66,25 +66,27 @@ def main():
     counts = {k: 0 for k in writers}
     lengths = {k: [] for k in writers}
 
+    END_TAGS = {t for t in tok.get_vocab().keys()
+            if t.startswith("</") and t.endswith(">")}
+
     with open(args.corpus, "r", encoding="utf-8") as f:
         buffer = []
         for line in tqdm(f, desc="Encoding → shards"):
             stripped = line.rstrip("\n")
 
-            # Accumulate all lines until we hit a closing top‑level tag
             buffer.append(stripped)
-            if stripped.startswith("</") and stripped.endswith(">") and stripped.count("/") == 1:
-                # Reached block boundary — flush the buffer
+
+            # Only flush when reaching a true top-level closing tag.
+            if stripped in END_TAGS:
                 text = "\n".join(buffer).strip()
                 buffer.clear()
                 if not text:
                     continue
 
-                # ---------------- Encode entire record ----------------
                 enc = tok.encode(text)
                 full_ids = [bos_id] + enc.ids + [eos_id]
 
-                # Decide split once per record
+                # --------- Split selection ----------
                 p = random.random()
                 if p < r_train:
                     split = "train"
@@ -93,21 +95,19 @@ def main():
                 else:
                     split = "test"
 
-                # Optionally cap or drop long records
+                # --------- Length control ------------
                 if args.seq_len and len(full_ids) > args.seq_len:
                     if args.truncate_policy == "truncate":
                         full_ids = full_ids[:args.seq_len]
                     else:
-                        continue  # drop too‑long one
+                        continue  # drop long record
 
-                # --------------- Write to shard ----------------
                 w = writers[split]
                 if w["cur"] >= args.max_shard_bytes:
                     next_w(w)
                 write_seq(w, full_ids)
                 counts[split] += 1
                 lengths[split].append(len(full_ids))
-        # (end loop)
 
     for s in writers:
         w = writers[s]

@@ -12,7 +12,7 @@ class BaseConfig:
     vocab_size: int = 65_536   # |V|
     num_heads: int = 12        # attention heads (d_model % num_heads == 0)
     seq_len: int = 64          # training context length (shorter = less memory)
-    max_len: int = 512         # generation max context
+    max_len: int = 1024         # generation max context
     n_layers: int = 12         # number of transformer blocks
     lr: float = 1e-3           # base learning rate (may be overridden per profile)
 

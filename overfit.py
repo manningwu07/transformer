@@ -1,4 +1,5 @@
 # overfit_wiki.py
+import os
 from tokenizers import Tokenizer
 import torch, json
 from torch.utils.data import DataLoader
@@ -35,9 +36,11 @@ class PackedDataset(torch.utils.data.Dataset):
         x,y=self.samples[i]; return torch.tensor(x), torch.tensor(y)
 
 def main():    
-    vocab=json.load(open("data/test/vocab.json"))
-    pad_id=vocab["TokenToID"]["<pad>"]
-    ds = PackedDataset("data/test/wiki_eval_ids", pad_id, max_samples=8)
+    vocab = json.load(open("data/json/vocab.json"))
+    pad_id = vocab["TokenToID"]["<pad>"]
+
+    # small sample from your new shards for smoke test (choose any split)
+    ds = PackedDataset("data/shards/val", pad_id, max_samples=8)
     loader = DataLoader(ds, batch_size=2, shuffle=False, collate_fn=lambda b: collate_fn(b,pad_id))
 
     model=GPT2LikeLM(
@@ -46,7 +49,7 @@ def main():
         n_heads=Config.num_heads,
         n_layers=2,           # small for test
         d_ff=Config.hidden_size,
-        max_len=512
+        max_len=1024
     )
     device="cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
     model=model.to(device)
@@ -65,9 +68,24 @@ def main():
             if step>1000: break   # quick overfit
         
     # Try generate
-    out=model.generate(torch.tensor([[vocab["TokenToID"]["<bos>"]]],device=device),max_tokens=40)
-    ids=out[0].tolist()
-    text="".join([vocab["IDToToken"][i] for i in ids if i in range(len(vocab["IDToToken"]))])
+    tok = Tokenizer.from_file("data/json/tokenizer.json")
+
+    bad_path = "data/json/bad_ids.json"
+    bad_ids = []
+    if os.path.exists(bad_path):
+        bad_ids = json.load(open(bad_path)).get("BadTokenIDs", [])
+
+    out = model.generate(
+        torch.tensor([[vocab["TokenToID"]["<bos>"]]], device=device),
+        max_tokens=40,
+        top_k=40,
+        top_p=0.9,
+        temperature=0.8,
+        repetition_penalty=1.2,
+    )
+    ids = [i for i in out[0].tolist() if i not in bad_ids]
+    text = tok.decode(ids, skip_special_tokens=True)
+    print("GEN:", text)
     print("GEN:",text)
 
 if __name__=="__main__":

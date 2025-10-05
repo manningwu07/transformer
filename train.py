@@ -174,30 +174,18 @@ def main(args):
         else "cpu"
     )
     
-    # Load vocab JSON once
+    # ---- Load prebuilt bad token IDs (for generation masking) ----
+    BAD_PATH = os.path.join("data", "json", "bad_ids.json")
+    if os.path.exists(BAD_PATH):
+        with open(BAD_PATH, "r") as f:
+            bad_json = json.load(f)
+        BAD_IDS = bad_json.get("BadTokenIDs", [])
+        print(f"⚙️ Loaded {len(BAD_IDS)} bad token IDs from {BAD_PATH}")
+    else:
+        BAD_IDS = []
+        print(f"⚠️  bad_ids.json not found at {BAD_PATH} (generation mask will be empty)")
 
-    VOCAB_PATH = "data/test/vocab.json"
-    with open(VOCAB_PATH) as f:
-        vocab = json.load(f)
-    TOK2ID = vocab["TokenToID"]
-
-    BAD_IDS = []
-    for i, (token, idx) in enumerate(TOK2ID.items()):
-        # safety: stop early; special tokens are always front‑loaded
-        if i >= 1024:
-            break
-        # Identify true <...> style delimiters or important meta tokens
-        if (
-            token.startswith("<")
-            and token.endswith(">")
-            and len(token) > 2    # ensure real tag, not just <>
-        ):
-            BAD_IDS.append(idx)
-
-    # Add a few absolutely critical special IDs if not already there
-    for name in ("<pad>", "<unk>", "<bos>"):
-        if name in TOK2ID:
-            BAD_IDS.append(TOK2ID[name])
+    print(f"Training on: {device}")
 
     # Remove any accidental duplicates (keep ordering stable)
     BAD_IDS = list(dict.fromkeys(BAD_IDS))

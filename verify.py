@@ -60,7 +60,7 @@ def verifyModel():
     
 # Make sure data is correct shape and contents are not corrupted
 def verifyShards(shardNumber):
-    a = np.memmap(f"data/test/wiki_train_ids-00{shardNumber}.bin", dtype=np.int32, mode="r")
+    a = np.memmap(f"data/shards/train-00{shardNumber}.bin", dtype=np.int32, mode="r")
     ids, counts = np.unique(a[:500000], return_counts=True)
     print("Unique IDs:", len(ids))
     print("Most common:", sorted(zip(counts, ids), reverse=True)[:30])
@@ -82,6 +82,6 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--shardNumber", type=int, default=-1)
-    parser.add_argument("--model", type=str, default="", help="Path to .pt checkpoint file")
-    parser.add_argument("--vocab", type=str, default="", help="Vocab JSON path (to get vocab size)")
+    parser.add_argument("--model", type=str, default="models/best_model.pt", help="Path to .pt checkpoint file")
+    parser.add_argument("--vocab", type=str, default="data/json/vocab.json", help="Vocab JSON path")
     args = parser.parse_args()

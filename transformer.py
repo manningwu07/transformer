@@ -10,7 +10,7 @@ from params import Config
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1, max_len=2048, lora_r=None):
+    def __init__(self, d_model, n_heads, dropout=0.1, max_len=2048, return_present=False, lora_r=None):
         super().__init__()
         assert d_model % n_heads == 0
         self.n_heads = n_heads
@@ -32,6 +32,7 @@ class CausalSelfAttention(nn.Module):
         self.out = nn.Linear(d_model, d_model)
         self.attn_drop = nn.Dropout(dropout)
         self.resid_drop = nn.Dropout(dropout)
+        self.return_present = return_present
 
         # Register a causal mask (upper triangular)
         mask = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool))
@@ -61,38 +62,39 @@ class CausalSelfAttention(nn.Module):
 
         # save for cache
         present = (k, v)
+        
+        B, _, T_q, _ = q.shape
+        T_k = k.size(2)
+        if T_k > self.mask.size(-1):
+            device = self.mask.device
+            self.mask = torch.tril(torch.ones(T_k, T_k, dtype=torch.bool, device=device)).view(1,1,T_k,T_k)
 
-        if (Config.seqlen <= 256):
-            # Manually calculate attention vanilla because less overhead
-            # attention scores
-            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B,h,T,T_total)
-            # apply causal mask
-            T_q = q.size(2)
-            T_k = k.size(2)
-            mask = self.mask[:, :, :T_q, :T_k]  # (1,1,T_q,T_k)
-            # use a large negative for numerical stability on MPS
+        if (Config.seq_len <= 256):
+            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
+            mask = self.mask[:, :, :T_q, :T_k]
             att = att.masked_fill(~mask, -1e9)
-
             att = F.softmax(att, dim=-1)
             att = self.attn_drop(att)
-
-            y = att @ v  # (B,h,T,d)    
+            y = att @ v  # (B,h,T,d) 
         else:
             # use PyTorch built-in function (faster on GPU)
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=self.mask[:, :, :T, :T_k], 
-                dropout_p=Config.attn_pdrop if self.training else 0.0, 
+                q, k, v, attn_mask=self.mask[:, :, :T_q, :T_k], 
+                dropout_p=self.attn_drop.p if self.training else 0.0, 
                 is_causal=False
             )
         
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # back to (B,T,C)
         y = self.resid_drop(self.out(y))  # linear out proj
 
-        return y, present
+        if self.return_present:
+            return y, present
+        else:
+            return y
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout, max_len):
+    def __init__(self, d_model, n_heads, d_ff, dropout, max_len, return_present=False):
         super().__init__()
         class RMSNorm(nn.Module):
             def __init__(self, dim, eps=1e-6):
@@ -119,19 +121,28 @@ class TransformerBlock(nn.Module):
         self.attn = CausalSelfAttention(d_model, n_heads, dropout, max_len)
         self.ln2 = RMSNorm(d_model)
         self.mlp = SwiGLU(d_model, d_ff, dropout)
+        
+        self.return_present = return_present
 
     def forward(self, x, past_kv=None):
-        # ---- Gradient checkpointing for memory saving ----
-        def attn_forward(layer_input):
-            a, present = self.attn(self.ln1(layer_input), past_kv)
-            return a, present
-
-        a, present = torch.utils.checkpoint.checkpoint(lambda t: attn_forward(t)[0], x)
-        x = x + a
-
-        m = torch.utils.checkpoint.checkpoint(self.mlp, self.ln2(x))
-        x = x + m
-        return x, present
+        if self.return_present == False:
+            # checkpoint saves memory – only need y ("a")
+            a = torch.utils.checkpoint.checkpoint(
+                lambda t: self.attn(self.ln1(t), past_kv),
+                x,
+                use_reentrant=False,
+            )
+            x = x + a
+            m = torch.utils.checkpoint.checkpoint(self.mlp, self.ln2(x), use_reentrant=False)
+            x = x + m
+            return x, None
+        else:
+            # inference path
+            a, present = self.attn(self.ln1(x), past_kv, return_present=True)
+            x = x + a
+            m = self.mlp(self.ln2(x))
+            x = x + m
+            return x, present
 
 
 class GPT2LikeLM(nn.Module):
@@ -143,13 +154,13 @@ class GPT2LikeLM(nn.Module):
         n_layers=6,
         d_ff=2048,
         max_len=1024,
-        dropout=0.1,
+        dropout=0.1
     ):
         super().__init__()
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_len, d_model)
         self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model, n_heads, d_ff, dropout, max_len) for _ in range(n_layers)]
+            [TransformerBlock(d_model, n_heads, d_ff, dropout, max_len, return_present=False) for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
@@ -244,7 +255,7 @@ class GPT2LikeLM(nn.Module):
             generated = torch.cat([generated, next_token], dim=1)
 
             # Stop if EOS or would overflow max_len
-            if next_token.item() == self.eos_id:
+            if next_token.item() == 2: # EOS ID = 2
                 break
             if generated.size(1) >= self.max_len:
                 break
