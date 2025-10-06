@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import io
 import os
 import random
 import struct
 import numpy as np
 from tokenizers import Tokenizer
 from tqdm import tqdm
+import re
 
 def open_w(wdir, split):
     return {"bin": None, "idx": None, "shard_id": 0, "cur": 0, "dir": wdir, "split": split}
@@ -51,6 +53,9 @@ def main():
     bos_id = tok.token_to_id("<bos>")
     eos_id = tok.token_to_id("<eos>")
     assert bos_id is not None and eos_id is not None, "Tokenizer missing <bos>/<eos>"
+    PAD_ID = tok.token_to_id("<pad>")
+    if PAD_ID is None:
+        raise ValueError("Tokenizer missing <pad> (required for later collate)")
 
     r_train, r_val, r_test = [float(x) for x in args.splits.split(",")]
     assert abs(r_train + r_val + r_test - 1.0) < 1e-6
@@ -66,48 +71,64 @@ def main():
     counts = {k: 0 for k in writers}
     lengths = {k: [] for k in writers}
 
-    END_TAGS = {t for t in tok.get_vocab().keys()
-            if t.startswith("</") and t.endswith(">")}
+    END_TAGS = set([
+        "</c4>", "</oscar>", "</dialog>", "</code>", "</stack>",
+        "</math>", "</mathqa>", "</comp_math>",
+        "[/c4]", "[/oscar]", "[/dialog]", "[/code]", "[/stack]",
+        "[/math]", "[/mathqa]", "[/comp_math]"
+    ])
 
     with open(args.corpus, "r", encoding="utf-8") as f:
-        buffer = []
-        for line in tqdm(f, desc="Encoding → shards"):
-            stripped = line.rstrip("\n")
-
-            buffer.append(stripped)
-
-            # Only flush when reaching a true top-level closing tag.
-            if stripped in END_TAGS:
-                text = "\n".join(buffer).strip()
-                buffer.clear()
+        buf = io.StringIO()
+        batch = []
+        for line in tqdm(f, desc="Encoding → shards", mininterval=3.0):
+            # accumulate until end tag
+            buf.write(line)
+            if line.strip() in END_TAGS:
+                text = buf.getvalue().strip()
+                buf.seek(0)
+                buf.truncate(0)
                 if not text:
                     continue
 
-                enc = tok.encode(text)
+                batch.append(text)
+
+            # encode & write in mini-batches to save tokenizer calls
+            if len(batch) >= 32:  # tune batch size
+                encs = tok.encode_batch(batch)
+                batch.clear()
+                for enc in encs:
+                    full_ids = [bos_id] + enc.ids + [eos_id]
+                    if len(full_ids) < 4 or PAD_ID in full_ids:
+                        continue
+                    # pick split
+                    p = random.random()
+                    split = (
+                        "train" if p < r_train else
+                        "val"   if p < r_train + r_val else
+                        "test"
+                    )
+                    if args.seq_len and len(full_ids) > args.seq_len:
+                        if args.truncate_policy == "truncate":
+                            full_ids = full_ids[:args.seq_len]
+                        else:
+                            continue
+                    w = writers[split]
+                    if w["cur"] >= args.max_shard_bytes:
+                        next_w(w)
+                    write_seq(w, full_ids)
+                    counts[split] += 1
+                    lengths[split].append(len(full_ids))
+
+        # flush any remaining texts
+        if batch:
+            for enc in tok.encode_batch(batch):
                 full_ids = [bos_id] + enc.ids + [eos_id]
-
-                # --------- Split selection ----------
-                p = random.random()
-                if p < r_train:
-                    split = "train"
-                elif p < r_train + r_val:
-                    split = "val"
-                else:
-                    split = "test"
-
-                # --------- Length control ------------
-                if args.seq_len and len(full_ids) > args.seq_len:
-                    if args.truncate_policy == "truncate":
-                        full_ids = full_ids[:args.seq_len]
-                    else:
-                        continue  # drop long record
-
-                w = writers[split]
-                if w["cur"] >= args.max_shard_bytes:
-                    next_w(w)
-                write_seq(w, full_ids)
-                counts[split] += 1
-                lengths[split].append(len(full_ids))
+                if len(full_ids) < 4 or PAD_ID in full_ids:
+                    continue
+                write_seq(writers["train"], full_ids)
+                counts["train"] += 1
+                lengths["train"].append(len(full_ids))
 
     for s in writers:
         w = writers[s]

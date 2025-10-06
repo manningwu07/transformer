@@ -16,6 +16,11 @@ from transformer import GPT2LikeLM
 from params import Config
 from transformers import Adafactor
 
+torch.backends.mps.allow_tf32 = False
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.set_default_dtype(torch.float32)
+torch.set_float32_matmul_precision("high") # for stability on diverse datasets; if you want speed, set to "medium" or "low"
+
 # --------------------
 # Dataset utilities
 # --------------------
@@ -50,7 +55,7 @@ class IndexedBinaryDataset(torch.utils.data.IterableDataset):
             ids = torch.from_numpy(np.array(arr, dtype=np.int64))
             ids = ids[: self.seq_len]
             if len(ids) < self.seq_len:
-                pad = torch.zeros(self.seq_len - len(ids), dtype=torch.long)
+                pad = torch.full((self.seq_len - len(ids),), self.pad_id, dtype=torch.long)
                 ids = torch.cat([ids, pad])
             yield ids[:-1], ids[1:]
 
@@ -167,7 +172,7 @@ def main(args):
     signal.signal(signal.SIGTERM, crash_handler)
 
     device = (
-        "mps"
+        "cpu"
         if torch.backends.mps.is_available()
         else "cuda"
         if torch.cuda.is_available()
@@ -217,19 +222,21 @@ def main(args):
         max_len=Config.max_len
     ).to(device)
     
-    try:
-        model = torch.compile(model, mode="max-autotune")
-        print("✅ torch.compile enabled")
-    except Exception as e:
-        print("⚠️ torch.compile not available:", e)
+    # try:
+    #     model = torch.compile(model, mode="max-autotune")
+    #     print("✅ torch.compile enabled")
+    # except Exception as e:
+    #     print("⚠️ torch.compile not available:", e)
+    print("⚠️ Disabled torch.compile for stability on MPS.")
 
-    optimizer = Adafactor(
-        model.parameters(),
-        relative_step=False,
-        scale_parameter=False,
-        warmup_init=False,
-        lr=Config.lr
-    )
+    # optimizer = Adafactor(
+    #     model.parameters(),
+    #     relative_step=False,
+    #     scale_parameter=False,
+    #     warmup_init=False,
+    #     lr=Config.lr
+    # )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=Config.lr, betas=(0.9,0.98), eps=1e-8, weight_decay=0.0)
 
     scheduler = get_lr_scheduler(
         optimizer,
@@ -238,7 +245,7 @@ def main(args):
         min_lr=Config.epsilon,
     )
         
-   # ---- Resume ----
+    # ---- Resume ----
     if args.resumePath and os.path.exists(args.resumePath):
         print(f"Resuming from checkpoint: {args.resumePath}")
         ckpt = torch.load(args.resumePath, map_location=device)
@@ -295,8 +302,15 @@ def main(args):
     noImprovement = 0
     model.train()
     total_loss_sum, total_tokens = 0.0, 0
-    # 🧮 AMP GradScaler for mixed precision (bf16 on MPS, fp16 on CUDA)
-    amp_dtype = torch.bfloat16 if device == "mps" else torch.float16
+    
+    # 🧮 AMP GradScaler for mixed precision (f32 on MPS, fp16 on CUDA)
+    # Force full precision on MPS for stability
+    if device == "mps":
+        amp_dtype = torch.float32
+        use_autocast = False
+    else:
+        amp_dtype = torch.float16
+        use_autocast = True
     scaler = torch.cuda.amp.GradScaler("cuda") if device == "cuda" else None
 
     while global_step < args.max_steps:
@@ -308,13 +322,12 @@ def main(args):
                 reduction="mean",
             )
 
-            with torch.autocast(device_type=device, dtype=amp_dtype):
-                logits, _ = model(x)
-                loss = criterion(logits.view(-1, vocab_size),
-                                 y.view(-1)) / Config.gradAccumSteps
-
             # --- AMP + grad accumulation ---
             if device == "cuda":
+                with torch.autocast(device_type=device, dtype=amp_dtype): # mps is unstable with autocast
+                    logits, _ = model(x)
+                    loss = criterion(logits.view(-1, vocab_size),
+                                    y.view(-1)) / Config.gradAccumSteps
                 scaler.scale(loss).backward()
                 if (global_step + 1) % Config.gradAccumSteps == 0:
                     scaler.unscale_(optimizer)
@@ -324,7 +337,14 @@ def main(args):
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
             else:
+                logits, _ = model(x)
+                loss = criterion(logits.view(-1, vocab_size),
+                                 y.view(-1)) / Config.gradAccumSteps
                 loss.backward()
+                # Guard
+                if global_step < 2000:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
+                
                 if (global_step + 1) % Config.gradAccumSteps == 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
                     optimizer.step()
@@ -332,6 +352,12 @@ def main(args):
                     optimizer.zero_grad(set_to_none=True)
             global_step += 1
             # Logging token-avg loss (accounting for gradAccum scaling)
+            if global_step < 20:
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        total_norm += p.grad.norm().item() ** 2
+                print("GradNorm", (total_norm ** 0.5))
             with torch.no_grad():
                 valid = (y != pad_id).sum().item()
                 # loss.item() is mean CE / gradAccumSteps; undo the division:

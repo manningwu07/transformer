@@ -74,16 +74,22 @@ class CausalSelfAttention(nn.Module):
             mask = self.mask[:, :, :T_q, :T_k]
             att = att.masked_fill(~mask, -1e9)
             att = F.softmax(att, dim=-1)
+            att = torch.nan_to_num(att, nan=0.0)
             att = self.attn_drop(att)
             y = att @ v  # (B,h,T,d) 
         else:
-            # use PyTorch built-in function (faster on GPU)
+            # Use SDPA's built-in causal mask. Do not pass a boolean "allow" mask.
+            # This avoids the True=masked vs True=allowed semantics mismatch.
             y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=self.mask[:, :, :T_q, :T_k], 
-                dropout_p=self.attn_drop.p if self.training else 0.0, 
-                is_causal=False
+                q, k, v,
+                attn_mask=None,
+                dropout_p=self.attn_drop.p if self.training else 0.0,
+                is_causal=True,
             )
         
+        if torch.isnan(y).any() or torch.isinf(y).any():
+            raise RuntimeError("NaN/Inf in attention output")
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # back to (B,T,C)
         y = self.resid_drop(self.out(y))  # linear out proj
 

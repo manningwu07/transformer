@@ -31,8 +31,8 @@ class BaseConfig:
 
     # Adafactor / LR schedule
     warmup_steps: int = 10_000
-    decay_steps: int = 50_000
-    grad_clip: float = 1.0
+    decay_steps: int = 60_000
+    grad_clip: float = 0.3
 
     # Debug
     debug: bool = True
@@ -63,23 +63,23 @@ class DebugProfile(BaseConfig):
 @dataclass
 class LocalProfile(BaseConfig):
     # target for M4 Pro, ~200M param model training locally
-    seq_len: int = 512
+    seq_len: int = 64
     n_layers: int = 12
     d_model: int = 768
     hidden_size: int = 2048
-    batch_size: int = 16
-    gradAccumSteps: int = 16         # effective batch ~256
-    lr: float = 4e-4
+    batch_size: int = 8
+    gradAccumSteps: int = 2         # effective batch ~256
+    lr: float = 2e-4
     
-    warmup_steps: int = 3_000
-    decay_steps: int = 30_000
-    eval_every_steps: int = 1_000
+    warmup_steps: int = 10_000
+    decay_steps: int = 60_000
+    eval_every_steps: int = 300
     save_every_steps: int = 2_500
     max_batches: int = 250
-    dropout: float = 0.075
-    label_smoothing: float = 0.025
+    dropout: float = 0.0 #0.1
+    label_smoothing: float = 0.0 #0.05
     debug: bool = True
-    debug_every: int = 250
+    debug_every: int = 100
 
 @dataclass
 class LoRAProfile(BaseConfig):
