@@ -174,6 +174,8 @@ def main(args):
         else "cpu"
     )
     
+    print(f"Training on: {device}")
+    
     # ---- Load prebuilt bad token IDs (for generation masking) ----
     BAD_PATH = os.path.join("data", "json", "bad_ids.json")
     if os.path.exists(BAD_PATH):
@@ -185,12 +187,8 @@ def main(args):
         BAD_IDS = []
         print(f"⚠️  bad_ids.json not found at {BAD_PATH} (generation mask will be empty)")
 
-    print(f"Training on: {device}")
-
     # Remove any accidental duplicates (keep ordering stable)
     BAD_IDS = list(dict.fromkeys(BAD_IDS))
-
-    print(f"Training on: {device}")
 
     # ---- Load vocab ----
     tok2id, id2tok = load_vocab(args.vocab)
@@ -268,7 +266,7 @@ def main(args):
                 min_lr=Config.epsilon,
             )
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        global_step = 0 # ckpt.get("step", 0)
+        global_step = ckpt.get("step", 0)
         print(f"✔️ Resumed at step {global_step} (best_val_loss={best_val_loss:.4f})")
 
     # --- Eval-only mode ---

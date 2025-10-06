@@ -14,7 +14,7 @@ class BaseConfig:
     seq_len: int = 64          # training context length (shorter = less memory)
     max_len: int = 1024         # generation max context
     n_layers: int = 12         # number of transformer blocks
-    lr: float = 1e-3           # base learning rate (may be overridden per profile)
+    lr: float = 6e-4           # base learning rate (may be overridden per profile)
 
     # Optimization & scheduling
     max_epochs: int = 3
@@ -30,8 +30,8 @@ class BaseConfig:
     dropout: float = 0.0
 
     # Adafactor / LR schedule
-    warmup_steps: int = 1_000
-    decay_steps: int = 5_000
+    warmup_steps: int = 10_000
+    decay_steps: int = 50_000
     grad_clip: float = 1.0
 
     # Debug
@@ -69,16 +69,16 @@ class LocalProfile(BaseConfig):
     hidden_size: int = 2048
     batch_size: int = 16
     gradAccumSteps: int = 16         # effective batch ~256
-    lr: float = 6e-4
+    lr: float = 4e-4
     
-    warmup_steps: int = 10_000
-    decay_steps: int = 200_000
-    eval_every_steps: int = 2_500
-    save_every_steps: int = 10_000
+    warmup_steps: int = 3_000
+    decay_steps: int = 30_000
+    eval_every_steps: int = 1_000
+    save_every_steps: int = 2_500
     max_batches: int = 250
-    dropout: float = 0.1
-    label_smoothing: float = 0.0
-    debug: bool = False
+    dropout: float = 0.075
+    label_smoothing: float = 0.025
+    debug: bool = True
     debug_every: int = 250
 
 @dataclass

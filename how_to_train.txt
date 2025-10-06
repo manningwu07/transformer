@@ -11,7 +11,7 @@ python3 dataExtraction/makeDataset.py
 To get vocab
 
 Next, train on python
-python3 train.py --train data/test/wiki_train_ids --test data/test/wiki_eval_ids --val data/test/wiki_val_ids --vocab data/test/vocab.json
+python3 train.py
 
 
 Open up connection between the 2:

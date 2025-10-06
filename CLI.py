@@ -2,7 +2,7 @@
 import requests
 from tokenizers import Tokenizer
 
-tokenizer = Tokenizer.from_file("data/test/tokenizer.json")
+tokenizer = Tokenizer.from_file("data/json/tokenizer.json")
 url = "http://127.0.0.1:8000/generate"
 
 while True:
