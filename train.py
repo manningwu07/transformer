@@ -217,17 +217,29 @@ def main(args):
         max_len=Config.max_len
     ).to(device)
     
-    with torch.no_grad():
-        model.head.weight = model.tok_emb.weight
+    tie_weight = model.tok_emb.weight
+    del model.head.weight
+    model.head.register_parameter("weight", torch.nn.Parameter(tie_weight))
+    print("✅ weight tied (shared param object)")
 
+    # Either tie the weights or use torch.compile on max autotune
+    # Reason for this is bc torch.compile will change the weight storage causing the tied weights to no longer be tied
     try:
         model = torch.compile(model, mode="max-autotune")
         print("✅ torch.compile enabled")
     except Exception as e:
         print("⚠️ torch.compile not available:", e)
 
+    # ✅ Filter out one of the duplicates so optimizer sees it once
+    unique_params = []
+    seen_ptrs = set()
+    for p in model.parameters():
+        if p.data_ptr() not in seen_ptrs:
+            unique_params.append(p)
+            seen_ptrs.add(p.data_ptr())
+
     optimizer = Adafactor(
-        model.parameters(),
+        unique_params,
         relative_step=False,
         scale_parameter=False,
         warmup_init=False,
@@ -338,6 +350,8 @@ def main(args):
                     scaler.update()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    # with torch.no_grad():
+                    #     model.head.weight = model.tok_emb.weight
             else:
                 loss.backward()
                 if (global_step + 1) % Config.gradAccumSteps == 0:
@@ -345,14 +359,21 @@ def main(args):
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
+                    with torch.no_grad():
+                        model.head.weight = model.tok_emb.weight
+    
             global_step += 1
+            if global_step < 5:
+                print("Tok loss:", loss.item(), "logits std:", logits.std().item())
             with torch.no_grad():
+                print("logits std:", logits.std().item())
                 valid = (y != pad_id).sum().item()
                 # loss.item() is mean CE / gradAccumSteps; undo the division:
                 mean_ce = loss.item() * Config.gradAccumSteps
                 total_loss_sum += mean_ce * valid
                 total_tokens += valid
-
+            
+            # ---- Logging ----
             if Config.debug and global_step % Config.debug_every == 0:
                 avg_tok_loss = total_loss_sum / total_tokens
                 print(f"Step {global_step} - Train tokLoss={avg_tok_loss:.4f}")

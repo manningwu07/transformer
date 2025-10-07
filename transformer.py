@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lora import LoRALinear
+from lora.lora import LoRALinear
 from params import Config
 
 
@@ -171,6 +171,8 @@ class GPT2LikeLM(nn.Module):
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.max_len = max_len
+        
+        self.logits_scale = math.sqrt(d_model)
     
     def forward(self, idx, past_kvs=None):
         B, T = idx.size()
@@ -187,7 +189,7 @@ class GPT2LikeLM(nn.Module):
             x, present = block(x, past)
             new_kvs.append(present)
         x = self.ln_f(x)
-        logits = self.head(x)
+        logits = self.head(x) / self.logits_scale
         return logits, new_kvs
 
     @torch.no_grad()

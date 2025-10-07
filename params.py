@@ -67,8 +67,8 @@ class LocalProfile(BaseConfig):
     n_layers: int = 12
     d_model: int = 768
     hidden_size: int = 2048
-    batch_size: int = 16
-    gradAccumSteps: int = 16         # effective batch ~256
+    batch_size: int = 2 #16
+    gradAccumSteps: int = 2 #16         # effective batch ~256
     lr: float = 5e-4
     
     warmup_steps: int = 10_000
@@ -76,10 +76,10 @@ class LocalProfile(BaseConfig):
     eval_every_steps: int = 2_000
     save_every_steps: int = 10_000
     max_batches: int = 250
-    dropout: float = 0.1
-    label_smoothing: float = 0.05
+    dropout: float = 0.0 #0.1
+    label_smoothing: float = 0.0 # 0.05
     debug: bool = True
-    debug_every: int = 250
+    debug_every: int = 25
 
 @dataclass
 class LoRAProfile(BaseConfig):
