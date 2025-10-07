@@ -217,6 +217,9 @@ def main(args):
         max_len=Config.max_len
     ).to(device)
     
+    with torch.no_grad():
+        model.head.weight = model.tok_emb.weight
+
     try:
         model = torch.compile(model, mode="max-autotune")
         print("✅ torch.compile enabled")

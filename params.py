@@ -18,7 +18,7 @@ class BaseConfig:
 
     # Optimization & scheduling
     max_epochs: int = 3
-    patience: int = 3
+    patience: int = 4
     improvement_threshold: float = 0.1
     batch_size: int = 24
     epsilon: float = 1e-5
@@ -69,12 +69,12 @@ class LocalProfile(BaseConfig):
     hidden_size: int = 2048
     batch_size: int = 16
     gradAccumSteps: int = 16         # effective batch ~256
-    lr: float = 7e-4
+    lr: float = 5e-4
     
     warmup_steps: int = 10_000
     decay_steps: int = 60_000
     eval_every_steps: int = 2_000
-    save_every_steps: int = 5_000
+    save_every_steps: int = 10_000
     max_batches: int = 250
     dropout: float = 0.1
     label_smoothing: float = 0.05
