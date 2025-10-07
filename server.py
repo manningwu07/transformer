@@ -44,6 +44,9 @@ model.load_state_dict(state, strict=False)
 model.eval()
 model.eos_id = eos_id
 
+model.load_state_dict(state, strict=False)
+model.head.weight = model.tok_emb.weight
+
 # ---------- FastAPI ----------
 app = FastAPI()
 

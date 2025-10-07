@@ -31,6 +31,10 @@ model = GPT2LikeLM(vocab_size=vocab_size,
 model.load_state_dict(state, strict=False)
 model.eval()
 
+model.load_state_dict(state, strict=False)
+model.head.weight = model.tok_emb.weight
+    
+
 # tokenize
 enc = tok.encode(args.prompt)
 ids = [tok.token_to_id("<bos>")] + enc.ids

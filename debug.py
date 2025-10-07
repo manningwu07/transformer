@@ -1,6 +1,6 @@
 import torch
 
-device = "cpu" if torch.backends.mps.is_available() else "cpu"
+device = "mps" if torch.backends.mps.is_available() else "cpu"
 print("Using device:", device)
 
 # Pure float32 (no autocast)

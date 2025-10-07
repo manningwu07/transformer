@@ -7,7 +7,6 @@ import struct
 import numpy as np
 from tokenizers import Tokenizer
 from tqdm import tqdm
-import re
 
 def open_w(wdir, split):
     return {"bin": None, "idx": None, "shard_id": 0, "cur": 0, "dir": wdir, "split": split}

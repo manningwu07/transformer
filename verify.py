@@ -31,6 +31,7 @@ def verifyModel():
         d_ff=Config.hidden_size,
         max_len=Config.max_len
     )
+    
 
     model.load_state_dict(model_state, strict=False)
     model.eval()

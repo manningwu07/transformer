@@ -32,7 +32,7 @@ class BaseConfig:
     # Adafactor / LR schedule
     warmup_steps: int = 10_000
     decay_steps: int = 60_000
-    grad_clip: float = 0.3
+    grad_clip: float = 0.5
 
     # Debug
     debug: bool = True
@@ -67,19 +67,19 @@ class LocalProfile(BaseConfig):
     n_layers: int = 12
     d_model: int = 768
     hidden_size: int = 2048
-    batch_size: int = 8
+    batch_size: int = 2
     gradAccumSteps: int = 2         # effective batch ~256
-    lr: float = 2e-4
+    lr: float = 3e-4
     
     warmup_steps: int = 10_000
     decay_steps: int = 60_000
-    eval_every_steps: int = 300
-    save_every_steps: int = 2_500
+    eval_every_steps: int = 100 # 2_000
+    save_every_steps: int = 5_000
     max_batches: int = 250
-    dropout: float = 0.0 #0.1
-    label_smoothing: float = 0.0 #0.05
+    dropout: float = 0.1
+    label_smoothing: float = 0.05
     debug: bool = True
-    debug_every: int = 100
+    debug_every: int = 25
 
 @dataclass
 class LoRAProfile(BaseConfig):

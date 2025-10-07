@@ -171,11 +171,9 @@ class GPT2LikeLM(nn.Module):
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.max_len = max_len
-            
-        # --- Tie token embedding & output head ---
-        self.head.weight = self.tok_emb.weight
+        
+        self.head.weight = self.tok_emb.weight  # weight tying
     
-
     def forward(self, idx, past_kvs=None):
         B, T = idx.size()
         past_len = 0

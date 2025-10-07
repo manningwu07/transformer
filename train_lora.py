@@ -36,6 +36,9 @@ def main(args):
         dropout=Config.dropout,
         max_len=Config.max_len
     ).to(device)
+    
+    model.load_state_dict(state, strict=False)
+    model.head.weight = model.tok_emb.weight
 
     # --- Load base weights ---
     ckpt = torch.load(args.resumePath, map_location=device)
