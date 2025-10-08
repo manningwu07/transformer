@@ -151,7 +151,7 @@ class TransformerBlock(nn.Module):
             return x, present
 
 
-class GPT2LikeLM(nn.Module):
+class LLM(nn.Module):
     def __init__(
         self,
         vocab_size,
@@ -165,6 +165,7 @@ class GPT2LikeLM(nn.Module):
         super().__init__()
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_len, d_model)
+
         self.blocks = nn.ModuleList(
             [TransformerBlock(d_model, n_heads, d_ff, dropout, max_len, return_present=False) for _ in range(n_layers)]
         )
@@ -172,7 +173,9 @@ class GPT2LikeLM(nn.Module):
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.max_len = max_len
         
-        self.logits_scale = math.sqrt(d_model)
+        # Stabilize the initial logits (GPT does this too) -- prevents inital logits explosion
+        torch.nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
+        torch.nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
     
     def forward(self, idx, past_kvs=None):
         B, T = idx.size()
@@ -189,7 +192,7 @@ class GPT2LikeLM(nn.Module):
             x, present = block(x, past)
             new_kvs.append(present)
         x = self.ln_f(x)
-        logits = self.head(x) / self.logits_scale
+        logits = self.head(x) / math.sqrt(x.size(-1))
         return logits, new_kvs
 
     @torch.no_grad()

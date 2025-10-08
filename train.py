@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from eval import evaluate
-from transformer import GPT2LikeLM
+from transformer import LLM
 from params import Config
 from transformers import Adafactor
 
@@ -103,14 +103,13 @@ def load_vocab(path):
 # Checkpoint helpers
 # --------------------
 
-def save_model_state(model, optimizer, scheduler, step, path, msg=""):
+def save_model_state(model, optimizer, step, path, msg=""):
     print("Saving model state...")
     torch.save(
         {
             "step": step,
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict() if scheduler else None,
             "best_val_loss": best_val_loss,
         },
         path,
@@ -119,32 +118,18 @@ def save_model_state(model, optimizer, scheduler, step, path, msg=""):
 
 
 def crash_handler(sig, frame):
-    global model, optimizer, scheduler, global_step
+    global model, optimizer, opt_step
     if model is not None:
         os.makedirs("models", exist_ok=True)
         save_model_state(
             model,
             optimizer,
-            scheduler,
-            global_step,
+            opt_step,
             "models/curr_model.pt",
             "CURRENT MODEL (crash-save)",
         )
     sys.exit(0)
 
-
-# --------------------
-# Scheduler
-# --------------------
-
-def get_lr_scheduler(optimizer, warmup_steps, total_steps, min_lr=1e-8):
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return float(step) / float(max(1, warmup_steps))
-        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        return max(min_lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # --------------------
@@ -154,12 +139,11 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, min_lr=1e-8):
 best_val_loss = float("inf")
 model = None
 optimizer = None
-scheduler = None
-global_step = 0
+opt_step = 0
 
 
 def main(args):
-    global model, optimizer, scheduler, best_val_loss, global_step
+    global model, optimizer, best_val_loss
     torch.set_num_threads(os.cpu_count() - 2 if os.cpu_count() > 2 else 0)
 
     # Handle Ctrl-C / SIGTERM
@@ -207,7 +191,7 @@ def main(args):
     test_loader  = DataLoader(test_ds,  batch_size=Config.batch_size, num_workers=1, pin_memory=pin)
 
     # ---- Model ----
-    model = GPT2LikeLM(
+    model = LLM(
         vocab_size=vocab_size,
         d_model=Config.d_model,
         n_heads=Config.num_heads,
@@ -240,17 +224,10 @@ def main(args):
 
     optimizer = Adafactor(
         unique_params,
-        relative_step=False,
-        scale_parameter=False,
-        warmup_init=False,
-        lr=Config.lr
-    )
-
-    scheduler = get_lr_scheduler(
-        optimizer,
-        Config.warmup_steps,
-        args.max_steps,
-        min_lr=Config.epsilon,
+        relative_step=True,
+        scale_parameter=True,
+        warmup_init=True,
+        lr=None
     )
         
     # ---- Resume ----
@@ -269,27 +246,18 @@ def main(args):
         if not args.override_hparams:
             if "optimizer_state" in ckpt:
                 optimizer.load_state_dict(ckpt["optimizer_state"])
-            if ckpt.get("scheduler_state") and scheduler:
-                scheduler.load_state_dict(ckpt["scheduler_state"])
         else:
-            print("⚡ Overriding hyperparameters: using new optimizer/scheduler")
-            # re-init optimizer, scheduler with current Config
+            print("⚡ Overriding hyperparameters: using new optimizer")
             optimizer = Adafactor(
-                model.parameters(),
-                relative_step=False,
-                scale_parameter=False,
-                warmup_init=False,
-                lr=Config.lr
-            )
-            scheduler = get_lr_scheduler(
-                optimizer,
-                Config.warmup_steps,
-                args.max_steps,
-                min_lr=Config.epsilon,
-            )
+                unique_params,
+                relative_step=True,
+                scale_parameter=True,
+                warmup_init=True,
+                lr=None
+            )            
+            
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        global_step = ckpt.get("step", 0)
-        print(f"✔️ Resumed at step {global_step} (best_val_loss={best_val_loss:.4f})")
+        print(f"✔️ Resumed at tokNum {tokens_per_opt:.3E} (best_val_loss={best_val_loss:.4f})")
 
     # --- Eval-only mode ---
     if args.evalPath and os.path.exists(args.evalPath) and args.evalSubset > 0:
@@ -325,8 +293,16 @@ def main(args):
     print("head ptr :", model.head.weight.data_ptr())
     print("tok_emb ptr:", model.tok_emb.weight.data_ptr())
     print("shared   :", model.head.weight.data_ptr() == model.tok_emb.weight.data_ptr())
+    
+    tokens_per_opt = Config.batch_size * Config.seq_len * Config.gradAccumSteps
+    Config.tokens_per_opt_step = tokens_per_opt
+    print(f"Tokens per optimizer step: {tokens_per_opt:,}")
 
-    while global_step < args.max_steps:
+    # Compute equivalent warm‑up steps just for info
+    warmup_equiv = int(Config.target_warmup_tokens / tokens_per_opt)
+    print(f"≈ {warmup_equiv:,} optimizer steps ≈ {Config.target_warmup_tokens:.2e} target warm-up tokens")
+
+    while opt_step < args.max_steps:
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             criterion = torch.nn.CrossEntropyLoss(
@@ -337,50 +313,69 @@ def main(args):
             
             with torch.autocast(device_type=device, dtype=amp_dtype):
                     logits, _ = model(x)
-                    loss = criterion(logits.view(-1, vocab_size),
-                                    y.view(-1)) / Config.gradAccumSteps
+                    # True token-level CE (use this for debug/logging only)
+                    ce_loss = criterion(
+                        logits.view(-1, vocab_size), y.view(-1)
+                    )
+                    loss = ce_loss / Config.gradAccumSteps
 
             # --- AMP + grad accumulation ---
             if device == "cuda":
                 scaler.scale(loss).backward()
-                if (global_step + 1) % Config.gradAccumSteps == 0:
+                if (opt_step * Config.gradAccumSteps + 1) % Config.gradAccumSteps == 0:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
                     scaler.step(optimizer)
                     scaler.update()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    # with torch.no_grad():
-                    #     model.head.weight = model.tok_emb.weight
-            else:
-                loss.backward()
-                if (global_step + 1) % Config.gradAccumSteps == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
-                    optimizer.step()
-                    scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     with torch.no_grad():
                         model.head.weight = model.tok_emb.weight
-    
-            global_step += 1
-            if global_step < 5:
-                print("Tok loss:", loss.item(), "logits std:", logits.std().item())
+                    opt_step += 1
+                    tokens_seen += tokens_per_opt
+            else:
+                loss.backward()
+                if (opt_step * Config.gradAccumSteps + 1) % Config.gradAccumSteps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    with torch.no_grad():
+                        model.head.weight = model.tok_emb.weight
+                    opt_step += 1
+                    tokens_seen += tokens_per_opt
+            
             with torch.no_grad():
-                print("logits std:", logits.std().item())
                 valid = (y != pad_id).sum().item()
                 # loss.item() is mean CE / gradAccumSteps; undo the division:
-                mean_ce = loss.item() * Config.gradAccumSteps
+                mean_ce = ce_loss.item()
                 total_loss_sum += mean_ce * valid
                 total_tokens += valid
             
             # ---- Logging ----
-            if Config.debug and global_step % Config.debug_every == 0:
-                avg_tok_loss = total_loss_sum / total_tokens
-                print(f"Step {global_step} - Train tokLoss={avg_tok_loss:.4f}")
-                total_loss_sum, total_tokens = 0.0, 0
+            if Config.debug and opt_step % Config.debug_every == 0 and opt_step > 0:
+                avg_tok_loss = total_loss_sum / max(1, total_tokens)
+                grads = [p.grad.norm() for p in model.parameters() if p.grad is not None]
+                total_norm = torch.norm(torch.stack(grads)) if grads else torch.tensor(0.0)
+
+                # 🔍 Debug: also print gradient norms and Adafactor LR if available
+                try:
+                    lr_val = optimizer._get_lr(None, None)
+                except Exception:
+                    lr_val = None
+
+                print(
+                    f"[DEBUG] opt_step={opt_step:<6d}  "
+                    f"tokens_seen={tokens_seen:.3e}  "
+                    f"tokLoss={avg_tok_loss:.4f}  "
+                    f"grad_norm={total_norm.item():.3f}  lr={lr_val}"
+                )
+                total_loss_sum, total_tokens = 0.0, 0.0
+                
+            if opt_step % 50 == 0:
+                lr_cur = optimizer._get_lr(None, None)
+                print(f"[LR debug] opt_step={opt_step},  adafactor_lr={lr_cur}")
 
             # ---- Validation ----
-            if global_step % args.eval_every_steps == 0:
+            if (opt_step > 0) and (opt_step % args.eval_every_steps == 0):
                 val_loss = evaluate(
                     model,
                     val_loader,
@@ -394,7 +389,7 @@ def main(args):
                 if val_loss < best_val_loss - Config.improvement_threshold:
                     best_val_loss = val_loss
                     noImprovement = 0
-                    save_model_state(model, optimizer, scheduler, global_step, "models/best_model.pt", "Best")
+                    save_model_state(model, optimizer, opt_step, "models/best_model.pt", "Best")
                 else:
                     noImprovement += 1
                     print(f"No improvement. Patience {noImprovement}/{Config.patience}")
@@ -404,12 +399,15 @@ def main(args):
                 model.train()
 
             # ---- Save ----
-            if global_step % args.save_every_steps == 0:
+            if opt_step > 0 and (opt_step % args.save_every_steps == 0):
                 os.makedirs("models", exist_ok=True)
-                save_model_state(model, optimizer, scheduler, global_step, "models/last_save_state.pt", f"Step {global_step}")
-
-            if global_step >= args.max_steps:
-                break
+                save_model_state(
+                    model,
+                    optimizer,
+                    opt_step,
+                    "models/last_save_state.pt",
+                    f"opt_step {opt_step}",
+                )
 
     # ---- Final test evaluation ----
     test_loss = evaluate(
@@ -430,7 +428,7 @@ if __name__ == "__main__":
 
     # defaults pulled from Config
     parser.add_argument("--lr", type=float, default=Config.lr)
-    parser.add_argument("--max_steps", type=int, default=Config.decay_steps)
+    parser.add_argument("--max_steps", type=int, default=3000) # 3b tokens
     parser.add_argument("--eval_every_steps", type=int, default=Config.eval_every_steps)
     parser.add_argument("--save_every_steps", type=int, default=Config.save_every_steps)
 

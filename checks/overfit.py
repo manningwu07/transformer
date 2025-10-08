@@ -4,7 +4,7 @@ from tokenizers import Tokenizer
 import torch, json
 from torch.utils.data import DataLoader
 import numpy as np
-from transformer import GPT2LikeLM
+from transformer import LLM
 from params import Config
 
 def collate_fn(batch, pad_id):
@@ -43,7 +43,7 @@ def main():
     ds = PackedDataset("data/shards/val", pad_id, max_samples=8)
     loader = DataLoader(ds, batch_size=2, shuffle=False, collate_fn=lambda b: collate_fn(b,pad_id))
 
-    model=GPT2LikeLM(
+    model=LLM(
         vocab_size=len(vocab["IDToToken"]),
         d_model=Config.d_model,
         n_heads=Config.num_heads,

@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import torch
 import torch.nn.functional as F
-from transformer import GPT2LikeLM
+from transformer import LLM
 from params import Config
 import json
 from tokenizers import Tokenizer as HFTokenizer
@@ -30,7 +30,7 @@ hf_tok = HFTokenizer.from_file(TOK_PATH)
 
 # ---------- Model ----------
 vocab_size = len(id2tok)
-model = GPT2LikeLM(
+model = LLM(
     vocab_size=vocab_size,
     d_model=Config.d_model,
     n_heads=Config.num_heads,

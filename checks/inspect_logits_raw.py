@@ -1,7 +1,7 @@
 # inspect_logits_raw.py
 import torch, json
 from tokenizers import Tokenizer
-from transformer import GPT2LikeLM
+from transformer import LLM
 from params import Config
 
 ckpt_path = "models/best_model.pt"
@@ -16,7 +16,7 @@ vocab_size = len(vocab["IDToToken"])
 ckpt = torch.load(ckpt_path, map_location="cpu")
 state = ckpt.get("model_state", ckpt)
 
-model = GPT2LikeLM(
+model = LLM(
     vocab_size=vocab_size,
     d_model=Config.d_model,
     n_heads=Config.num_heads,

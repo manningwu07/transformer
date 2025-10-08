@@ -2,7 +2,7 @@ import argparse
 import numpy as np
 import json
 import torch
-from transformer import GPT2LikeLM
+from transformer import LLM
 from params import Config
 
 
@@ -23,7 +23,7 @@ def verifyModel():
     model_state = ckpt.get("model_state", ckpt)  # support raw state_dict
 
     # Build model with config
-    model = GPT2LikeLM(
+    model = LLM(
         vocab_size=vocab_size,
         d_model=Config.d_model,
         n_heads=Config.num_heads,

@@ -1,7 +1,7 @@
 # inspect_logits.py
 import argparse, torch, json, numpy as np
 from tokenizers import Tokenizer
-from transformer import GPT2LikeLM
+from transformer import LLM
 
 def stats(t):
     return dict(min=float(t.min()), max=float(t.max()), mean=float(t.mean()), std=float(t.std()), nan=bool(torch.isnan(t).any()), inf=bool(torch.isinf(t).any()))
@@ -22,7 +22,7 @@ ckpt = torch.load(args.ckpt, map_location="cpu")
 state = ckpt.get("model_state", ckpt)
 # Build model with your Config; adjust if your params module is named differently
 from params import Config
-model = GPT2LikeLM(vocab_size=vocab_size,
+model = LLM(vocab_size=vocab_size,
                    d_model=Config.d_model,
                    n_heads=Config.num_heads,
                    n_layers=Config.n_layers,

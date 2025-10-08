@@ -14,7 +14,7 @@ class BaseConfig:
     seq_len: int = 64          # training context length (shorter = less memory)
     max_len: int = 1024         # generation max context
     n_layers: int = 12         # number of transformer blocks
-    lr: float = 6e-4           # base learning rate (may be overridden per profile)
+    lr: float = 3e-4           # base learning rate (may be overridden per profile)
 
     # Optimization & scheduling
     max_epochs: int = 3
@@ -23,20 +23,23 @@ class BaseConfig:
     batch_size: int = 24
     epsilon: float = 1e-5
     gradAccumSteps: int = 24          # effective batch = batch_size * gradAccumSteps
-    eval_every_steps: int = 2_500
+    eval_every_steps: int = 100
     max_batches: int = 250
-    save_every_steps: int = 10_000
+    save_every_steps: int = 500
     label_smoothing: float = 0.0
     dropout: float = 0.0
 
-    # Adafactor / LR schedule
-    warmup_steps: int = 10_000
-    decay_steps: int = 60_000
-    grad_clip: float = 0.5
+    # Adafactor-specific
+    grad_clip: float = 0.9
+    
+    # Token accounting
+    # (dynamic: recomputed in train.py; used for diagnostics/logging only)
+    target_warmup_tokens: float = 2e7  # ≈ 20 M tokens of warmup (1-3% of total token count) 
+    tokens_per_opt_step: int = 0
 
     # Debug
     debug: bool = True
-    debug_every: int = 500
+    debug_every: int = 20
     log_random_sample: bool = False
     random_samples: int = 250
 
@@ -54,8 +57,7 @@ class DebugProfile(BaseConfig):
     eval_every_steps: int = 200
     save_every_steps: int = 1000
     max_batches: int = 50
-    warmup_steps: int = 100
-    decay_steps: int = 1_000
+    
     dropout: float = 0.0
     debug: bool = True
     debug_every: int = 50
@@ -63,23 +65,21 @@ class DebugProfile(BaseConfig):
 @dataclass
 class LocalProfile(BaseConfig):
     # target for M4 Pro, ~200M param model training locally
-    seq_len: int = 64
+    seq_len: int = 1024
     n_layers: int = 12
     d_model: int = 768
     hidden_size: int = 2048
-    batch_size: int = 2 #16
-    gradAccumSteps: int = 2 #16         # effective batch ~256
+    batch_size: int = 18
+    gradAccumSteps: int = 10         # effective batch ~180
     lr: float = 5e-4
     
-    warmup_steps: int = 10_000
-    decay_steps: int = 60_000
-    eval_every_steps: int = 2_000
-    save_every_steps: int = 10_000
+    eval_every_steps: int = 100
+    save_every_steps: int = 500
     max_batches: int = 250
-    dropout: float = 0.0 #0.1
-    label_smoothing: float = 0.0 # 0.05
+    dropout: float = 0.1
+    label_smoothing: float = 0.05
     debug: bool = True
-    debug_every: int = 25
+    debug_every: int = 20
 
 @dataclass
 class LoRAProfile(BaseConfig):
@@ -92,8 +92,6 @@ class LoRAProfile(BaseConfig):
     gradAccumSteps: int = 8          # effective batch = 32
     lr: float = 2e-3                 # LoRA often uses higher LR
     
-    warmup_steps: int = 100
-    decay_steps: int = 3_000
     eval_every_steps: int = 250
     save_every_steps: int = 1_000
     dropout: float = 0.0

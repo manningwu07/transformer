@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import DataLoader
 import numpy as np
 
-from transformer import GPT2LikeLM
+from transformer import LLM
 from params import Config
 from train import IndexedBinaryDataset
 from eval import evaluate
@@ -27,7 +27,7 @@ def main(args):
     val_loader   = DataLoader(val_ds,   batch_size=Config.batch_size, num_workers=1)
 
     # --- Model ---
-    model = GPT2LikeLM(
+    model = LLM(
         vocab_size=vocab_size,
         d_model=Config.d_model,
         n_heads=Config.num_heads,
