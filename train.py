@@ -2,7 +2,6 @@
 import argparse
 import glob
 import json
-import math
 import os
 import random
 import signal
@@ -143,7 +142,7 @@ opt_step = 0
 
 
 def main(args):
-    global model, optimizer, best_val_loss
+    global model, optimizer, best_val_loss, opt_step
     torch.set_num_threads(os.cpu_count() - 2 if os.cpu_count() > 2 else 0)
 
     # Handle Ctrl-C / SIGTERM
@@ -369,10 +368,6 @@ def main(args):
                     f"grad_norm={total_norm.item():.3f}  lr={lr_val}"
                 )
                 total_loss_sum, total_tokens = 0.0, 0.0
-                
-            if opt_step % 50 == 0:
-                lr_cur = optimizer._get_lr(None, None)
-                print(f"[LR debug] opt_step={opt_step},  adafactor_lr={lr_cur}")
 
             # ---- Validation ----
             if (opt_step > 0) and (opt_step % args.eval_every_steps == 0):
@@ -386,6 +381,7 @@ def main(args):
                     max_batches=Config.max_batches,
                     shard_frac=0.003,
                 )
+                
                 if val_loss < best_val_loss - Config.improvement_threshold:
                     best_val_loss = val_loss
                     noImprovement = 0
