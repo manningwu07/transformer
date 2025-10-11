@@ -49,7 +49,14 @@ class IndexedBinaryDataset(torch.utils.data.IterableDataset):
             start, length = idx_arr[j]
             arr = data[start // 4 : start // 4 + length]
             ids = torch.from_numpy(np.array(arr, dtype=np.int64))
-            ids = ids[: self.seq_len]
+            
+            # Takes random slice of the training example
+            if len(ids) > self.seq_len:
+                start = 0
+                if self.shuffle:
+                    start = random.randint(0, len(ids) - self.seq_len)
+                ids = ids[start : start + self.seq_len]
+                
             if len(ids) < self.seq_len:
                 pad = torch.full((self.seq_len - len(ids),), self.pad_id, dtype=torch.long)
                 ids = torch.cat([ids, pad])

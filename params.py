@@ -7,14 +7,14 @@ ACTIVE = "local"
 @dataclass
 class BaseConfig:
     # Core transformer parameters (must match any loaded checkpoint)
-    d_model: int = 768         # model width
-    hidden_size: int = 2048    # MLP hidden dim (typically 2-4x d_model)
+    d_model: int = 512         # model width
+    hidden_size: int = 1536    # MLP hidden dim (typically 2-4x d_model)
     vocab_size: int = 65_536   # |V|
-    num_heads: int = 12        # attention heads (d_model % num_heads == 0)
+    num_heads: int = 8        # attention heads (d_model % num_heads == 0)
     seq_len: int = 64          # training context length (shorter = less memory)
-    max_len: int = 1024         # generation max context
-    n_layers: int = 12         # number of transformer blocks
-    lr: float = 3e-4           # base learning rate (may be overridden per profile)
+    max_len: int = 256         # generation max context
+    n_layers: int = 8         # number of transformer blocks
+    lr: float = 6e-4           # base learning rate (may be overridden per profile)
 
     # Optimization & scheduling
     max_epochs: int = 3
@@ -34,7 +34,7 @@ class BaseConfig:
     
     # Token accounting
     # (dynamic: recomputed in train.py; used for diagnostics/logging only)
-    target_warmup_tokens: float = 2e7  # ≈ 20 M tokens of warmup (1-3% of total token count) 
+    target_warmup_tokens: float = 5e5  # ≈ 500 K tokens of warmup (1-3% of total token count) --- Total count is ~20-50M tokens
     tokens_per_opt_step: int = 0
 
     # Debug
@@ -65,21 +65,21 @@ class DebugProfile(BaseConfig):
 @dataclass
 class LocalProfile(BaseConfig):
     # target for M4 Pro, ~200M param model training locally
-    seq_len: int = 1024
-    n_layers: int = 12
-    d_model: int = 768
-    hidden_size: int = 2048
-    batch_size: int = 5
-    gradAccumSteps: int = 8         # effective batch ~40
-    lr: float = 3e-4
+    seq_len: int = 256
+    n_layers: int = 8
+    d_model: int = 512
+    hidden_size: int = 1536
+    batch_size: int = 16
+    gradAccumSteps: int = 16         # effective batch ~40
+    lr: float = 6e-4
     
-    eval_every_steps: int = 100
-    save_every_steps: int = 250
+    eval_every_steps: int = 250
+    save_every_steps: int = 1000
     max_batches: int = 250
-    dropout: float = 0.1
-    label_smoothing: float = 0.05
+    dropout: float = 0.05
+    label_smoothing: float = 0.025
     debug: bool = True
-    debug_every: int = 25
+    debug_every: int = 100
 
 @dataclass
 class LoRAProfile(BaseConfig):
