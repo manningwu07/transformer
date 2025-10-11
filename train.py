@@ -6,9 +6,11 @@ import os
 import random
 import signal
 import sys
+import time
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+from datetime import datetime
 
 from eval import evaluate
 from transformer import LLM
@@ -149,13 +151,8 @@ def main(args):
     signal.signal(signal.SIGINT, crash_handler)
     signal.signal(signal.SIGTERM, crash_handler)
 
-    device = (
-        "mps"
-        if torch.backends.mps.is_available()
-        else "cuda"
-        if torch.cuda.is_available()
-        else "cpu"
-    )
+    device = "mps"
+    is_mps = device == "mps"
     
     print(f"Training on: {device}")
     
@@ -185,9 +182,18 @@ def main(args):
     test_ds  = IndexedBinaryDataset(args.test,  Config.seq_len, shuffle=False, repeat=False, pad_id=pad_id)
 
     pin = (device == "cuda")
-    train_loader = DataLoader(train_ds, batch_size=Config.batch_size, num_workers=2, pin_memory=pin, persistent_workers=True)
-    val_loader   = DataLoader(val_ds,   batch_size=Config.batch_size, num_workers=1, pin_memory=pin)
-    test_loader  = DataLoader(test_ds,  batch_size=Config.batch_size, num_workers=1, pin_memory=pin)
+    # On macOS/MPS, multiprocessing often hurts more than helps for memmap IO.
+    nw_train = 0 if is_mps else 2
+    nw_eval = 0 if is_mps else 1
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=Config.batch_size,
+        num_workers=nw_train,
+        pin_memory=pin,
+        persistent_workers=False if is_mps else True,
+    )
+    val_loader   = DataLoader(val_ds,   batch_size=Config.batch_size, num_workers=nw_eval, pin_memory=pin)
+    test_loader  = DataLoader(test_ds,  batch_size=Config.batch_size, num_workers=nw_eval, pin_memory=pin)
 
     # ---- Model ----
     model = LLM(
@@ -205,13 +211,15 @@ def main(args):
     model.head.register_parameter("weight", torch.nn.Parameter(tie_weight))
     print("✅ weight tied (shared param object)")
 
-    # Either tie the weights or use torch.compile on max autotune
-    # Reason for this is bc torch.compile will change the weight storage causing the tied weights to no longer be tied
-    # try:
-    #     model = torch.compile(model, mode="max-autotune")
-    #     print("✅ torch.compile enabled")
-    # except Exception as e:
-    #     print("⚠️ torch.compile not available:", e)
+    # Compile helps on CUDA; on MPS it usually hurts (graph breaks, fallbacks).
+    if device == "cuda":
+        try:
+            model = torch.compile(model, mode="max-autotune")
+            print("✅ torch.compile enabled")
+        except Exception as e:
+            print("⚠️ torch.compile not available:", e)
+    else:
+        print("ℹ️ Skipping torch.compile on non-CUDA device")
 
     # ✅ Filter out one of the duplicates so optimizer sees it once
     unique_params = []
@@ -283,6 +291,8 @@ def main(args):
     # ---- Training loop ----
     noImprovement = 0
     tokens_seen = 0
+    steps_done = 0
+    t0 = time.time()
     model.train()
     total_loss_sum, total_tokens = 0.0, 0
     
@@ -317,7 +327,14 @@ def main(args):
                 reduction="mean",
             )
             
-            with torch.autocast(device_type=device, dtype=amp_dtype):
+            # Autocast only on CUDA; MPS autocast support is limited and can be slower.
+            if device == "cuda":
+                ctx = torch.autocast(device_type="cuda", dtype=amp_dtype)
+            else:
+                from contextlib import nullcontext
+                ctx = nullcontext()
+
+            with ctx:
                 logits, _ = model(x)
                 # True token-level CE (use this for debug/logging only)
                 ce_loss = criterion(
@@ -327,45 +344,19 @@ def main(args):
 
             loss.backward()
             if (step_idx + 1) % Config.gradAccumSteps == 0:
-                print(f"Gradient step" + str(opt_step))
                 torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                with torch.no_grad():
-                    model.head.weight = model.tok_emb.weight
                 opt_step += 1
                 tokens_seen += tokens_per_opt
-                
-            # --- AMP + grad accumulation --- (saves compute checks here)
-            # if device == "cuda":
-            #     scaler.scale(loss).backward()
-            #     if (step_idx + 1) % Config.gradAccumSteps == 0:
-            #         scaler.unscale_(optimizer)
-            #         torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
-            #         scaler.step(optimizer)
-            #         scaler.update()
-            #         optimizer.zero_grad(set_to_none=True)
-            #         with torch.no_grad():
-            #             model.head.weight = model.tok_emb.weight
-            #         opt_step += 1
-            #         tokens_seen += tokens_per_opt
-            # else:
-            #     loss.backward()
-            #     if (step_idx + 1) % Config.gradAccumSteps == 0:
-            #         torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
-            #         optimizer.step()
-            #         optimizer.zero_grad(set_to_none=True)
-            #         with torch.no_grad():
-            #             model.head.weight = model.tok_emb.weight
-            #         opt_step += 1
-            #         tokens_seen += tokens_per_opt
-            
-            # with torch.no_grad():
-            #     valid = (y != pad_id).sum().item()
-            #     # loss.item() is mean CE / gradAccumSteps; undo the division:
-            #     mean_ce = ce_loss.item()
-            #     total_loss_sum += mean_ce * valid
-            #     total_tokens += valid
+                steps_done += 1
+
+                # lightweight throughput log
+                if steps_done % 3 == 0:
+                    dt = time.time() - t0
+                    sps = steps_done / max(1e-6, dt)
+                    toks_s = tokens_seen / max(1e-6, dt)
+                    print(f"⏱ {sps:.2f} opt_steps/s, {toks_s:.0f} toks/s (running)")
             
             # ---- Logging ----
             if Config.debug and opt_step % Config.debug_every == 0 and opt_step > 0:
@@ -373,8 +364,9 @@ def main(args):
                 grads = [p.grad.norm() for p in model.parameters() if p.grad is not None]
                 total_norm = torch.norm(torch.stack(grads)) if grads else torch.tensor(0.0)
 
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 print(
-                    f"[DEBUG] opt_step={opt_step:<6d}  "
+                    f"[{now}] [DEBUG] opt_step={opt_step:<6d}  "
                     f"tokens_seen={tokens_seen:.3e}  "
                     f"tokLoss={avg_tok_loss:.4f}  "
                     f"grad_norm={total_norm.item():.3f}"
@@ -436,7 +428,7 @@ if __name__ == "__main__":
 
     # defaults pulled from Config
     parser.add_argument("--lr", type=float, default=Config.lr)
-    parser.add_argument("--max_steps", type=int, default=3000) # 3b tokens
+    parser.add_argument("--max_steps", type=int, default=12000) # 3b tokens
     parser.add_argument("--eval_every_steps", type=int, default=Config.eval_every_steps)
     parser.add_argument("--save_every_steps", type=int, default=Config.save_every_steps)
 

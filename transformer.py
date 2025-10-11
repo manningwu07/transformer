@@ -132,12 +132,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, x, past_kv=None):
         if self.return_present == False:
-            # checkpoint saves memory – only need y ("a")
-            a = torch.utils.checkpoint.checkpoint(
-                lambda t: self.attn(self.ln1(t), past_kv),
-                x,
-                use_reentrant=False,
-            )
+            a = self.attn(self.ln1(x), past_kv)
             x = x + a
             m = torch.utils.checkpoint.checkpoint(self.mlp, self.ln2(x), use_reentrant=False)
             x = x + m
