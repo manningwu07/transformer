@@ -138,7 +138,7 @@ def crash_handler(sig, frame):
 best_val_loss = float("inf")
 model = None
 optimizer = None
-opt_step = 0
+opt_step = 1
 
 
 def main(args):
@@ -207,11 +207,11 @@ def main(args):
 
     # Either tie the weights or use torch.compile on max autotune
     # Reason for this is bc torch.compile will change the weight storage causing the tied weights to no longer be tied
-    try:
-        model = torch.compile(model, mode="max-autotune")
-        print("✅ torch.compile enabled")
-    except Exception as e:
-        print("⚠️ torch.compile not available:", e)
+    # try:
+    #     model = torch.compile(model, mode="max-autotune")
+    #     print("✅ torch.compile enabled")
+    # except Exception as e:
+    #     print("⚠️ torch.compile not available:", e)
 
     # ✅ Filter out one of the duplicates so optimizer sees it once
     unique_params = []
@@ -282,6 +282,7 @@ def main(args):
 
     # ---- Training loop ----
     noImprovement = 0
+    tokens_seen = 0
     model.train()
     total_loss_sum, total_tokens = 0.0, 0
     
@@ -289,6 +290,7 @@ def main(args):
     amp_dtype = torch.bfloat16 if device == "mps" else torch.float16
     scaler = torch.cuda.amp.GradScaler("cuda") if device == "cuda" else None
     
+    # Ensure weight tied after scaler init (in case it changes storage)
     print("head ptr :", model.head.weight.data_ptr())
     print("tok_emb ptr:", model.tok_emb.weight.data_ptr())
     print("shared   :", model.head.weight.data_ptr() == model.tok_emb.weight.data_ptr())
@@ -302,7 +304,12 @@ def main(args):
     print(f"≈ {warmup_equiv:,} optimizer steps ≈ {Config.target_warmup_tokens:.2e} target warm-up tokens")
 
     while opt_step < args.max_steps:
-        for x, y in train_loader:
+        for step_idx, (x, y) in enumerate(train_loader):
+            x, y = x.to(device), y.to(device)
+            # Sanity check
+            # if step_idx % 1 == 0 and opt_step < 3:
+            #     print(f"Step {step_idx}: x.device={x.device}, model.device={next(model.parameters()).device}, opt_step={opt_step}")
+    
             x, y = x.to(device), y.to(device)
             criterion = torch.nn.CrossEntropyLoss(
                 ignore_index=pad_id,
@@ -311,43 +318,54 @@ def main(args):
             )
             
             with torch.autocast(device_type=device, dtype=amp_dtype):
-                    logits, _ = model(x)
-                    # True token-level CE (use this for debug/logging only)
-                    ce_loss = criterion(
-                        logits.view(-1, vocab_size), y.view(-1)
-                    )
-                    loss = ce_loss / Config.gradAccumSteps
+                logits, _ = model(x)
+                # True token-level CE (use this for debug/logging only)
+                ce_loss = criterion(
+                    logits.view(-1, vocab_size), y.view(-1)
+                )
+                loss = ce_loss / Config.gradAccumSteps
 
-            # --- AMP + grad accumulation ---
-            if device == "cuda":
-                scaler.scale(loss).backward()
-                if (opt_step * Config.gradAccumSteps + 1) % Config.gradAccumSteps == 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
-                    with torch.no_grad():
-                        model.head.weight = model.tok_emb.weight
-                    opt_step += 1
-                    tokens_seen += tokens_per_opt
-            else:
-                loss.backward()
-                if (opt_step * Config.gradAccumSteps + 1) % Config.gradAccumSteps == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
-                    optimizer.step()
-                    optimizer.zero_grad(set_to_none=True)
-                    with torch.no_grad():
-                        model.head.weight = model.tok_emb.weight
-                    opt_step += 1
-                    tokens_seen += tokens_per_opt
+            loss.backward()
+            if (step_idx + 1) % Config.gradAccumSteps == 0:
+                print(f"Gradient step" + str(opt_step))
+                torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                with torch.no_grad():
+                    model.head.weight = model.tok_emb.weight
+                opt_step += 1
+                tokens_seen += tokens_per_opt
+                
+            # --- AMP + grad accumulation --- (saves compute checks here)
+            # if device == "cuda":
+            #     scaler.scale(loss).backward()
+            #     if (step_idx + 1) % Config.gradAccumSteps == 0:
+            #         scaler.unscale_(optimizer)
+            #         torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
+            #         scaler.step(optimizer)
+            #         scaler.update()
+            #         optimizer.zero_grad(set_to_none=True)
+            #         with torch.no_grad():
+            #             model.head.weight = model.tok_emb.weight
+            #         opt_step += 1
+            #         tokens_seen += tokens_per_opt
+            # else:
+            #     loss.backward()
+            #     if (step_idx + 1) % Config.gradAccumSteps == 0:
+            #         torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
+            #         optimizer.step()
+            #         optimizer.zero_grad(set_to_none=True)
+            #         with torch.no_grad():
+            #             model.head.weight = model.tok_emb.weight
+            #         opt_step += 1
+            #         tokens_seen += tokens_per_opt
             
-            with torch.no_grad():
-                valid = (y != pad_id).sum().item()
-                # loss.item() is mean CE / gradAccumSteps; undo the division:
-                mean_ce = ce_loss.item()
-                total_loss_sum += mean_ce * valid
-                total_tokens += valid
+            # with torch.no_grad():
+            #     valid = (y != pad_id).sum().item()
+            #     # loss.item() is mean CE / gradAccumSteps; undo the division:
+            #     mean_ce = ce_loss.item()
+            #     total_loss_sum += mean_ce * valid
+            #     total_tokens += valid
             
             # ---- Logging ----
             if Config.debug and opt_step % Config.debug_every == 0 and opt_step > 0:
@@ -355,17 +373,11 @@ def main(args):
                 grads = [p.grad.norm() for p in model.parameters() if p.grad is not None]
                 total_norm = torch.norm(torch.stack(grads)) if grads else torch.tensor(0.0)
 
-                # 🔍 Debug: also print gradient norms and Adafactor LR if available
-                try:
-                    lr_val = optimizer._get_lr(None, None)
-                except Exception:
-                    lr_val = None
-
                 print(
                     f"[DEBUG] opt_step={opt_step:<6d}  "
                     f"tokens_seen={tokens_seen:.3e}  "
                     f"tokLoss={avg_tok_loss:.4f}  "
-                    f"grad_norm={total_norm.item():.3f}  lr={lr_val}"
+                    f"grad_norm={total_norm.item():.3f}"
                 )
                 total_loss_sum, total_tokens = 0.0, 0.0
 
