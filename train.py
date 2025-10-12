@@ -15,7 +15,10 @@ from datetime import datetime
 from eval import evaluate
 from transformer import LLM
 from params import Config
-from transformers import Adafactor
+# from transformers import Adafactor
+# from transformers.optimization import get_constant_schedule_with_warmup
+from torch.optim import AdamW
+
 
 # --------------------
 # Dataset utilities
@@ -48,18 +51,19 @@ class IndexedBinaryDataset(torch.utils.data.IterableDataset):
         for j in order:
             start, length = idx_arr[j]
             arr = data[start // 4 : start // 4 + length]
-            ids = torch.from_numpy(np.array(arr, dtype=np.int64))
-            
-            # Takes random slice of the training example
+            ids = torch.from_numpy(arr.astype(np.int64))
+            # Random 256 window when longer
             if len(ids) > self.seq_len:
-                start = 0
+                start_off = 0
                 if self.shuffle:
-                    start = random.randint(0, len(ids) - self.seq_len)
-                ids = ids[start : start + self.seq_len]
-                
-            if len(ids) < self.seq_len:
-                pad = torch.full((self.seq_len - len(ids),), self.pad_id, dtype=torch.long)
-                ids = torch.cat([ids, pad])
+                    start_off = random.randint(0, len(ids) - self.seq_len)
+                ids = ids[start_off : start_off + self.seq_len]
+            else:
+                if len(ids) < self.seq_len:
+                    pad = torch.full(
+                        (self.seq_len - len(ids),), self.pad_id, dtype=torch.long
+                    )
+                    ids = torch.cat([ids, pad])
             yield ids[:-1], ids[1:]
 
     def __iter__(self):
@@ -213,10 +217,11 @@ def main(args):
         max_len=Config.max_len
     ).to(device)
     
-    tie_weight = model.tok_emb.weight
-    del model.head.weight
-    model.head.register_parameter("weight", torch.nn.Parameter(tie_weight))
-    print("✅ weight tied (shared param object)")
+    # Proper weight tying: use the SAME Parameter object (no duplicate grads)
+    model.head.weight = model.tok_emb.weight
+    assert model.head.weight is model.tok_emb.weight
+    assert model.head.weight.data_ptr() == model.tok_emb.weight.data_ptr()
+    print("✅ weight tied (same Parameter object)")
 
     # Compile helps on CUDA; on MPS it usually hurts (graph breaks, fallbacks).
     if device == "cuda":
@@ -227,21 +232,14 @@ def main(args):
             print("⚠️ torch.compile not available:", e)
     else:
         print("ℹ️ Skipping torch.compile on non-CUDA device")
-
-    # ✅ Filter out one of the duplicates so optimizer sees it once
-    unique_params = []
-    seen_ptrs = set()
-    for p in model.parameters():
-        if p.data_ptr() not in seen_ptrs:
-            unique_params.append(p)
-            seen_ptrs.add(p.data_ptr())
-
-    optimizer = Adafactor(
-        unique_params,
-        relative_step=True,
-        scale_parameter=True,
-        warmup_init=True,
-        lr=None
+    
+    # Use AdamW with a fixed LR for now because Adafactor isnt worth it at a smaller model. 
+    optimizer = AdamW(
+        model.parameters(),
+        lr=6e-4,
+        betas=(0.9, 0.95),
+        weight_decay=0.01,
+        eps=1e-8,
     )
         
     # ---- Resume ----
@@ -259,16 +257,19 @@ def main(args):
         
         if not args.override_hparams:
             if "optimizer_state" in ckpt:
-                optimizer.load_state_dict(ckpt["optimizer_state"])
+                try:
+                    optimizer.load_state_dict(ckpt["optimizer_state"])
+                except Exception as _:
+                    print("ℹ️ Optimizer type or shapes differ; starting fresh optimizer")
         else:
             print("⚡ Overriding hyperparameters: using new optimizer")
-            optimizer = Adafactor(
-                unique_params,
-                relative_step=True,
-                scale_parameter=True,
-                warmup_init=True,
-                lr=None
-            )            
+            optimizer = AdamW(
+                model.parameters(),
+                lr=3e-4,
+                betas=(0.9, 0.95),
+                weight_decay=0.01,
+                eps=1e-8,
+            )        
             
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
         print(f"✔️ Resumed at tokNum {tokens_per_opt:.3E} (best_val_loss={best_val_loss:.4f})")
@@ -320,7 +321,8 @@ def main(args):
     warmup_equiv = int(Config.target_warmup_tokens / tokens_per_opt)
     print(f"≈ {warmup_equiv:,} optimizer steps ≈ {Config.target_warmup_tokens:.2e} target warm-up tokens")
 
-    while opt_step < args.max_steps:
+    stop_training = False
+    while opt_step < args.max_steps and not stop_training:
         for step_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
             # Sanity check
@@ -350,6 +352,10 @@ def main(args):
                 loss = ce_loss / Config.gradAccumSteps
 
             loss.backward()
+            n_nonpad = (y != pad_id).sum().item()
+            total_loss_sum += ce_loss.detach().item() * max(1, n_nonpad)
+            total_tokens   += n_nonpad
+            
             if (step_idx + 1) % Config.gradAccumSteps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
                 optimizer.step()
@@ -357,64 +363,64 @@ def main(args):
                 opt_step += 1
                 tokens_seen += tokens_per_opt
                 steps_done += 1
-
-                # lightweight throughput log
-                if steps_done % 3 == 0:
+            
+                # ---- Logging (once per optimizer step) ----
+                if Config.debug and opt_step % Config.debug_every == 0 and opt_step > 0:
+                    avg_tok_loss = total_loss_sum / max(1, total_tokens)
+                    grads = [p.grad.norm() for p in model.parameters() if p.grad is not None]
+                    total_norm = torch.norm(torch.stack(grads)) if grads else torch.tensor(0.0)
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(
+                        f"[{now}] [DEBUG] opt_step={opt_step:<6d}  "
+                        f"tokens_seen={tokens_seen:.3e}  "
+                        f"tokLoss={avg_tok_loss:.4f}  "
+                        f"grad_norm={total_norm.item():.3f}"
+                    )
+                    total_loss_sum, total_tokens = 0.0, 0.0
+                    # Throughput
                     dt = time.time() - t0
                     sps = steps_done / max(1e-6, dt)
                     toks_s = tokens_seen / max(1e-6, dt)
                     print(f"⏱ {sps:.2f} opt_steps/s, {toks_s:.0f} toks/s (running)")
-            
-            # ---- Logging ----
-            if Config.debug and opt_step % Config.debug_every == 0 and opt_step > 0:
-                avg_tok_loss = total_loss_sum / max(1, total_tokens)
-                grads = [p.grad.norm() for p in model.parameters() if p.grad is not None]
-                total_norm = torch.norm(torch.stack(grads)) if grads else torch.tensor(0.0)
+                    
+                # ---- Validation (only right after an optimizer step) ----
+                if (opt_step > 0) and (opt_step % args.eval_every_steps == 0):
+                    val_loss = evaluate(
+                        model,
+                        val_loader,
+                        vocab_size,
+                        pad_id,
+                        device,
+                        "VAL",
+                        max_batches=Config.max_batches,
+                        shard_frac=0.003,
+                    )
+                    if val_loss < best_val_loss - Config.improvement_threshold:
+                        best_val_loss = val_loss
+                        noImprovement = 0
+                        save_model_state(model, optimizer, opt_step, "models/best_model.pt", "Best")
+                    else:
+                        noImprovement += 1
+                        print(f"No improvement. Patience {noImprovement}/{Config.patience}")
+                        if noImprovement >= Config.patience:
+                            print("⚠️ Early stopping")
+                            stop_training = True
+                            break
+                    model.train()
 
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(
-                    f"[{now}] [DEBUG] opt_step={opt_step:<6d}  "
-                    f"tokens_seen={tokens_seen:.3e}  "
-                    f"tokLoss={avg_tok_loss:.4f}  "
-                    f"grad_norm={total_norm.item():.3f}"
-                )
-                total_loss_sum, total_tokens = 0.0, 0.0
-
-            # ---- Validation ----
-            if (opt_step > 0) and (opt_step % args.eval_every_steps == 0):
-                val_loss = evaluate(
-                    model,
-                    val_loader,
-                    vocab_size,
-                    pad_id,
-                    device,
-                    "VAL",
-                    max_batches=Config.max_batches,
-                    shard_frac=0.003,
-                )
-                
-                if val_loss < best_val_loss - Config.improvement_threshold:
-                    best_val_loss = val_loss
-                    noImprovement = 0
-                    save_model_state(model, optimizer, opt_step, "models/best_model.pt", "Best")
-                else:
-                    noImprovement += 1
-                    print(f"No improvement. Patience {noImprovement}/{Config.patience}")
-                    if noImprovement >= Config.patience:
-                        print("⚠️ Early stopping")
-                        break
-                model.train()
-
-            # ---- Save ----
-            if opt_step > 0 and (opt_step % args.save_every_steps == 0):
-                os.makedirs("models", exist_ok=True)
-                save_model_state(
-                    model,
-                    optimizer,
-                    opt_step,
-                    "models/last_save_state.pt",
-                    f"opt_step {opt_step}",
-                )
+                # ---- Periodic Save (only right after an optimizer step) ----
+                if opt_step > 0 and (opt_step % args.save_every_steps == 0):
+                    os.makedirs("models", exist_ok=True)
+                    save_model_state(
+                        model,
+                        optimizer,
+                        opt_step,
+                        "models/last_save_state.pt",
+                        f"opt_step {opt_step}",
+                    )
+        # break outer while if early stopped
+        if stop_training:
+            break
 
     # ---- Final test evaluation ----
     test_loss = evaluate(
@@ -435,7 +441,7 @@ if __name__ == "__main__":
 
     # defaults pulled from Config
     parser.add_argument("--lr", type=float, default=Config.lr)
-    parser.add_argument("--max_steps", type=int, default=12000) # 3b tokens
+    parser.add_argument("--max_steps", type=int, default=3000) # 3b tokens
     parser.add_argument("--eval_every_steps", type=int, default=Config.eval_every_steps)
     parser.add_argument("--save_every_steps", type=int, default=Config.save_every_steps)
 

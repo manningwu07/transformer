@@ -12,7 +12,7 @@ class BaseConfig:
     vocab_size: int = 65_536   # |V|
     num_heads: int = 8        # attention heads (d_model % num_heads == 0)
     seq_len: int = 64          # training context length (shorter = less memory)
-    max_len: int = 256         # generation max context
+    max_len: int = 1024         # generation max context
     n_layers: int = 8         # number of transformer blocks
     lr: float = 6e-4           # base learning rate (may be overridden per profile)
 
@@ -65,21 +65,21 @@ class DebugProfile(BaseConfig):
 @dataclass
 class LocalProfile(BaseConfig):
     # target for M4 Pro, ~200M param model training locally
-    seq_len: int = 256
+    seq_len: int = 1024
     n_layers: int = 8
     d_model: int = 512
     hidden_size: int = 1536
-    batch_size: int = 16
-    gradAccumSteps: int = 16         # effective batch ~40
-    lr: float = 6e-4
+    batch_size: int = 8
+    gradAccumSteps: int = 16         # effective batch ~128
+    lr: float = 4e-4
     
-    eval_every_steps: int = 250
-    save_every_steps: int = 1000
+    eval_every_steps: int = 25
+    save_every_steps: int = 100
     max_batches: int = 250
     dropout: float = 0.05
     label_smoothing: float = 0.025
     debug: bool = True
-    debug_every: int = 100
+    debug_every: int = 10
 
 @dataclass
 class LoRAProfile(BaseConfig):

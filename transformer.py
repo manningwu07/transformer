@@ -187,7 +187,7 @@ class LLM(nn.Module):
             x, present = block(x, past)
             new_kvs.append(present)
         x = self.ln_f(x)
-        logits = self.head(x) / math.sqrt(x.size(-1))
+        logits = self.head(x)
         return logits, new_kvs
 
     @torch.no_grad()
