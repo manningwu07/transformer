@@ -2,6 +2,7 @@
 import argparse
 import glob
 import json
+import math
 import os
 import random
 import signal
@@ -111,11 +112,41 @@ def load_vocab(path):
     return data["TokenToID"], data["IDToToken"]
 
 
+# -------------------------------
+# Custom cosine scheduler (manual update, no LambdaLR)
+# -------------------------------
+def update_lr(optimizer, step, curr_tokens_seen=0):
+    """
+    Adjusts LR using:
+      - linear warm-up until Config.target_warmup_tokens tokens processed
+      - cosine decay thereafter based on optimizer step progression
+    """
+    start = Config.startLr
+    end = Config.endLr
+    total_steps = max(1, Config.totalOptSteps)
+
+    # --- Warm-up phase (token-based) ---
+    if curr_tokens_seen < Config.target_warmup_tokens:
+        progress = curr_tokens_seen / max(1.0, Config.target_warmup_tokens)
+        new_lr = start * progress
+    else:
+        # --- Cosine decay after warm-up ---
+        progress = min(step / total_steps, 1.0)
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+        new_lr = end + (start - end) * cosine
+
+    # Update optimizer groups
+    for g in optimizer.param_groups:
+        g["lr"] = new_lr
+
+    return new_lr
+
+
 # --------------------
 # Checkpoint helpers
 # --------------------
 
-def save_model_state(model, optimizer, step, path, msg=""):
+def save_model_state(model, optimizer, step, path, tokens_seen, msg=""):
     print("Saving model state...")
     torch.save(
         {
@@ -123,6 +154,7 @@ def save_model_state(model, optimizer, step, path, msg=""):
             "model_state": model.state_dict(),
             "optimizer_state": optimizer.state_dict(),
             "best_val_loss": best_val_loss,
+            "tokens_seen_total": tokens_seen
         },
         path,
     )
@@ -152,6 +184,7 @@ best_val_loss = float("inf")
 model = None
 optimizer = None
 opt_step = 1
+tokens_seen = 0
 
 
 def main(args):
@@ -236,9 +269,9 @@ def main(args):
     # Use AdamW with a fixed LR for now because Adafactor isnt worth it at a smaller model. 
     optimizer = AdamW(
         model.parameters(),
-        lr=6e-4,
+        lr=Config.startLr,
         betas=(0.9, 0.95),
-        weight_decay=0.01,
+        weight_decay=Config.weight_decay,
         eps=1e-8,
     )
         
@@ -249,6 +282,9 @@ def main(args):
         state = ckpt.get("model_state", ckpt)
         
         model.load_state_dict(state, strict=False)
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        tokens_seen = ckpt.get("tokens_seen_total", 0)
+        opt_step = int(ckpt.get("step", 1))
         try:
             model.head.weight = model.tok_emb.weight
             assert model.head.weight.data_ptr() == model.tok_emb.weight.data_ptr()
@@ -265,14 +301,21 @@ def main(args):
             print("⚡ Overriding hyperparameters: using new optimizer")
             optimizer = AdamW(
                 model.parameters(),
-                lr=3e-4,
+                lr=4e-4, # Manually change this as backup LR if update_lr doesnt work properly
                 betas=(0.9, 0.95),
-                weight_decay=0.01,
+                weight_decay=Config.weight_decay,
                 eps=1e-8,
-            )        
+            )
+            update_lr(optimizer, opt_step, tokens_seen)        
             
-        best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        print(f"✔️ Resumed at tokNum {tokens_per_opt:.3E} (best_val_loss={best_val_loss:.4f})")
+        # Logging statements to make sure everythings okay
+        print(
+            f"✔️ Resumed training from checkpoint."
+            f" opt_step≈{ckpt.get('step',0)}, tokens_seen_total={tokens_seen:.3e},"
+            f" best_val_loss={best_val_loss:.4f}"
+            f" curr_adamW_lr={optimizer.param_groups[0]['lr']:.6f}"
+        )
+        print(f"✔️ (best_val_loss={best_val_loss:.4f})")
 
     # --- Eval-only mode ---
     if args.evalPath and os.path.exists(args.evalPath) and args.evalSubset > 0:
@@ -298,7 +341,6 @@ def main(args):
 
     # ---- Training loop ----
     noImprovement = 0
-    tokens_seen = 0
     steps_done = 0
     t0 = time.time()
     model.train()
@@ -306,7 +348,6 @@ def main(args):
     
     # 🧮 AMP GradScaler for mixed precision (bf16 on MPS, fp16 on CUDA)
     amp_dtype = torch.bfloat16 if device == "mps" else torch.float16
-    scaler = torch.cuda.amp.GradScaler("cuda") if device == "cuda" else None
     
     # Ensure weight tied after scaler init (in case it changes storage)
     print("head ptr :", model.head.weight.data_ptr())
@@ -359,6 +400,7 @@ def main(args):
             if (step_idx + 1) % Config.gradAccumSteps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), Config.grad_clip)
                 optimizer.step()
+                curr_lr = update_lr(optimizer, opt_step, tokens_seen)
                 optimizer.zero_grad(set_to_none=True)
                 opt_step += 1
                 tokens_seen += tokens_per_opt
@@ -374,7 +416,8 @@ def main(args):
                         f"[{now}] [DEBUG] opt_step={opt_step:<6d}  "
                         f"tokens_seen={tokens_seen:.3e}  "
                         f"tokLoss={avg_tok_loss:.4f}  "
-                        f"grad_norm={total_norm.item():.3f}"
+                        f"grad_norm={total_norm.item():.3f} "
+                        f"adamW_lr={curr_lr:.6f} "
                     )
                     total_loss_sum, total_tokens = 0.0, 0.0
                     # Throughput
@@ -398,7 +441,7 @@ def main(args):
                     if val_loss < best_val_loss - Config.improvement_threshold:
                         best_val_loss = val_loss
                         noImprovement = 0
-                        save_model_state(model, optimizer, opt_step, "models/best_model.pt", "Best")
+                        save_model_state(model, optimizer, opt_step, "models/best_model.pt", tokens_seen, "Best")
                     else:
                         noImprovement += 1
                         print(f"No improvement. Patience {noImprovement}/{Config.patience}")
@@ -416,6 +459,7 @@ def main(args):
                         optimizer,
                         opt_step,
                         "models/last_save_state.pt",
+                        tokens_seen,
                         f"opt_step {opt_step}",
                     )
         # break outer while if early stopped
@@ -441,7 +485,7 @@ if __name__ == "__main__":
 
     # defaults pulled from Config
     parser.add_argument("--lr", type=float, default=Config.lr)
-    parser.add_argument("--max_steps", type=int, default=3000) # 3b tokens
+    parser.add_argument("--max_steps", type=int, default=Config.totalOptSteps)
     parser.add_argument("--eval_every_steps", type=int, default=Config.eval_every_steps)
     parser.add_argument("--save_every_steps", type=int, default=Config.save_every_steps)
 

@@ -30,17 +30,21 @@ class BaseConfig:
     dropout: float = 0.0
 
     # Adafactor-specific
-    grad_clip: float = 0.9
+    grad_clip: float = 1.2
+    startLr: float = 6e-4
+    endLr: float = 1e-4
+    weight_decay: float = 0.01
+    totalOptSteps: int = 10_000
     
     # Token accounting
     # (dynamic: recomputed in train.py; used for diagnostics/logging only)
-    target_warmup_tokens: float = 5e5  # ≈ 500 K tokens of warmup (1-3% of total token count) --- Total count is ~20-50M tokens
+    target_warmup_tokens: float = 2e6  # ≈ 500 K tokens of warmup (1-3% of total token count)
     tokens_per_opt_step: int = 0
 
     # Debug
     debug: bool = True
     debug_every: int = 20
-    log_random_sample: bool = False
+    log_random_sample: bool = True
     random_samples: int = 250
 
 # Profile overrides ---------------------------------------------------------
@@ -54,13 +58,13 @@ class DebugProfile(BaseConfig):
     batch_size: int = 4
     gradAccumSteps: int = 1
     lr: float = 5e-4
-    eval_every_steps: int = 200
+    eval_every_steps: int = 250
     save_every_steps: int = 1000
-    max_batches: int = 50
+    max_batches: int = 100
     
     dropout: float = 0.0
     debug: bool = True
-    debug_every: int = 50
+    debug_every: int = 100
 
 @dataclass
 class LocalProfile(BaseConfig):
@@ -69,17 +73,17 @@ class LocalProfile(BaseConfig):
     n_layers: int = 8
     d_model: int = 512
     hidden_size: int = 1536
-    batch_size: int = 8
-    gradAccumSteps: int = 16         # effective batch ~128
+    batch_size: int = 5             # Dont try to max out this bc it will be slow... leave some memory for other processes
+    gradAccumSteps: int = 10         # effective batch ~50
     lr: float = 4e-4
     
-    eval_every_steps: int = 25
-    save_every_steps: int = 100
+    eval_every_steps: int = 200
+    save_every_steps: int = 500
     max_batches: int = 250
     dropout: float = 0.05
     label_smoothing: float = 0.025
     debug: bool = True
-    debug_every: int = 10
+    debug_every: int = 40
 
 @dataclass
 class LoRAProfile(BaseConfig):
