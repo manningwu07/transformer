@@ -200,18 +200,7 @@ def build_blend(target_bytes: int, out_path: str):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     written = 0
     n = 0
-    # reserved training specials and wrappers you use elsewhere
-    RESERVED = {
-        "<bos>", "</bos>", "<eos>", "</eos>", "<unk>", "<pad>", "<NL>",
-        "<c4>", "</c4>", "<oscar>", "</oscar>",
-        "<dialog>", "</dialog>", "<code>", "</code>", "<stack>", "</stack>",
-        "<math>", "</math>", "<mathqa>", "</mathqa>", "<comp_math>", "</comp_math>",
-        "<Q>", "<A>",
-    }
     def sanitize_text(s: str) -> str:
-        # Replace <tag> with [tag] so tokenizer won’t emit BOS/EOS/… mid‑text
-        for t in RESERVED:
-            s = s.replace(t, t.replace("<", "[").replace(">", "]"))
         return s
 
     with open(out_path, "w", encoding="utf-8") as f:

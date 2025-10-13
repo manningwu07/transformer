@@ -18,33 +18,31 @@ class BaseConfig:
 
     # Optimization & scheduling
     max_epochs: int = 3
-    patience: int = 4
-    improvement_threshold: float = 0.1
+    patience: int = 3
+    improvement_threshold: float = 0.05
     batch_size: int = 24
     epsilon: float = 1e-5
     gradAccumSteps: int = 24          # effective batch = batch_size * gradAccumSteps
     eval_every_steps: int = 100
     max_batches: int = 250
-    save_every_steps: int = 500
     label_smoothing: float = 0.0
     dropout: float = 0.0
 
     # Adafactor-specific
     grad_clip: float = 1.2
     startLr: float = 6e-4
-    endLr: float = 1e-4
+    endLr: float = 6e-5
     weight_decay: float = 0.01
-    totalOptSteps: int = 10_000
+    totalOptSteps: int = 8_000
     
     # Token accounting
     # (dynamic: recomputed in train.py; used for diagnostics/logging only)
-    target_warmup_tokens: float = 2e6  # ≈ 500 K tokens of warmup (1-3% of total token count)
-    tokens_per_opt_step: int = 0
+    target_warmup_tokens: float = 2e6  # ≈ 2M tokens of warmup (1-3% of total token count)
 
     # Debug
     debug: bool = True
     debug_every: int = 20
-    log_random_sample: bool = True
+    log_random_sample: bool = False
     random_samples: int = 250
 
 # Profile overrides ---------------------------------------------------------
@@ -59,7 +57,6 @@ class DebugProfile(BaseConfig):
     gradAccumSteps: int = 1
     lr: float = 5e-4
     eval_every_steps: int = 250
-    save_every_steps: int = 1000
     max_batches: int = 100
     
     dropout: float = 0.0
@@ -77,13 +74,14 @@ class LocalProfile(BaseConfig):
     gradAccumSteps: int = 10         # effective batch ~50
     lr: float = 4e-4
     
-    eval_every_steps: int = 200
-    save_every_steps: int = 500
-    max_batches: int = 250
+    eval_every_steps: int = 500
+    max_batches: int = 100
     dropout: float = 0.05
     label_smoothing: float = 0.025
     debug: bool = True
-    debug_every: int = 40
+    debug_every: int = 80
+    log_random_sample: bool = False
+    random_samples: int = 250
 
 @dataclass
 class LoRAProfile(BaseConfig):
@@ -97,7 +95,6 @@ class LoRAProfile(BaseConfig):
     lr: float = 2e-3                 # LoRA often uses higher LR
     
     eval_every_steps: int = 250
-    save_every_steps: int = 1_000
     dropout: float = 0.0
     debug: bool = False
 

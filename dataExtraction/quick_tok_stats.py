@@ -13,3 +13,5 @@ def top_ids(prefix, n=1_000_000):
     print("total scanned:", len(a))
 
 top_ids("data/shards/train")
+top_ids("data/shards/val")
+top_ids("data/shards/test")

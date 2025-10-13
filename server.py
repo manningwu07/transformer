@@ -15,6 +15,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 VOCAB_PATH = os.path.join(BASE_DIR, "data/json/vocab.json")
 MODEL_PATH = os.path.join(BASE_DIR, "models", "best_model.pt")  # change if needed
 TOK_PATH = os.path.join(BASE_DIR, "data/json/tokenizer.json")
+BAD_IDS_PATH = os.path.join(BASE_DIR, "data/json/bad_ids.json")
 
 # ---------- Load vocab ----------
 print("CWD:", os.getcwd())
@@ -48,6 +49,25 @@ model.load_state_dict(state, strict=False)
 model.head.weight = model.tok_emb.weight
 
 # ---------- FastAPI ----------
+DEVICE = (
+    "mps"
+    if torch.backends.mps.is_available()
+    else ("cuda" if torch.cuda.is_available() else "cpu")
+)
+model.to(DEVICE)
+
+# Load bad tokens
+bad_ids = []
+try:
+    if os.path.exists(BAD_IDS_PATH):
+        with open(BAD_IDS_PATH, "r") as f:
+            bad_ids = json.load(f).get("BadTokenIDs", [])
+        print(f"Loaded {len(bad_ids)} bad token ids.")
+    else:
+        print("Warning: bad_ids.json not found.")
+except Exception as e:
+    print("Warning: failed to parse bad_ids.json:", e)
+
 app = FastAPI()
 
 # request schema
@@ -86,16 +106,18 @@ def filter_logits(logits, top_k=0, top_p=0.0):
 @app.post("/generate")
 def generate(req: InferRequest):
     try:
-        ids = torch.tensor([req.ids], dtype=torch.long)
+        ids = torch.tensor([req.ids], dtype=torch.long, device=DEVICE)
         with torch.no_grad():
             out = model.generate(
-            ids,
-            max_tokens=req.max_tokens,
-            top_k=req.top_k,
-            top_p=req.top_p,
-            temperature=req.temperature,
-            repetition_penalty=req.repetition_penalty,
-        )
+                ids,
+                max_tokens=req.max_tokens,
+                top_k=req.top_k,
+                top_p=req.top_p,
+                temperature=req.temperature,
+                repetition_penalty=req.repetition_penalty,
+                bad_ids=bad_ids,
+                eos_id=model.eos_id,
+            )
         out_ids = out[0].tolist()
 
         # Robust byte-level decoding with the trained tokenizer
@@ -107,3 +129,7 @@ def generate(req: InferRequest):
 
         traceback.print_exc()
         return {"error": str(e)}
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "device": DEVICE, "vocab_size": vocab_size}

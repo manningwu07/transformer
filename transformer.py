@@ -194,11 +194,13 @@ class LLM(nn.Module):
     def generate(
         self,
         idx,
-        max_tokens=20,
-        top_k=15,
-        top_p=0.9,
-        temperature=0.7,
-        repetition_penalty=1.3,
+        max_tokens: int = 20,
+        top_k: int = 15,
+        top_p: float = 0.9,
+        temperature: float = 0.7,
+        repetition_penalty: float = 1.2,
+        bad_ids: list[int] | None = None,
+        eos_id: int | None = None,
     ):
         """
         Incremental decoding with KV cache.
@@ -210,12 +212,13 @@ class LLM(nn.Module):
         device = next(self.parameters()).device
         generated = idx.to(device)
         past_kvs = None
-        
-        bad_ids = (lambda p: json.load(open(p)).get("BadTokenIDs", []) if os.path.exists(p) else [])("data/test/bad_ids.json")
-        if not bad_ids:
-            FileNotFoundError("Bad IDs file not found or isn't correct. Please run the tokenizer script to generate bad_ids.json")
 
-        def filter_top_k_p(logits, top_k, top_p):
+        # Set EOS from model if not provided
+        if eos_id is None:
+            eos_id = getattr(self, "eos_id", None)
+
+        # --- Utility: filter logits ---
+        def filter_top_k_p(logits, top_k=None, top_p=None):
             if top_k is not None and top_k > 0:
                 v, _ = torch.topk(logits, top_k)
                 logits = torch.where(
@@ -241,23 +244,34 @@ class LLM(nn.Module):
                 logits, past_kvs = self(generated[:, -1:], past_kvs)
 
             logits = logits[:, -1, :] / max(1e-5, float(temperature))
-            # Dont sample the tags and especially pad/unk/bos
-            logits[:, bad_ids] = -float("inf")
 
-            # Repetition penalty (vectorized on unique tokens)
-            if repetition_penalty is not None and repetition_penalty > 1.0:
-                uniq = torch.unique(generated[0])
-                logits[:, uniq] /= repetition_penalty
+            # Mask invalid/special tokens
+            if bad_ids:
+                logits[:, bad_ids] = -float("inf")
 
-            # Top-k / top-p
+            # Apply repetition penalty correctly (handle sign)
+            if repetition_penalty and abs(repetition_penalty - 1.0) > 1e-6:
+                uniq_tokens = torch.unique(generated[0])
+                for t in uniq_tokens:
+                    val = logits[0, t]
+                    if val > 0:
+                        logits[0, t] = val / repetition_penalty
+                    else:
+                        logits[0, t] = val * repetition_penalty
+
+            # Sampling filter
             logits = filter_top_k_p(logits, top_k, top_p)
-
             probs = F.softmax(logits, dim=-1)
-            next_token = torch.multinomial(probs, num_samples=1)
+
+            # Degenerate fallback to greedy if NaNs/Inf
+            if not torch.isfinite(probs).all() or (probs.sum(dim=-1) == 0).any():
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                next_token = torch.multinomial(probs, num_samples=1)
             generated = torch.cat([generated, next_token], dim=1)
 
-            # Stop if EOS or would overflow max_len
-            if next_token.item() == 2: # EOS ID = 2
+            # Stop at EOS/id overflow
+            if eos_id is not None and next_token.item() == int(eos_id):
                 break
             if generated.size(1) >= self.max_len:
                 break

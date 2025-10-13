@@ -147,7 +147,7 @@ def update_lr(optimizer, step, curr_tokens_seen=0):
 # --------------------
 
 def save_model_state(model, optimizer, step, path, tokens_seen, msg=""):
-    print("Saving model state...")
+    print(f"Model save checkpoint: opt_step={opt_step}, tokens_seen={tokens_seen}")
     torch.save(
         {
             "step": step,
@@ -162,7 +162,8 @@ def save_model_state(model, optimizer, step, path, tokens_seen, msg=""):
 
 
 def crash_handler(sig, frame):
-    global model, optimizer, opt_step
+    global model, optimizer, opt_step, tokens_seen
+    print(f"Model crash checkpoint: opt_step={opt_step}, tokens_seen={tokens_seen}")
     if model is not None:
         os.makedirs("models", exist_ok=True)
         save_model_state(
@@ -170,6 +171,7 @@ def crash_handler(sig, frame):
             optimizer,
             opt_step,
             "models/curr_model.pt",
+            tokens_seen,
             "CURRENT MODEL (crash-save)",
         )
     sys.exit(0)
@@ -343,6 +345,7 @@ def main(args):
     noImprovement = 0
     steps_done = 0
     t0 = time.time()
+    tokens_seen_curr_run = 0
     model.train()
     total_loss_sum, total_tokens = 0.0, 0
     
@@ -355,7 +358,6 @@ def main(args):
     print("shared   :", model.head.weight.data_ptr() == model.tok_emb.weight.data_ptr())
     
     tokens_per_opt = Config.batch_size * Config.seq_len * Config.gradAccumSteps
-    Config.tokens_per_opt_step = tokens_per_opt
     print(f"Tokens per optimizer step: {tokens_per_opt:,}")
 
     # Compute equivalent warm‑up steps just for info
@@ -404,26 +406,24 @@ def main(args):
                 optimizer.zero_grad(set_to_none=True)
                 opt_step += 1
                 tokens_seen += tokens_per_opt
+                tokens_seen_curr_run += tokens_per_opt
                 steps_done += 1
             
                 # ---- Logging (once per optimizer step) ----
                 if Config.debug and opt_step % Config.debug_every == 0 and opt_step > 0:
                     avg_tok_loss = total_loss_sum / max(1, total_tokens)
-                    grads = [p.grad.norm() for p in model.parameters() if p.grad is not None]
-                    total_norm = torch.norm(torch.stack(grads)) if grads else torch.tensor(0.0)
                     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     print(
                         f"[{now}] [DEBUG] opt_step={opt_step:<6d}  "
                         f"tokens_seen={tokens_seen:.3e}  "
                         f"tokLoss={avg_tok_loss:.4f}  "
-                        f"grad_norm={total_norm.item():.3f} "
                         f"adamW_lr={curr_lr:.6f} "
                     )
                     total_loss_sum, total_tokens = 0.0, 0.0
                     # Throughput
                     dt = time.time() - t0
                     sps = steps_done / max(1e-6, dt)
-                    toks_s = tokens_seen / max(1e-6, dt)
+                    toks_s = tokens_seen_curr_run / max(1e-6, dt)
                     print(f"⏱ {sps:.2f} opt_steps/s, {toks_s:.0f} toks/s (running)")
                     
                 # ---- Validation (only right after an optimizer step) ----
@@ -448,20 +448,16 @@ def main(args):
                         if noImprovement >= Config.patience:
                             print("⚠️ Early stopping")
                             stop_training = True
+                            save_model_state(
+                                model,
+                                optimizer,
+                                opt_step,
+                                "models/early_stopping.pt",
+                                tokens_seen,
+                                f"opt_step {opt_step}",
+                            )
                             break
                     model.train()
-
-                # ---- Periodic Save (only right after an optimizer step) ----
-                if opt_step > 0 and (opt_step % args.save_every_steps == 0):
-                    os.makedirs("models", exist_ok=True)
-                    save_model_state(
-                        model,
-                        optimizer,
-                        opt_step,
-                        "models/last_save_state.pt",
-                        tokens_seen,
-                        f"opt_step {opt_step}",
-                    )
         # break outer while if early stopped
         if stop_training:
             break
