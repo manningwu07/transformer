@@ -188,7 +188,7 @@ tokens_seen = 0
 
 
 def main(args):
-    global model, optimizer, best_val_loss, opt_step
+    global model, optimizer, best_val_loss, opt_step, tokens_seen
     torch.set_num_threads(os.cpu_count() - 2 if os.cpu_count() > 2 else 0)
 
     # Handle Ctrl-C / SIGTERM
@@ -301,7 +301,7 @@ def main(args):
             print("⚡ Overriding hyperparameters: using new optimizer")
             optimizer = AdamW(
                 model.parameters(),
-                lr=4e-4, # Manually change this as backup LR if update_lr doesnt work properly
+                lr= (Config.startLr - Config.endLr) / 2, # Manually change this as backup LR if update_lr doesnt work properly
                 betas=(0.9, 0.95),
                 weight_decay=Config.weight_decay,
                 eps=1e-8,
