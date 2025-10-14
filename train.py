@@ -26,81 +26,72 @@ from torch.optim import AdamW
 # --------------------
 
 class IndexedBinaryDataset(torch.utils.data.IterableDataset):
-    """
-    Streams examples from .bin/.idx shards produced by ExportTokenIDsBinary.
-    Each example = (x, y), where x is input seq, y is target seq.
-    """
-
-    def __init__(self, prefix, seq_len, repeat=False, shuffle=False, pad_id=0):
+    def __init__(self, prefix, seq_len, repeat=True, shuffle=True, pad_id=0, seed=42):
         self.prefix = prefix
         self.seq_len = seq_len
         self.repeat = repeat
         self.shuffle = shuffle
         self.pad_id = pad_id
         self.shards = sorted(glob.glob(prefix + "-*.idx"))
-        assert self.shards, f"No shards found for prefix {prefix}"
+        assert self.shards, f"No shards found for {prefix}"
+        self.rng = random.Random(seed)
+        self._used_shards = set()
 
-    def _iter_shard(self, idx_path):
-        bin_path = idx_path.replace(".idx", ".bin")
-        idx_arr = np.fromfile(idx_path, dtype=np.uint64).reshape(-1, 2)
-        data = np.memmap(bin_path, dtype=np.uint32, mode="r")
-
-        order = np.arange(len(idx_arr))
-        if self.shuffle:
-            np.random.shuffle(order)
-
-        for j in order:
-            start, length = idx_arr[j]
-            arr = data[start // 4 : start // 4 + length]
-            ids = torch.from_numpy(arr.astype(np.int64))
-            # Random 256 window when longer
-            if len(ids) > self.seq_len:
-                start_off = 0
-                if self.shuffle:
-                    start_off = random.randint(0, len(ids) - self.seq_len)
-                ids = ids[start_off : start_off + self.seq_len]
-            else:
-                if len(ids) < self.seq_len:
-                    pad = torch.full(
-                        (self.seq_len - len(ids),), self.pad_id, dtype=torch.long
-                    )
-                    ids = torch.cat([ids, pad])
-            yield ids[:-1], ids[1:]
+    def _select_next_shard(self):
+        all_idx = list(range(len(self.shards)))
+        available = [i for i in all_idx if i not in self._used_shards]
+        if not available:
+            # all shards consumed → reset epoch
+            self._used_shards.clear()
+            available = all_idx
+        shard_id = self.rng.choice(available)
+        self._used_shards.add(shard_id)
+        return self.shards[shard_id]
 
     def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        worker_id = worker_info.id if worker_info else 0
-        num_workers = worker_info.num_workers if worker_info else 1
+        worker = torch.utils.data.get_worker_info()
+        wid = worker.id if worker else 0
+        nworkers = worker.num_workers if worker else 1
 
-        # choose 1 shard per epoch (you can rotate if you want)
-        shard = random.choice(self.shards) if self.shuffle else self.shards[0]
+        while True:
+            idx_path = self._select_next_shard()
+            bin_path = idx_path.replace(".idx", ".bin")
+            idx_arr = np.fromfile(idx_path, dtype=np.uint64).reshape(-1, 2)
+            data = np.memmap(bin_path, dtype=np.uint32, mode="r")
 
-        # load shard
-        idx_path = shard
-        bin_path = idx_path.replace(".idx", ".bin")
-        idx_arr = np.fromfile(idx_path, dtype=np.uint64).reshape(-1, 2)
-        data = np.memmap(bin_path, dtype=np.uint32, mode="r")
+            # optional random starting position within shard
+            offset = 0
+            if self.shuffle:
+                offset = self.rng.randint(0, len(idx_arr) - 1)
 
-        # assign each worker a strided slice of the index array
-        total = len(idx_arr)
-        per_worker = total // num_workers
-        start = worker_id * per_worker
-        end = total if worker_id == num_workers - 1 else (worker_id + 1) * per_worker
-        order = np.arange(start, end)
+            order = list(np.arange(len(idx_arr)))
+            if self.shuffle:
+                self.rng.shuffle(order)
+            order = order[offset:] + order[:offset]
 
-        if self.shuffle:
-            np.random.shuffle(order)
+            # split order among workers
+            chunk = len(order) // nworkers
+            start = wid * chunk
+            end = len(order) if wid == nworkers - 1 else (wid + 1) * chunk
+            for j in order[start:end]:
+                st, ln = idx_arr[j]
+                arr = data[st // 4 : st // 4 + ln]
+                ids = torch.from_numpy(arr.astype(np.int64))
+                if len(ids) < 2:
+                    continue
+                if len(ids) > self.seq_len:
+                    if self.shuffle:
+                        start_off = self.rng.randint(0, len(ids) - self.seq_len)
+                    else:
+                        start_off = 0
+                    ids = ids[start_off : start_off + self.seq_len]
+                elif len(ids) < self.seq_len:
+                    pad = torch.full((self.seq_len - len(ids),), self.pad_id, dtype=torch.long)
+                    ids = torch.cat([ids, pad])
+                yield ids[:-1], ids[1:]
 
-        for j in order:
-            start, length = idx_arr[j]
-            arr = data[start // 4 : start // 4 + length]
-            ids = torch.from_numpy(arr.astype(np.int64))
-            ids = ids[: self.seq_len]
-            if len(ids) < self.seq_len:
-                pad = torch.full((self.seq_len - len(ids),), self.pad_id, dtype=torch.long)
-                ids = torch.cat([ids, pad])
-            yield ids[:-1], ids[1:]
-
+            if not self.repeat and len(self._used_shards) == len(self.shards):
+                break
 
 # --------------------
 # Vocab utils
@@ -285,7 +276,7 @@ def main(args):
         
         model.load_state_dict(state, strict=False)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        tokens_seen = ckpt.get("tokens_seen_total", 0)
+        tokens_seen = 0 # ckpt.get("tokens_seen_total", 0)
         opt_step = int(ckpt.get("step", 1))
         try:
             model.head.weight = model.tok_emb.weight
@@ -304,7 +295,7 @@ def main(args):
             optimizer = AdamW(
                 model.parameters(),
                 lr= (Config.startLr - Config.endLr) / 2, # Manually change this as backup LR if update_lr doesnt work properly
-                betas=(0.9, 0.95),
+                betas=(Config.beta1, Config.beta2),
                 weight_decay=Config.weight_decay,
                 eps=1e-8,
             )
@@ -480,10 +471,8 @@ if __name__ == "__main__":
     parser.add_argument("--vocab", type=str, required=True, help="Vocab JSON path")
 
     # defaults pulled from Config
-    parser.add_argument("--lr", type=float, default=Config.lr)
     parser.add_argument("--max_steps", type=int, default=Config.totalOptSteps)
     parser.add_argument("--eval_every_steps", type=int, default=Config.eval_every_steps)
-    parser.add_argument("--save_every_steps", type=int, default=Config.save_every_steps)
 
     # Resume
     parser.add_argument("--resumePath", type=str, default="models/last_save_state.pt")

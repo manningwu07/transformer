@@ -14,14 +14,13 @@ class BaseConfig:
     seq_len: int = 64          # training context length (shorter = less memory)
     max_len: int = 1024         # generation max context
     n_layers: int = 8         # number of transformer blocks
-    lr: float = 6e-4           # base learning rate (may be overridden per profile)
 
     # Optimization & scheduling
     max_epochs: int = 3
-    patience: int = 3
+    patience: int = 5
     improvement_threshold: float = 0.05
     batch_size: int = 24
-    epsilon: float = 1e-5
+    epsilon: float = 1e-4
     gradAccumSteps: int = 24          # effective batch = batch_size * gradAccumSteps
     eval_every_steps: int = 100
     max_batches: int = 250
@@ -30,10 +29,12 @@ class BaseConfig:
 
     # Adafactor-specific
     grad_clip: float = 1.2
-    startLr: float = 6e-4
-    endLr: float = 6e-5
+    startLr: float = 3e-4
+    endLr: float = 1e-5
+    beta1: float = 0.9
+    beta2: float = 0.92
     weight_decay: float = 0.01
-    totalOptSteps: int = 8_000
+    totalOptSteps: int = 5_000
     
     # Token accounting
     # (dynamic: recomputed in train.py; used for diagnostics/logging only)
@@ -55,7 +56,6 @@ class DebugProfile(BaseConfig):
     hidden_size: int = 1536
     batch_size: int = 4
     gradAccumSteps: int = 1
-    lr: float = 5e-4
     eval_every_steps: int = 250
     max_batches: int = 100
     
@@ -72,12 +72,11 @@ class LocalProfile(BaseConfig):
     hidden_size: int = 1536
     batch_size: int = 5             # Dont try to max out this bc it will be slow... leave some memory for other processes
     gradAccumSteps: int = 10         # effective batch ~50
-    lr: float = 4e-4
     
     eval_every_steps: int = 500
     max_batches: int = 100
-    dropout: float = 0.05
-    label_smoothing: float = 0.025
+    dropout: float = 0.1
+    label_smoothing: float = 0.07
     debug: bool = True
     debug_every: int = 80
     log_random_sample: bool = False
@@ -90,9 +89,9 @@ class LoRAProfile(BaseConfig):
     n_layers: int = 12
     d_model: int = 768
     hidden_size: int = 2048
-    batch_size: int = 4
-    gradAccumSteps: int = 8          # effective batch = 32
-    lr: float = 2e-3                 # LoRA often uses higher LR
+    batch_size: int = 10
+    gradAccumSteps: int = 10          # effective batch = 64
+    lr: float = 1e-3
     
     eval_every_steps: int = 250
     dropout: float = 0.0
