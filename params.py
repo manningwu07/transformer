@@ -17,28 +17,28 @@ class BaseConfig:
 
     # Optimization & scheduling
     max_epochs: int = 3
-    patience: int = 5
+    patience: int = 3
     improvement_threshold: float = 0.05
     batch_size: int = 24
     epsilon: float = 1e-4
     gradAccumSteps: int = 24          # effective batch = batch_size * gradAccumSteps
     eval_every_steps: int = 100
     max_batches: int = 250
-    label_smoothing: float = 0.0
-    dropout: float = 0.0
+    label_smoothing: float = 0.01
+    dropout: float = 0.01
 
     # Adafactor-specific
-    grad_clip: float = 1.2
+    grad_clip: float = 1.0
     startLr: float = 3e-4
-    endLr: float = 1e-5
+    endLr: float = 3e-5
     beta1: float = 0.9
-    beta2: float = 0.92
+    beta2: float = 0.99
     weight_decay: float = 0.01
-    totalOptSteps: int = 5_000
+    totalOptSteps: int = 1_500
     
     # Token accounting
     # (dynamic: recomputed in train.py; used for diagnostics/logging only)
-    target_warmup_tokens: float = 2e6  # ≈ 2M tokens of warmup (1-3% of total token count)
+    target_warmup_tokens: float = 2e7  # ≈ 20M tokens of warmup (1-3% of total token count)
 
     # Debug
     debug: bool = True
@@ -65,20 +65,19 @@ class DebugProfile(BaseConfig):
 
 @dataclass
 class LocalProfile(BaseConfig):
-    # target for M4 Pro, ~200M param model training locally
     seq_len: int = 1024
     n_layers: int = 8
     d_model: int = 512
     hidden_size: int = 1536
     batch_size: int = 5             # Dont try to max out this bc it will be slow... leave some memory for other processes
-    gradAccumSteps: int = 10         # effective batch ~50
+    gradAccumSteps: int = 30         # effective batch ~150
     
-    eval_every_steps: int = 500
+    eval_every_steps: int = 250
     max_batches: int = 100
-    dropout: float = 0.1
-    label_smoothing: float = 0.07
+    dropout: float = 0.01
+    label_smoothing: float = 0.01
     debug: bool = True
-    debug_every: int = 80
+    debug_every: int = 33
     log_random_sample: bool = False
     random_samples: int = 250
 

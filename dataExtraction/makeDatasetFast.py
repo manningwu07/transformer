@@ -107,11 +107,15 @@ def main():
                         "val"   if p < r_train + r_val else
                         "test"
                     )
+                    # random window when longer than desired sequence length
                     if args.seq_len and len(full_ids) > args.seq_len:
                         if args.truncate_policy == "truncate":
-                            full_ids = full_ids[:args.seq_len]
+                            max_offset = len(full_ids) - args.seq_len
+                            offset = random.randint(0, max_offset)
+                            full_ids = full_ids[offset : offset + args.seq_len]
                         else:
                             continue
+	                
                     w = writers[split]
                     if w["cur"] >= args.max_shard_bytes:
                         next_w(w)

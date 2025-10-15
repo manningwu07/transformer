@@ -26,7 +26,7 @@ from torch.optim import AdamW
 # --------------------
 
 class IndexedBinaryDataset(torch.utils.data.IterableDataset):
-    def __init__(self, prefix, seq_len, repeat=True, shuffle=True, pad_id=0, seed=42):
+    def __init__(self, prefix, seq_len, repeat=True, shuffle=True, pad_id=0, seed=42, log_path: str | None = None):
         self.prefix = prefix
         self.seq_len = seq_len
         self.repeat = repeat
@@ -36,17 +36,35 @@ class IndexedBinaryDataset(torch.utils.data.IterableDataset):
         assert self.shards, f"No shards found for {prefix}"
         self.rng = random.Random(seed)
         self._used_shards = set()
+        
+        self._log_fh = None
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            self._log_fh = open(log_path, "a", buffering=1, encoding="utf-8")
+        self._log_path = log_path
+        
+    def _log(self, msg: str):
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{now}] [IndexedBinaryDataset] {msg}"
+        print(line, flush=True)
+        if self._log_fh:
+            self._log_fh.write(line + "\n")
+            self._log_fh.flush()
 
     def _select_next_shard(self):
         all_idx = list(range(len(self.shards)))
         available = [i for i in all_idx if i not in self._used_shards]
         if not available:
             # all shards consumed → reset epoch
+            self._log(f"✅ All shards exhausted for corpus {self.prefix}. Restarting new epoch.")
             self._used_shards.clear()
             available = all_idx
+
         shard_id = self.rng.choice(available)
+        path = self.shards[shard_id]
         self._used_shards.add(shard_id)
-        return self.shards[shard_id]
+        self._log(f"📚 Loading shard {path} ({len(self._used_shards)}/{len(self.shards)})")
+        return path
 
     def __iter__(self):
         worker = torch.utils.data.get_worker_info()
@@ -92,6 +110,10 @@ class IndexedBinaryDataset(torch.utils.data.IterableDataset):
 
             if not self.repeat and len(self._used_shards) == len(self.shards):
                 break
+            
+    def __del__(self):
+        if self._log_fh:
+            self._log_fh.close()
 
 # --------------------
 # Vocab utils
@@ -214,7 +236,7 @@ def main(args):
     pad_id = tok2id["<pad>"]
 
     # ---- Datasets ----
-    train_ds = IndexedBinaryDataset(args.train, Config.seq_len, shuffle=True,  repeat=True,  pad_id=pad_id)
+    train_ds = IndexedBinaryDataset(args.train, Config.seq_len, shuffle=True,  repeat=True,  pad_id=pad_id, log_path="data/logs/dataset_cycle.log")
     val_ds   = IndexedBinaryDataset(args.val,   Config.seq_len, shuffle=False, repeat=False, pad_id=pad_id)
     test_ds  = IndexedBinaryDataset(args.test,  Config.seq_len, shuffle=False, repeat=False, pad_id=pad_id)
 
@@ -276,8 +298,8 @@ def main(args):
         
         model.load_state_dict(state, strict=False)
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        tokens_seen = 0 # ckpt.get("tokens_seen_total", 0)
-        opt_step = int(ckpt.get("step", 1))
+        tokens_seen = ckpt.get("tokens_seen_total", 0)
+        opt_step = 0 #int(ckpt.get("step", 1))
         try:
             model.head.weight = model.tok_emb.weight
             assert model.head.weight.data_ptr() == model.tok_emb.weight.data_ptr()
@@ -294,12 +316,12 @@ def main(args):
             print("⚡ Overriding hyperparameters: using new optimizer")
             optimizer = AdamW(
                 model.parameters(),
-                lr= (Config.startLr - Config.endLr) / 2, # Manually change this as backup LR if update_lr doesnt work properly
+                lr= Config.startLr,
                 betas=(Config.beta1, Config.beta2),
                 weight_decay=Config.weight_decay,
                 eps=1e-8,
             )
-            update_lr(optimizer, opt_step, tokens_seen)        
+            update_lr(optimizer, opt_step, 1) # (Soft resets the lr + warmup for the first effective batch)      
             
         # Logging statements to make sure everythings okay
         print(
@@ -481,7 +503,7 @@ if __name__ == "__main__":
     
     # Eval only
     parser.add_argument("--evalPath", type=str, default="models/best_model.pt")
-    parser.add_argument("--evalSubset", type=float, default=-0.1)
+    parser.add_argument("--evalSubset", type=float, default=-0.1) #supposed to be negative
     
     args = parser.parse_args()
 
