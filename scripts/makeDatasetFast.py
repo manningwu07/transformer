@@ -129,9 +129,28 @@ def main():
                 full_ids = [bos_id] + enc.ids + [eos_id]
                 if len(full_ids) < 4 or PAD_ID in full_ids:
                     continue
-                write_seq(writers["train"], full_ids)
-                counts["train"] += 1
-                lengths["train"].append(len(full_ids))
+                # Apply same split logic as main loop
+                p = random.random()
+                split = (
+                    "train" if p < r_train else
+                    "val"   if p < r_train + r_val else
+                    "test"
+                )
+                
+                if args.seq_len and len(full_ids) > args.seq_len:
+                    if args.truncate_policy == "truncate":
+                        max_offset = len(full_ids) - args.seq_len
+                        offset = random.randint(0, max_offset)
+                        full_ids = full_ids[offset : offset + args.seq_len]
+                    else:
+                        continue
+                
+                w = writers[split]
+                if w["cur"] >= args.max_shard_bytes:
+                    next_w(w)
+                write_seq(w, full_ids)
+                counts[split] = 1
+                lengths[split].append(len(full_ids))
 
     for s in writers:
         w = writers[s]

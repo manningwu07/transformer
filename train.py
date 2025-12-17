@@ -11,11 +11,11 @@ import traceback
 import glob
 from transformers import Adafactor
 from torch.utils.data import DataLoader
+from dataset import IndexedBinaryDataset
 
 # Imports from your project
 from transformer import LLM
 from params import Config, TrainCfg
-from dataset import BinaryDataset 
 
 # --- Optimizations ---
 torch.backends.cuda.matmul.allow_tf32 = True # Huge speedup on Ampere+
@@ -64,10 +64,38 @@ class CheckpointManager:
     def _prune(self):
         files = sorted(glob.glob(os.path.join(self.save_dir, "ckpt_step_*.pt")), key=os.path.getmtime)
         for f in files[:-3]: os.remove(f)
+        
+class LossTracker:
+    """Tracks loss for spike detection and NaN handling."""
+    def __init__(self, window_size=100, spike_threshold=3.0):
+        self.window_size = window_size
+        self.spike_threshold = spike_threshold
+        self.history = []
+        
+    def update(self, loss_val):
+        self.history.append(loss_val)
+        if len(self.history) > self.window_size:
+            self.history.pop(0)
+    
+    @property
+    def running_avg(self):
+        if not self.history:
+            return float('inf')
+        return sum(self.history) / len(self.history)
+    
+    def is_spike(self, loss_val):
+        if len(self.history) < 50:
+            return False
+        return loss_val > self.spike_threshold * self.running_avg
+    
+    def is_valid(self, loss_tensor):
+        return torch.isfinite(loss_tensor).all()
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--data_dir", type=str, default="data/shards")
     args = parser.parse_args()
 
     # 1. Init Model
@@ -99,10 +127,10 @@ def main():
     print(f"📂 Loading Binary Dataset...")
     # NOTE: Ensure you ran prepare_data.py first!
     try:
-        train_ds = BinaryDataset("data/binary/train", TrainCfg.seq_len)
+        train_ds = IndexedBinaryDataset(args.data_dir, split="train", seq_len=TrainCfg.seq_len)
     except FileNotFoundError:
-        print("❌ Error: data/binary/train/data.bin not found.")
-        print("   Run: python3 prepare_data.py")
+        print(f"❌ Error: No shards found at {args.data_dir}/train-*.bin")
+        print("   Run: python3 scripts/makeDatasetFast.py")
         return
 
     train_loader = DataLoader(
@@ -123,6 +151,7 @@ def main():
     # 3. Training Loop
     model.train()
     step = start_step
+    loss_tracker = LossTracker(window_size=100, spike_threshold=3.0)
     
     # Handle Ctrl+C
     def signal_handler(sig, frame):
@@ -150,10 +179,26 @@ def main():
             
             # Forward
             # Note: We rely on internal loss calculation or do it here
-            logits, loss = model(x, targets=y)
+            logits, loss, _ = model(x, targets=y)
+            
+            # NaN/Inf check
+            if not loss_tracker.is_valid(loss):
+                print(f"⚠️ Step {step}: Non-finite loss detected, skipping batch")
+                optimizer.zero_grad()
+                continue
+            
+            raw_loss = loss.item()
+            
+            # Spike detection
+            if loss_tracker.is_spike(raw_loss):
+                print(f"⚠️ Step {step}: Loss spike detected ({raw_loss:.4f} vs avg {loss_tracker.running_avg:.4f})")
+                # Option: skip, reduce LR, or just warn
+            
+            loss_tracker.update(raw_loss)
+
             loss = loss / TrainCfg.grad_accum_steps
             loss.backward()
-            accum_loss += loss.item()
+            accum_loss += raw_loss  # Track true loss, not scaled
             
             # Step
             if (step + 1) % TrainCfg.grad_accum_steps == 0:
@@ -171,7 +216,8 @@ def main():
                 if step % 10 == 0:
                     dt = time.time() - t0
                     tps = (TrainCfg.batch_size * TrainCfg.seq_len * TrainCfg.grad_accum_steps * 10) / dt
-                    print(f"Step {step} | Loss: {accum_loss*TrainCfg.grad_accum_steps:.4f} | LR: {lr:.2e} | {tps:.0f} tok/s")
+                    avg_loss = accum_loss / TrainCfg.grad_accum_steps
+                    print(f"Step {step} | Loss: {avg_loss:.4f} | LR: {lr:.2e} | {tps:.0f} tok/s")
                     t0 = time.time()
                     accum_loss = 0.0
 

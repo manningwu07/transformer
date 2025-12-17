@@ -1,5 +1,12 @@
 # params.py
 from dataclasses import dataclass
+import os
+ 
+# --- Unified Paths ---
+DATA_DIR = "data"
+TOKENIZER_PATH = os.path.join(DATA_DIR, "json", "tokenizer.json")
+VOCAB_PATH = os.path.join(DATA_DIR, "json", "vocab.json")
+SHARD_DIR = os.path.join(DATA_DIR, "shards")
 
 # Toggle this to switch between Training (Short Ctx) and Fine-tuning (Long Ctx)
 # Options: "pretrain_5080", "longctx_5090"
@@ -25,6 +32,9 @@ class ModelArgs:
     # Architecture
     hidden_size: int = 5632    # MLP Expansion (~2.75x d_model for SwiGLU efficiency)
     dropout: float = 0.0
+    
+    # Sequence length (for generation crop)
+    max_seq_len: int = 16384
 
 @dataclass
 class TrainingArgs:
@@ -33,6 +43,7 @@ class TrainingArgs:
     grad_accum_steps: int
     lr_start: float
     lr_end: float
+    warmup_steps: int = 2000
 
 # --- Hardware Profiles ---
 
@@ -44,7 +55,8 @@ if MODE == "pretrain_5080":
         seq_len=2048,           # Standard context
         grad_accum_steps=8,     # Effective batch ~128
         lr_start=3e-4,
-        lr_end=1e-5
+        lr_end=1e-5,
+        warmup_steps=2000
     )
 
 elif MODE == "longctx_5090":
@@ -55,5 +67,6 @@ elif MODE == "longctx_5090":
         seq_len=16384,          # 16k Context (MLA makes this possible!)
         grad_accum_steps=32,
         lr_start=5e-5,          # Lower LR for long-context finetuning
-        lr_end=1e-6
+        lr_end=1e-6,
+        warmup_steps=500
     )
