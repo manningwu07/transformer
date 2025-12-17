@@ -1,8 +1,6 @@
 # data
 /data/
-/data/raw/
-/data/processed/*.bin
-/data/tokenized/
+/logs/
 
 # venv
 /.venv/
@@ -10,11 +8,7 @@
 /__pycache__/
 
 # modal
-/src/models/
 /models/
-/oldModels/
-/dataExtraction/old/
-/blended_corpus.txt
 
 # archived
 /src/archived
