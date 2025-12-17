@@ -1,102 +1,191 @@
-import json
 import math
-import os
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
+import mlx.core as mx
+import mlx.nn as nn
 from lora.lora import LoRALinear
 from params import Config
 
-
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1, max_len=2048, return_present=False, lora_r=None):
+    def __init__(self, d_model, n_heads, dropout=0.1, max_len=2048, lora_r=None):
         super().__init__()
-        assert d_model % n_heads == 0
+        assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         self.n_heads = n_heads
         self.d_head = d_model // n_heads
-        qkv = nn.Linear(d_model, 3 * d_model)
+        
+        # RoPE: Define rotary embedding
+        self.rope = nn.RoPE(self.d_head, traditional=True)
+
+        # Projections
         if lora_r:
-            # split into q, k, v projections
-            q_layer = nn.Linear(d_model, d_model)
-            k_layer = nn.Linear(d_model, d_model)
-            v_layer = nn.Linear(d_model, d_model)
-            # LoRA only on q and v
-            self.q_proj = LoRALinear(q_layer, r=lora_r)
-            self.k_proj = k_layer
-            self.v_proj = LoRALinear(v_layer, r=lora_r)
-            self.merge = nn.Linear(3 * d_model, 3 * d_model)
+            self.q_proj = LoRALinear(nn.Linear(d_model, d_model, bias=False), r=lora_r)
+            self.v_proj = LoRALinear(nn.Linear(d_model, d_model, bias=False), r=lora_r)
+            self.k_proj = nn.Linear(d_model, d_model, bias=False)
         else:
-            self.qkv = qkv
+            self.q_proj = nn.Linear(d_model, d_model, bias=False)
+            self.k_proj = nn.Linear(d_model, d_model, bias=False)
+            self.v_proj = nn.Linear(d_model, d_model, bias=False)
 
-        self.out = nn.Linear(d_model, d_model)
-        self.attn_drop = nn.Dropout(dropout)
-        self.resid_drop = nn.Dropout(dropout)
-        self.return_present = return_present
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
-        # Register a causal mask (upper triangular)
-        mask = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool))
-        self.register_buffer("mask", mask.view(1, 1, max_len, max_len), persistent=False)
-
-    def forward(self, x, past_kv=None):
-        # x: (B, T, d_model)
-        B, T, C = x.size()
-        if hasattr(self, "qkv"):  # normal mode
-            qkv = self.qkv(x)  # (B,T,3*d)
-            q, k, v = qkv.split(C, dim=2)
-        else:  # LoRA mode
-            q = self.q_proj(x)
-            k = self.k_proj(x)
-            v = self.v_proj(x)
-
-        # reshape into heads
-        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)  # (B,h,T,d)
-        k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-
-        # If we have past KV (for incremental decoding), append
-        if past_kv is not None:
-            pk, pv = past_kv
-            k = torch.cat([pk, k], dim=2)  # (B,h,T_total,d)
-            v = torch.cat([pv, v], dim=2)
-
-        # save for cache
-        present = (k, v)
+    def __call__(self, x, mask=None, cache=None):
+        B, L, D = x.shape
         
-        B, _, T_q, _ = q.shape
-        T_k = k.size(2)
-        if T_k > self.mask.size(-1):
-            device = self.mask.device
-            self.mask = torch.tril(torch.ones(T_k, T_k, dtype=torch.bool, device=device)).view(1,1,T_k,T_k)
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
-        if (Config.seq_len <= 256):
-            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
-            mask = self.mask[:, :, :T_q, :T_k]
-            att = att.masked_fill(~mask, -1e9)
-            att = F.softmax(att, dim=-1)
-            att = torch.nan_to_num(att, nan=0.0)
-            att = self.attn_drop(att)
-            y = att @ v  # (B,h,T,d) 
-        else:
-            # Use SDPA's built-in causal mask. Do not pass a boolean "allow" mask.
-            # This avoids the True=masked vs True=allowed semantics mismatch.
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                is_causal=True,
-            )
+        # Reshape for multi-head attention: (B, L, n_heads, d_head)
+        q = q.reshape(B, L, self.n_heads, self.d_head)
+        k = k.reshape(B, L, self.n_heads, self.d_head)
+        v = v.reshape(B, L, self.n_heads, self.d_head)
+
+        # Apply RoPE to Q and K
+        # If we have a cache (inference), we need to offset the RoPE positions
+        offset = cache[0].shape[1] if cache is not None else 0
+        q = self.rope(q, offset=offset)
+        k = self.rope(k, offset=offset)
+
+        # Update KV Cache if present
+        if cache is not None:
+            past_k, past_v = cache
+            k = mx.concatenate([past_k, k], axis=1)
+            v = mx.concatenate([past_v, v], axis=1)
+            cache = (k, v)
+
+        # Flash Attention (Scaled Dot Product)
+        # MLX expects (B, H, L, D) for transpose or handles it internally. 
+        # mx.fast.scaled_dot_product_attention expects: (q, k, v, mask)
+        # We need to swap dimensions to (B, H, L, D) for the fast kernel API usually
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
+
+        # Apply attention
+        # Note: MLX scaled_dot_product_attention handles causal masking if a mask is provided,
+        # but for causal specific implementation without explicit mask tensor, we rely on the mask passed in.
+        y = mx.fast.scaled_dot_product_attention(q, k, v, mask=mask, scale=1/math.sqrt(self.d_head))
+
+        # Reassemble
+        y = y.transpose(0, 2, 1, 3).reshape(B, L, D)
         
-        if torch.isnan(y).any() or torch.isinf(y).any():
-            raise RuntimeError("NaN/Inf in attention output")
+        y = self.out_proj(y)
+        y = self.dropout(y)
+        
+        return y, cache
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # back to (B,T,C)
-        y = self.resid_drop(self.out(y))  # linear out proj
+class SwiGLU(nn.Module):
+    def __init__(self, d_model, d_ff, dropout):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_ff * 2, bias=False)
+        self.fc2 = nn.Linear(d_ff, d_model, bias=False)
+        self.drop = nn.Dropout(dropout)
 
-        if self.return_present:
-            return y, present
-        else:
-            return y
+    def __call__(self, x):
+        x_gated = self.fc1(x)
+        x_g, x_v = mx.split(x_gated, 2, axis=-1)
+        # SwiGLU: SiLU(gate) * value
+        return self.drop(self.fc2(nn.silu(x_g) * x_v))
+
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, n_heads, d_ff, dropout, max_len):
+        super().__init__()
+        self.ln1 = nn.RMSNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_heads, dropout, max_len)
+        self.ln2 = nn.RMSNorm(d_model)
+        self.mlp = SwiGLU(d_model, d_ff, dropout)
+
+    def __call__(self, x, mask=None, cache=None):
+        residual = x
+        x = self.ln1(x)
+        a, cache = self.attn(x, mask=mask, cache=cache)
+        x = residual + a
+        
+        residual = x
+        x = self.ln2(x)
+        x = residual + self.mlp(x)
+        return x, cache
+
+class LLM(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        d_model=512,
+        n_heads=8,
+        n_layers=6,
+        d_ff=2048,
+        max_len=1024,
+        dropout=0.1
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        # Note: Removed learned Positional Embeddings in favor of RoPE inside blocks
+        
+        self.layers = [
+            TransformerBlock(d_model, n_heads, d_ff, dropout, max_len)
+            for _ in range(n_layers)
+        ]
+        self.ln_f = nn.RMSNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.max_len = max_len
+
+        # Weight Tying
+        self.head.weight = self.tok_emb.weight
+
+    def __call__(self, x, mask=None, cache=None):
+        # x: (B, L)
+        x = self.tok_emb(x)
+        
+        new_cache = []
+        for i, layer in enumerate(self.layers):
+            c_i = cache[i] if cache is not None else None
+            x, c_i = layer(x, mask=mask, cache=c_i)
+            new_cache.append(c_i)
+            
+        x = self.ln_f(x)
+        logits = self.head(x)
+        return logits, new_cache
+
+    def generate(self, idx, max_tokens=20, temp=0.7):
+        # idx: (B, L) initial prompt
+        y = idx
+        cache = None
+
+        # Create a causal mask for the initial pass
+        # MLX fast attention supports additive mask. 
+        # We generally rely on the implicit causal nature or pass a triangular mask.
+        # For the prompt:
+        L = y.shape[1]
+        mask = nn.MultiHeadAttention.create_additive_causal_mask(L)
+        mask = mask.astype(self.tok_emb.weight.dtype)
+
+        # 1. Process Prompt
+        logits, cache = self(y, mask=mask)
+        
+        # 2. Decode loop
+        for _ in range(max_tokens):
+            # Take last token logits
+            last_logits = logits[:, -1, :] 
+            
+            # Simple Sampling
+            if temp > 0:
+                last_logits = last_logits / temp
+                # MLX doesn't have Multinomial yet in all versions, 
+                # but we can use categorical via random.categorical
+                next_token = mx.random.categorical(last_logits, num_samples=1)
+            else:
+                next_token = mx.argmax(last_logits, axis=-1, keepdims=True)
+            
+            y = mx.concatenate([y, next_token], axis=1)
+            
+            if y.shape[1] >= self.max_len:
+                break
+                
+            # Forward only the new token
+            # Mask is None for single token (it attends to all past via cache)
+            logits, cache = self(next_token, cache=cache)
+
+        return y
 
 
 class TransformerBlock(nn.Module):
