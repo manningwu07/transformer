@@ -1,52 +1,102 @@
-#!/usr/bin/env python3
+import torch
+import torch.nn.functional as F
+import os
+import argparse
+from transformer import LLM
+from params import Config
 from tokenizers import Tokenizer
-import argparse, requests
 
-def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--host", type=str, default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--max_tokens", type=int, default=80)
-    ap.add_argument("--top_k", type=int, default=40)
-    ap.add_argument("--top_p", type=float, default=0.9)
-    ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--rep_pen", type=float, default=1.2)
-    ap.add_argument("--tok", type=str, default="data/json/tokenizer.json")
-    return ap.parse_args()
+# --- Configuration ---
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+TOKENIZER_PATH = "data/tokenizer.json" # Path to your trained tokenizer
 
-args = parse_args()
-tokenizer = Tokenizer.from_file(args.tok)
-url = f"http://{args.host}:{args.port}/generate"
-print(f"Connecting to {url}")
+def load_model(ckpt_path):
+    print(f"⏳ Loading model from {ckpt_path}...")
+    model = LLM() # Config is pulled automatically from params.py
+    
+    # Load weights
+    if os.path.exists(ckpt_path):
+        state_dict = torch.load(ckpt_path, map_location=DEVICE)
+        model.load_state_dict(state_dict)
+        print("✅ Model weights loaded successfully.")
+    else:
+        print("⚠️ Checkpoint not found! Initializing random model (Gibberish mode).")
+    
+    model.to(DEVICE).to(dtype=torch.bfloat16) # Use BF16 for inference
+    model.eval()
+    return model
 
-while True:
-    try:
-        prompt = input("You: ").strip()
-        if prompt.lower() == "exit":
+def generate(model, tokenizer, prompt, max_new_tokens=100, temperature=0.7, top_k=50):
+    # 1. Encode
+    encoded = tokenizer.encode(prompt)
+    idx = torch.tensor(encoded.ids, dtype=torch.long, device=DEVICE).unsqueeze(0)
+    
+    # 2. Loop
+    print(f"\n🤖 AI: ", end="", flush=True)
+    
+    for _ in range(max_new_tokens):
+        # Crop context if it exceeds model limit (standard simple inference)
+        idx_cond = idx[:, -Config.d_model:] 
+        
+        with torch.no_grad():
+            # Forward pass
+            logits, _ = model(idx_cond)
+            logits = logits[:, -1, :] # Get last token logits
+            
+            # Temperature scaling
+            logits = logits / temperature
+            
+            # Top-K Sampling
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            # Sample
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # Decode & Print token-by-token
+            new_token_id = idx_next.item()
+            decoded_token = tokenizer.decode([new_token_id])
+            print(decoded_token, end="", flush=True)
+            
+            # Append
+            idx = torch.cat((idx, idx_next), dim=1)
+            
+            # Stop token logic (optional, assuming 0 is pad or you have an EOS)
+            if new_token_id == tokenizer.token_to_id("<|endoftext|>"):
+                break
+    print("\n")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, default="models/latest.pt", help="Path to model checkpoint")
+    parser.add_argument("--temp", type=float, default=0.7, help="Sampling temperature")
+    args = parser.parse_args()
+
+    # Load Tokenizer
+    if not os.path.exists(TOKENIZER_PATH):
+        print(f"❌ Tokenizer not found at {TOKENIZER_PATH}. Run tokenizer generation first.")
+        return
+    tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
+
+    # Load Model
+    model = load_model(args.ckpt)
+
+    print(f"✨ Ready! (Ctrl+C to exit)")
+    print("-" * 50)
+
+    while True:
+        try:
+            user_input = input("You: ")
+            if not user_input: continue
+            if user_input.lower() in ["exit", "quit"]: break
+            
+            generate(model, tokenizer, user_input, temperature=args.temp)
+            
+        except KeyboardInterrupt:
+            print("\nExiting...")
             break
-        if not prompt:
-            continue
-        # tokenize
-        enc = tokenizer.encode(prompt)
-        ids = [tokenizer.token_to_id("<bos>")] + enc.ids
-        payload = {
-            "ids": ids,
-            "max_tokens": args.max_tokens,
-            "top_k": args.top_k,
-            "top_p": args.top_p,
-            "temperature": args.temperature,
-            "repetition_penalty": args.rep_pen,
-        }
-        r = requests.post(url, json=payload, timeout=30)
-        res = r.json()
-        if "error" in res:
-            print("[SERVER ERROR]", res["error"])
-        else:
-            print(f"Bot: {res.get('text', '').strip()}")
-        # Uncomment for debug:
-        print(res)
-    except KeyboardInterrupt:
-        break
-    except Exception as e:
-        print("[CLI ERROR]", e)
-        continue
+
+if __name__ == "__main__":
+    main()

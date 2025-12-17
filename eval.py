@@ -1,120 +1,78 @@
-import math
-import random
 import torch
+import torch.nn.functional as F
+import os
+import argparse
+from tqdm import tqdm
+from transformer import LLM
 from params import Config
+from torch.utils.data import DataLoader
+# Assuming you use the IndexedBinaryDataset from your train.py logic
+from train import IndexedBinaryDataset 
 
-def evaluate(
-    model,
-    loader,
-    vocab_size,
-    pad_id,
-    device,
-    split="VAL",
-    max_batches=None,
-    shard_frac=1.0,
-    log_random_sample = Config.log_random_sample,
-    random_batches = Config.random_samples
-):
-    """
-    Evaluate model on a subset of shards.
-    Args:
-      max_batches: if set (int), evaluate only this many batches total.
-      shard_frac: fraction of shards to use (1.0 = all).
-    """
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+def evaluate(model, data_loader):
     model.eval()
-    total_loss_sum = 0.0
+    total_loss = 0.0
     total_tokens = 0
-    criterion = torch.nn.CrossEntropyLoss(ignore_index=pad_id, reduction="sum")
-
-    # Build sub-loader if we can access shards; otherwise, use the provided loader.
-    use_subset = hasattr(loader, "dataset") and hasattr(loader.dataset, "shards")
-    if use_subset:
-        all_shards = list(loader.dataset.shards)
-        n_total = len(all_shards)
-        selected = all_shards
-        n_selected = max(1, int(round(n_total * float(shard_frac))))
-        if n_selected >= n_total:
-            selected = all_shards
-        else:
-            selected = random.sample(all_shards, n_selected)
-
-        sub_ds = loader.dataset.__class__(
-            loader.dataset.prefix,
-            loader.dataset.seq_len,
-            repeat=False,
-            shuffle=False,
-            pad_id=getattr(loader.dataset, "pad_id", pad_id),
-        )
-        sub_ds.shards = selected
-        num_workers = getattr(loader, "num_workers", 2) or 0
-        sub_loader = torch.utils.data.DataLoader(
-            sub_ds, batch_size=loader.batch_size, num_workers=num_workers
-        )
-        frac_effective = len(selected) / max(1, n_total)
-        print(
-            f"[{split}] Using {len(selected)}/{n_total} shards (~{frac_effective*100:.1f}%). "
-            f"Eval up to {max_batches or 'ALL'} batches"
-        )
-    else:
-        sub_loader = loader
-        print(f"[{split}] Evaluating loader (no shard control).")
-
-    batches_run = 0
-    with torch.no_grad():
-        for i, (x, y) in enumerate(sub_loader):
-            x, y = x.to(device), y.to(device)
-            logits, _ = model(x)
-            loss_sum = criterion(logits.view(-1, vocab_size), y.view(-1)).item()
-            tokens = (y != pad_id).sum().item()
-
-            total_loss_sum += loss_sum
-            total_tokens += tokens
-
-            batches_run += 1
-            if max_batches is not None and batches_run >= int(max_batches):
-                break
-            if i % 50 == 0:
-                print(
-                    f"[{split}] {batches_run} batches, {total_tokens} non-pad tokens",
-                    end="\r",
-                )
-
-    avg_loss = total_loss_sum / max(1, total_tokens)
-    ppl = math.exp(avg_loss) if total_tokens > 0 else float("inf")
-    print(f"\n[{split}] tokLoss={avg_loss:.4f}, PPL={ppl:.2f}")
     
-    if log_random_sample:
-        # Build a fresh dataset with shuffle=True just for random sample
-        rand_ds = loader.dataset.__class__(
-            loader.dataset.prefix,
-            loader.dataset.seq_len,
-            pad_id=getattr(loader.dataset, "pad_id", pad_id),
-            repeat=False,
-            shuffle=True,
-        )
+    pbar = tqdm(data_loader, desc="Evaluating")
+    
+    with torch.no_grad():
+        for x, y in pbar:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            
+            # Forward pass
+            # Note: transformer.py returns (logits, loss) if targets provided
+            _, loss = model(x, targets=y)
+            
+            total_loss += loss.item() * y.numel()
+            total_tokens += y.numel()
+            
+            # Update progress bar with current perplexity
+            current_ppl = torch.exp(torch.tensor(total_loss / total_tokens))
+            pbar.set_postfix({"PPL": f"{current_ppl:.2f}"})
 
-        rand_loader = torch.utils.data.DataLoader(
-            rand_ds,
-            batch_size=loader.batch_size,
-            num_workers=getattr(loader, "num_workers", 0) or 0,
-        )
+    avg_loss = total_loss / total_tokens
+    perplexity = torch.exp(torch.tensor(avg_loss))
+    return avg_loss, perplexity.item()
 
-        rs_loss_sum, rs_total_tokens = 0.0, 0
-        with torch.no_grad():
-            for i, (x, y) in enumerate(rand_loader):
-                x, y = x.to(device), y.to(device)
-                logits, _ = model(x)
-                
-                loss_sum = criterion(logits.view(-1, vocab_size), y.view(-1)).item()
-                tokens = (y != pad_id).sum().item()
-                rs_loss_sum += loss_sum
-                rs_total_tokens += tokens
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", type=str, required=True, help="Checkpoint to evaluate")
+    parser.add_argument("--data", type=str, default="data/shards/val", help="Path to validation shards")
+    args = parser.parse_args()
 
-                if i + 1 >= random_batches:
-                    break
-
-        rs_avg = rs_loss_sum / max(1, rs_total_tokens)
-        rs_ppl = math.exp(rs_avg) if rs_total_tokens > 0 else float("inf")
-        print(f"[{split}-RANDOM] {random_batches} batches → tokLoss={rs_avg:.4f}, PPL={rs_ppl:.2f}")
+    print(f"📉 Evaluating Checkpoint: {args.ckpt}")
+    
+    # 1. Load Model
+    model = LLM()
+    if os.path.exists(args.ckpt):
+        model.load_state_dict(torch.load(args.ckpt, map_location=DEVICE))
+    else:
+        print("❌ Checkpoint not found.")
+        return
         
-    return avg_loss
+    model.to(DEVICE).to(dtype=torch.bfloat16) # BF16 for speed/memory
+
+    # 2. Load Data
+    # Ensure validation data exists
+    if not os.path.exists(args.data):
+        print(f"❌ Validation data not found at {args.data}")
+        return
+
+    # Use a larger batch size for eval since no gradients are stored
+    val_ds = IndexedBinaryDataset(args.data, Config.seq_len)
+    val_loader = DataLoader(val_ds, batch_size=Config.batch_size * 2, num_workers=4)
+    
+    # 3. Run Eval
+    loss, ppl = evaluate(model, val_loader)
+    
+    print("-" * 40)
+    print(f"✅ Final Results:")
+    print(f"   Validation Loss: {loss:.4f}")
+    print(f"   Perplexity:      {ppl:.2f}")
+    print("-" * 40)
+
+if __name__ == "__main__":
+    main()
