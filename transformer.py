@@ -1,279 +1,169 @@
-import json
+# transformer.py
 import math
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from params import Config, TrainCfg
 
-from lora.lora import LoRALinear
-from params import Config
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout=0.1, max_len=2048, return_present=False, lora_r=None):
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
-        assert d_model % n_heads == 0
-        self.n_heads = n_heads
-        self.d_head = d_model // n_heads
-        qkv = nn.Linear(d_model, 3 * d_model)
-        if lora_r:
-            # split into q, k, v projections
-            q_layer = nn.Linear(d_model, d_model)
-            k_layer = nn.Linear(d_model, d_model)
-            v_layer = nn.Linear(d_model, d_model)
-            # LoRA only on q and v
-            self.q_proj = LoRALinear(q_layer, r=lora_r)
-            self.k_proj = k_layer
-            self.v_proj = LoRALinear(v_layer, r=lora_r)
-            self.merge = nn.Linear(3 * d_model, 3 * d_model)
-        else:
-            self.qkv = qkv
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
 
-        self.out = nn.Linear(d_model, d_model)
-        self.attn_drop = nn.Dropout(dropout)
-        self.resid_drop = nn.Dropout(dropout)
-        self.return_present = return_present
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
-        # Register a causal mask (upper triangular)
-        mask = torch.tril(torch.ones(max_len, max_len, dtype=torch.bool))
-        self.register_buffer("mask", mask.view(1, 1, max_len, max_len), persistent=False)
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=16384, theta=10000.0):
+        super().__init__()
+        # Precompute RoPE frequencies
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        t = torch.arange(max_seq_len)
+        freqs = torch.outer(t, freqs).float()
+        self.register_buffer("cos_cached", freqs.cos())
+        self.register_buffer("sin_cached", freqs.sin())
 
-    def forward(self, x, past_kv=None):
-        # x: (B, T, d_model)
-        B, T, C = x.size()
-        if hasattr(self, "qkv"):  # normal mode
-            qkv = self.qkv(x)  # (B,T,3*d)
-            q, k, v = qkv.split(C, dim=2)
-        else:  # LoRA mode
-            q = self.q_proj(x)
-            k = self.k_proj(x)
-            v = self.v_proj(x)
+    def forward(self, x, seq_len):
+        # x: [Batch, Heads, Seq, HeadDim]
+        # Return cos, sin for the relevant sequence length
+        return self.cos_cached[:seq_len, ...].to(x.device), \
+               self.sin_cached[:seq_len, ...].to(x.device)
 
-        # reshape into heads
-        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)  # (B,h,T,d)
-        k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+def apply_rope(x, cos, sin):
+    # Rotate standard Q/K vectors
+    d = x.shape[-1] // 2
+    x1, x2 = x[..., :d], x[..., d:]
+    y1 = x1 * cos - x2 * sin
+    y2 = x1 * sin + x2 * cos
+    return torch.cat([y1, y2], dim=-1)
 
-        # If we have past KV (for incremental decoding), append
-        if past_kv is not None:
-            pk, pv = past_kv
-            k = torch.cat([pk, k], dim=2)  # (B,h,T_total,d)
-            v = torch.cat([pv, v], dim=2)
-
-        # save for cache
-        present = (k, v)
+class MLA(nn.Module):
+    """
+    Multi-Head Latent Attention (DeepSeek V3 Style)
+    Compresses KV into a latent vector to save VRAM and Bandwidth.
+    """
+    def __init__(self, args):
+        super().__init__()
+        self.n_heads = args.n_heads
+        self.head_dim = args.head_dim
+        self.d_model = args.d_model
         
-        B, _, T_q, _ = q.shape
-        T_k = k.size(2)
-        if T_k > self.mask.size(-1):
-            device = self.mask.device
-            self.mask = torch.tril(torch.ones(T_k, T_k, dtype=torch.bool, device=device)).view(1,1,T_k,T_k)
-
-        if (Config.seq_len <= 256):
-            att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)
-            mask = self.mask[:, :, :T_q, :T_k]
-            att = att.masked_fill(~mask, -1e9)
-            att = F.softmax(att, dim=-1)
-            att = torch.nan_to_num(att, nan=0.0)
-            att = self.attn_drop(att)
-            y = att @ v  # (B,h,T,d) 
-        else:
-            # Use SDPA's built-in causal mask. Do not pass a boolean "allow" mask.
-            # This avoids the True=masked vs True=allowed semantics mismatch.
-            y = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,
-                dropout_p=self.attn_drop.p if self.training else 0.0,
-                is_causal=True,
-            )
+        # 1. Query Compression (Model -> Latent -> Heads)
+        self.q_down = nn.Linear(args.d_model, args.q_lora_rank, bias=False)
+        self.q_up = nn.Linear(args.q_lora_rank, args.n_heads * args.head_dim, bias=False)
         
-        if torch.isnan(y).any() or torch.isinf(y).any():
-            raise RuntimeError("NaN/Inf in attention output")
+        # 2. KV Compression (Model -> Latent -> Heads)
+        # This 'kv_down' output is what gets cached during inference! (512 dims vs 2048)
+        self.kv_down = nn.Linear(args.d_model, args.d_latent, bias=False)
+        self.kv_up = nn.Linear(args.d_latent, args.n_heads * args.head_dim, bias=False)
+        
+        # 3. Output Projection
+        self.o_proj = nn.Linear(args.n_heads * args.head_dim, args.d_model, bias=False)
+        
+        self.rope = RotaryEmbedding(args.head_dim, theta=args.rope_theta)
 
-        y = y.transpose(1, 2).contiguous().view(B, T, C)  # back to (B,T,C)
-        y = self.resid_drop(self.out(y))  # linear out proj
+    def forward(self, x):
+        B, T, C = x.shape
+        
+        # --- Q Processing ---
+        # Compress -> Decompress
+        q_latent = self.q_down(x)
+        q = self.q_up(q_latent)
+        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2) # [B, H, T, D]
+        
+        # --- KV Processing (MLA Magic) ---
+        # Compress (This 512-dim vector is what you'd cache in inference)
+        kv_latent = self.kv_down(x) 
+        
+        # Decompress (Reconstruct full heads for calculation)
+        # Note: In pure inference, we can merge this w/ Query, but for training, 
+        # reconstructing K/V is cleaner for FlashAttn kernels.
+        kv = self.kv_up(kv_latent)
+        kv = kv.view(B, T, self.n_heads, self.head_dim).transpose(1, 2) # [B, H, T, D]
+        
+        k, v = kv, kv  # In simple MLA, K and V share the same projection
+        
+        # --- RoPE ---
+        cos, sin = self.rope(q, T)
+        # Apply RoPE to Q and K
+        # (DeepSeek technically uses a decoupled strategy, but standard RoPE 
+        # on the up-projected heads is mathematically stable for 1B scale)
+        q = apply_rope(q, cos, sin)
+        k = apply_rope(k, cos, sin)
+        
+        # --- Flash Attention ---
+        # Uses standard PyTorch optimized kernel (FlashAttn v2 backend usually)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        return self.o_proj(out)
 
-        if self.return_present:
-            return y, present
-        else:
-            return y
+class SwiGLU_MLP(nn.Module):
+    """
+    Standard High-Performance MLP (Llama style).
+    Replaces the MoE. Dense, robust, harder to mess up.
+    """
+    def __init__(self, args):
+        super().__init__()
+        self.w1 = nn.Linear(args.d_model, args.hidden_size, bias=False) # Gate
+        self.w2 = nn.Linear(args.hidden_size, args.d_model, bias=False) # Down
+        self.w3 = nn.Linear(args.d_model, args.hidden_size, bias=False) # Up
 
+    def forward(self, x):
+        # F.silu is Swish
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout, max_len, return_present=False):
+    def __init__(self, args):
         super().__init__()
-        class RMSNorm(nn.Module):
-            def __init__(self, dim, eps=1e-6):
-                super().__init__()
-                self.scale = nn.Parameter(torch.ones(dim))
-                self.eps = eps
-            def forward(self, x):
-                norm = x.pow(2).mean(-1, keepdim=True)
-                return self.scale * x / torch.sqrt(norm + self.eps)
+        self.norm1 = RMSNorm(args.d_model, eps=args.rms_norm_eps)
+        self.attn = MLA(args)
+        self.norm2 = RMSNorm(args.d_model, eps=args.rms_norm_eps)
+        self.mlp = SwiGLU_MLP(args)
 
-        # --- SwiGLU MLP: efficient and higher‑quality
-        class SwiGLU(nn.Module):
-            def __init__(self, d_model, d_ff, dropout):
-                super().__init__()
-                self.fc1 = nn.Linear(d_model, 2 * d_ff)
-                self.fc2 = nn.Linear(d_ff, d_model)
-                self.drop = nn.Dropout(dropout)
-            def forward(self, x):
-                x_gated = self.fc1(x)
-                x_g, x_v = x_gated.chunk(2, dim=-1)
-                return self.drop(self.fc2(F.silu(x_g) * x_v))
-
-        self.ln1 = RMSNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout, max_len)
-        self.ln2 = RMSNorm(d_model)
-        self.mlp = SwiGLU(d_model, d_ff, dropout)
-        
-        self.return_present = return_present
-
-    def forward(self, x, past_kv=None):
-        if self.return_present == False:
-            a = self.attn(self.ln1(x), past_kv)
-            x = x + a
-            m = torch.utils.checkpoint.checkpoint(self.mlp, self.ln2(x), use_reentrant=False)
-            x = x + m
-            return x, None
-        else:
-            # inference path
-            a, present = self.attn(self.ln1(x), past_kv, return_present=True)
-            x = x + a
-            m = self.mlp(self.ln2(x))
-            x = x + m
-            return x, present
-
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 class LLM(nn.Module):
-    def __init__(
-        self,
-        vocab_size,
-        d_model=512,
-        n_heads=8,
-        n_layers=6,
-        d_ff=2048,
-        max_len=1024,
-        dropout=0.1
-    ):
+    def __init__(self):
         super().__init__()
-        self.tok_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(max_len, d_model)
-
-        self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model, n_heads, d_ff, dropout, max_len, return_present=False) for _ in range(n_layers)]
-        )
-        self.ln_f = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab_size, bias=False)
-        self.max_len = max_len
+        self.config = Config
         
-        # Stabilize the initial logits (GPT does this too) -- prevents inital logits explosion
-        torch.nn.init.normal_(self.tok_emb.weight, mean=0.0, std=0.02)
-        torch.nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
-    
-    def forward(self, idx, past_kvs=None):
-        B, T = idx.size()
-        past_len = 0
-        if past_kvs is not None and len(past_kvs) > 0 and past_kvs[0] is not None:
-            # past_kvs[0][0] is k: (B,h,T_past,d)
-            past_len = past_kvs[0][0].size(2)
-        pos = torch.arange(past_len, past_len + T, device=idx.device).unsqueeze(0)
-        x = self.tok_emb(idx) + self.pos_emb(pos)
+        self.tok_embeddings = nn.Embedding(Config.vocab_size, Config.d_model)
+        self.layers = nn.ModuleList([TransformerBlock(Config) for _ in range(Config.n_layers)])
+        self.norm = RMSNorm(Config.d_model, eps=Config.rms_norm_eps)
+        self.output = nn.Linear(Config.d_model, Config.vocab_size, bias=False)
+        
+        # Weight Tying (Standard practice for small models)
+        self.tok_embeddings.weight = self.output.weight
+        
+        self.apply(self._init_weights)
+        print(f"🧠 Model Initialized: 1B Params | MLA (512 lat) | Context: {TrainCfg.seq_len}")
 
-        new_kvs = []
-        for i, block in enumerate(self.blocks):
-            past = None if past_kvs is None else past_kvs[i]
-            x, present = block(x, past)
-            new_kvs.append(present)
-        x = self.ln_f(x)
-        logits = self.head(x)
-        return logits, new_kvs
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    @torch.no_grad()
-    def generate(
-        self,
-        idx,
-        max_tokens: int = 20,
-        top_k: int = 15,
-        top_p: float = 0.9,
-        temperature: float = 0.7,
-        repetition_penalty: float = 1.2,
-        bad_ids: list[int] | None = None,
-        eos_id: int | None = None,
-    ):
-        """
-        Incremental decoding with KV cache.
-        - First step uses the full prompt to build cache.
-        - Subsequent steps feed only the last token.
-        - Supports top-k, top-p, repetition penalty, temperature.
-        """
-        self.eval()
-        device = next(self.parameters()).device
-        generated = idx.to(device)
-        past_kvs = None
-
-        # Set EOS from model if not provided
-        if eos_id is None:
-            eos_id = getattr(self, "eos_id", None)
-
-        # --- Utility: filter logits ---
-        def filter_top_k_p(logits, top_k=None, top_p=None):
-            if top_k is not None and top_k > 0:
-                v, _ = torch.topk(logits, top_k)
-                logits = torch.where(
-                    logits < v[:, [-1]], torch.full_like(logits, -float("inf")), logits
-                )
-            if top_p is not None and 0.0 < top_p < 1.0:
-                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-                probs = F.softmax(sorted_logits, dim=-1)
-                cum = torch.cumsum(probs, dim=-1)
-                to_remove = cum > top_p
-                to_remove[:, 1:] = to_remove[:, :-1].clone()
-                to_remove[:, 0] = 0
-                mask = torch.zeros_like(logits, dtype=torch.bool)
-                mask.scatter_(1, sorted_idx, to_remove)
-                logits = logits.masked_fill(mask, -float("inf"))
-            return logits
-
-        for _ in range(max_tokens):
-            # Build cache with full prompt once; then incremental
-            if past_kvs is None:
-                logits, past_kvs = self(generated)
-            else:
-                logits, past_kvs = self(generated[:, -1:], past_kvs)
-
-            logits = logits[:, -1, :] / max(1e-5, float(temperature))
-
-            # Mask invalid/special tokens
-            if bad_ids:
-                logits[:, bad_ids] = -float("inf")
-
-            # Apply repetition penalty correctly (handle sign)
-            if repetition_penalty and abs(repetition_penalty - 1.0) > 1e-6:
-                uniq_tokens = torch.unique(generated[0])
-                for t in uniq_tokens:
-                    val = logits[0, t]
-                    if val > 0:
-                        logits[0, t] = val / repetition_penalty
-                    else:
-                        logits[0, t] = val * repetition_penalty
-
-            # Sampling filter
-            logits = filter_top_k_p(logits, top_k, top_p)
-            probs = F.softmax(logits, dim=-1)
-
-            # Degenerate fallback to greedy if NaNs/Inf
-            if not torch.isfinite(probs).all() or (probs.sum(dim=-1) == 0).any():
-                next_token = torch.argmax(logits, dim=-1, keepdim=True)
-            else:
-                next_token = torch.multinomial(probs, num_samples=1)
-            generated = torch.cat([generated, next_token], dim=1)
-
-            # Stop at EOS/id overflow
-            if eos_id is not None and next_token.item() == int(eos_id):
-                break
-            if generated.size(1) >= self.max_len:
-                break
-
-        return generated
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+        x = self.tok_embeddings(idx)
+        
+        for layer in self.layers:
+            x = layer(x)
+            
+        x = self.norm(x)
+        
+        if targets is not None:
+            # Training Mode (Return Loss)
+            logits = self.output(x)
+            loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), targets.view(-1))
+            return logits, loss
+        else:
+            # Inference Mode (Return just logits for last token)
+            logits = self.output(x[:, [-1], :])
+            return logits, None

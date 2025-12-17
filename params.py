@@ -1,108 +1,59 @@
 # params.py
 from dataclasses import dataclass
 
-# Choose a profile by setting ACTIVE = "local" / "debug" / "lora"
-ACTIVE = "local"
+# Toggle this to switch between Training (Short Ctx) and Fine-tuning (Long Ctx)
+# Options: "pretrain_5080", "longctx_5090"
+MODE = "pretrain_5080" 
 
 @dataclass
-class BaseConfig:
-    # Core transformer parameters (must match any loaded checkpoint)
-    d_model: int = 512         # model width
-    hidden_size: int = 1536    # MLP hidden dim (typically 2-4x d_model)
-    vocab_size: int = 65_536   # |V|
-    num_heads: int = 8        # attention heads (d_model % num_heads == 0)
-    seq_len: int = 64          # training context length (shorter = less memory)
-    max_len: int = 1024         # generation max context
-    n_layers: int = 8         # number of transformer blocks
-
-    # Optimization & scheduling
-    max_epochs: int = 3
-    patience: int = 3
-    improvement_threshold: float = 0.05
-    batch_size: int = 24
-    epsilon: float = 1e-4
-    gradAccumSteps: int = 24          # effective batch = batch_size * gradAccumSteps
-    eval_every_steps: int = 100
-    max_batches: int = 250
-    label_smoothing: float = 0.01
-    dropout: float = 0.01
-
-    # Adafactor-specific
-    grad_clip: float = 1.0
-    startLr: float = 3e-4
-    endLr: float = 3e-5
-    beta1: float = 0.9
-    beta2: float = 0.99
-    weight_decay: float = 0.01
-    totalOptSteps: int = 1_500
+class ModelArgs:
+    # 1B Model Dimensions
+    d_model: int = 2048        # Core thinking dimension
+    n_layers: int = 24         # Depth
+    n_heads: int = 16          # Attention heads
+    head_dim: int = 128        # d_model // n_heads
     
-    # Token accounting
-    # (dynamic: recomputed in train.py; used for diagnostics/logging only)
-    target_warmup_tokens: float = 2e7  # ≈ 20M tokens of warmup (1-3% of total token count)
-
-    # Debug
-    debug: bool = True
-    debug_every: int = 20
-    log_random_sample: bool = False
-    random_samples: int = 250
-
-# Profile overrides ---------------------------------------------------------
-@dataclass
-class DebugProfile(BaseConfig):
-    # fast iteration / overfit checks
-    seq_len: int = 64
-    n_layers: int = 2
-    d_model: int = 512
-    hidden_size: int = 1536
-    batch_size: int = 4
-    gradAccumSteps: int = 1
-    eval_every_steps: int = 250
-    max_batches: int = 100
+    # MLA Specifics (The Compression)
+    d_latent: int = 512        # KV Cache is compressed to this size (4x smaller than d_model)
+    q_lora_rank: int = 1536    # Query compression (optional, but follows DeepSeek V3 spec)
     
+    # Vocabulary & Normalization
+    vocab_size: int = 65536
+    rms_norm_eps: float = 1e-6
+    rope_theta: float = 10000.0
+    
+    # Architecture
+    hidden_size: int = 5632    # MLP Expansion (~2.75x d_model for SwiGLU efficiency)
     dropout: float = 0.0
-    debug: bool = True
-    debug_every: int = 100
 
 @dataclass
-class LocalProfile(BaseConfig):
-    seq_len: int = 1024
-    n_layers: int = 8
-    d_model: int = 512
-    hidden_size: int = 1536
-    batch_size: int = 5             # Dont try to max out this bc it will be slow... leave some memory for other processes
-    gradAccumSteps: int = 30         # effective batch ~150
-    
-    eval_every_steps: int = 250
-    max_batches: int = 100
-    dropout: float = 0.01
-    label_smoothing: float = 0.01
-    debug: bool = True
-    debug_every: int = 33
-    log_random_sample: bool = False
-    random_samples: int = 250
+class TrainingArgs:
+    batch_size: int
+    seq_len: int
+    grad_accum_steps: int
+    lr_start: float
+    lr_end: float
 
-@dataclass
-class LoRAProfile(BaseConfig):
-    # LoRA finetuning: only adapter params updated so memory / batch can be bigger
-    seq_len: int = 256
-    n_layers: int = 12
-    d_model: int = 768
-    hidden_size: int = 2048
-    batch_size: int = 10
-    gradAccumSteps: int = 10          # effective batch = 64
-    lr: float = 1e-3
-    
-    eval_every_steps: int = 250
-    dropout: float = 0.0
-    debug: bool = False
+# --- Hardware Profiles ---
 
-# Export the chosen Config
-if ACTIVE == "debug":
-    Config = DebugProfile()
-elif ACTIVE == "lora":
-    Config = LoRAProfile()
-else:
-    Config = LocalProfile()
+if MODE == "pretrain_5080":
+    # Optimized for RTX 5080 (16GB VRAM)
+    Config = ModelArgs()
+    TrainCfg = TrainingArgs(
+        batch_size=16,          # Higher BS thanks to MLA
+        seq_len=2048,           # Standard context
+        grad_accum_steps=8,     # Effective batch ~128
+        lr_start=3e-4,
+        lr_end=1e-5
+    )
 
-# Backwards compatibility: expose lowercase name if some modules import 'config'
-config = Config
+elif MODE == "longctx_5090":
+    # Optimized for RTX 5090 (32GB VRAM) - Pushing limits
+    Config = ModelArgs()
+    TrainCfg = TrainingArgs(
+        batch_size=4,           # Lower BS for massive context
+        seq_len=16384,          # 16k Context (MLA makes this possible!)
+        grad_accum_steps=32,
+        lr_start=5e-5,          # Lower LR for long-context finetuning
+        lr_end=1e-6
+    )
