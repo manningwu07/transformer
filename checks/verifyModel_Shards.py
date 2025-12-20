@@ -2,7 +2,7 @@ import argparse
 import numpy as np
 import json
 import torch
-from transformer import LLM
+from transformer_mlx import LLM
 from params import Config
 
 

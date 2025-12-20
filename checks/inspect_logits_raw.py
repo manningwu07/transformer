@@ -1,7 +1,7 @@
 # inspect_logits_raw.py
 import torch, json
 from tokenizers import Tokenizer
-from transformer import LLM
+from transformer_mlx import LLM
 from params import Config
 
 ckpt_path = "models/best_model.pt"

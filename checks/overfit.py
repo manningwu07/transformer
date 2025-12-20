@@ -4,7 +4,7 @@ from tokenizers import Tokenizer
 import torch, json
 from torch.utils.data import DataLoader
 import numpy as np
-from transformer import LLM
+from transformer_mlx import LLM
 from params import Config
 
 def collate_fn(batch, pad_id):

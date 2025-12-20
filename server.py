@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import torch
 import torch.nn.functional as F
-from transformer import LLM
+from transformer_mlx import LLM
 from params import Config
 import json
 from tokenizers import Tokenizer as HFTokenizer

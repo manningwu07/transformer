@@ -1,7 +1,7 @@
 # inspect_logits.py
 import argparse, torch, json, numpy as np
 from tokenizers import Tokenizer
-from transformer import LLM
+from transformer_mlx import LLM
 
 def stats(t):
     return dict(min=float(t.min()), max=float(t.max()), mean=float(t.mean()), std=float(t.std()), nan=bool(torch.isnan(t).any()), inf=bool(torch.isinf(t).any()))

@@ -12,7 +12,7 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_map, tree_flatten
 
-from transformer import LLM
+from transformer_mlx import LLM
 from params import Config
 
 # --------------------

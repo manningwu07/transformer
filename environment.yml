@@ -1,0 +1,26 @@
+name: mlx-lab
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy>=1.26.0
+  - pip
+  - tqdm
+  - ipython
+  # Core ML libraries
+  - pytorch::pytorch 
+  - pytorch::torchvision
+  # API / Server
+  - fastapi
+  - uvicorn
+  - pydantic
+  # Dev tools
+  - black
+  - pip:
+    - mlx==0.16.3
+    - huggingface-hub
+    - datasets
+    - tokenizers
+    - psutil  # For memory tracking in script

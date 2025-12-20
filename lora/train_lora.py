@@ -4,7 +4,7 @@ import torch
 from torch.utils.data import DataLoader
 import numpy as np
 
-from transformer import LLM
+from transformer_mlx import LLM
 from params import Config
 from train import IndexedBinaryDataset
 from eval import evaluate
