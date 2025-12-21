@@ -4,7 +4,7 @@ import json
 import time
 
 # --- CONFIG ---
-API_KEY = "your_openrouter_api_key"
+API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
 INPUT_FILE = "user_plans_prompts.txt"
 OUTPUT_FILE = "bot_plan_response.json"
 MODEL = "deepseek/deepseek-chat" # DeepSeek V3
@@ -70,7 +70,7 @@ def main():
             with open(OUTPUT_FILE, "w") as f:
                 json.dump(dataset, f, indent=2)
         
-        time.sleep(0.5) # Avoid hitting rate limits too hard
+        time.sleep(0.25) # Avoid hitting rate limits too hard
 
     print(f"Done. Synthetic data saved to {OUTPUT_FILE}")
 

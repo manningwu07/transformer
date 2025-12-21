@@ -13,3 +13,8 @@
 # archived
 /src/archived
 /mistake_models/
+
+
+# env files
+.env
+*.env

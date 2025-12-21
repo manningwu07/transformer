@@ -27,45 +27,22 @@ def load_model(ckpt_path):
     return model
 
 def generate(model, tokenizer, prompt, max_new_tokens=100, temperature=0.7, top_k=50):
-    # 1. Encode
     encoded = tokenizer.encode(prompt)
     idx = torch.tensor(encoded.ids, dtype=torch.long, device=DEVICE).unsqueeze(0)
     
-    # 2. Loop
     print(f"\n🤖 AI: ", end="", flush=True)
     
-    for _ in range(max_new_tokens):
-        # Crop context if it exceeds model limit (standard simple inference)
-        idx_cond = idx[:, -Config.d_model:] 
-        
-        with torch.no_grad():
-            # Forward pass
-            logits, _ = model(idx_cond)
-            logits = logits[:, -1, :] # Get last token logits
-            
-            # Temperature scaling
-            logits = logits / temperature
-            
-            # Top-K Sampling
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            
-            # Sample
-            probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
-            
-            # Decode & Print token-by-token
-            new_token_id = idx_next.item()
-            decoded_token = tokenizer.decode([new_token_id])
-            print(decoded_token, end="", flush=True)
-            
-            # Append
-            idx = torch.cat((idx, idx_next), dim=1)
-            
-            # Stop token logic (optional, assuming 0 is pad or you have an EOS)
-            if new_token_id == tokenizer.token_to_id("<|endoftext|>"):
-                break
+    # Use the generator from the class
+    for next_token in model.generate(
+        idx, 
+        max_new_tokens=max_new_tokens, 
+        temperature=temperature, 
+        top_k=top_k,
+        use_cache=True
+    ):
+        decoded_token = tokenizer.decode([next_token.item()])
+        print(decoded_token, end="", flush=True)
+    
     print("\n")
 
 def main():

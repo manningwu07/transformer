@@ -1,4 +1,3 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -68,7 +67,6 @@ class MLA(nn.Module):
 
         # 3. Output
         self.o_proj = nn.Linear(args.n_heads * args.head_dim, args.d_model, bias=False)
-        
         self.rope = RotaryEmbedding(self.rope_dim, theta=args.rope_theta)
 
     def forward(self, x, kv_cache=None, use_cache=False):
@@ -208,7 +206,7 @@ class LLM(nn.Module):
             return logits, None, new_caches if use_cache else None
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens=100, temperature=0.7, top_k=50):
+    def generate(self, idx, max_new_tokens=100, temperature=0.7, top_k=50, use_cache=True):
         """
         Autoregressive generation with optional KV caching.
         use_cache=True: O(n) per token (fast)

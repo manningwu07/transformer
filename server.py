@@ -9,6 +9,7 @@ from transformer import LLM
 from params import Config
 import json
 from tokenizers import Tokenizer as HFTokenizer
+import traceback
 
 # ---------- Config ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -107,26 +108,24 @@ def filter_logits(logits, top_k=0, top_p=0.0):
 def generate(req: InferRequest):
     try:
         ids = torch.tensor([req.ids], dtype=torch.long, device=DEVICE)
-        with torch.no_grad():
-            out = model.generate(
-                ids,
-                max_tokens=req.max_tokens,
-                top_k=req.top_k,
-                top_p=req.top_p,
-                temperature=req.temperature,
-                repetition_penalty=req.repetition_penalty,
-                bad_ids=bad_ids,
-                eos_id=model.eos_id,
-            )
-        out_ids = out[0].tolist()
+        
+        # Collect the tokens from the generator
+        generated_tokens = []
+        for next_token in model.generate(
+            ids,
+            max_new_tokens=req.max_tokens, # Changed from max_tokens to max_new_tokens
+            top_k=req.top_k,
+            temperature=req.temperature,
+            use_cache=True # Now we can use the speed boost!
+        ):
+            generated_tokens.append(next_token.item())
 
-        # Robust byte-level decoding with the trained tokenizer
-        decoded = hf_tok.decode(out_ids, skip_special_tokens=True)
+        # Final sequence = input + generated
+        full_ids = req.ids + generated_tokens
+        decoded = hf_tok.decode(full_ids, skip_special_tokens=True)
 
-        return {"ids": out_ids, "text": decoded.strip()}
+        return {"ids": full_ids, "text": decoded.strip()}
     except Exception as e:
-        import traceback
-
         traceback.print_exc()
         return {"error": str(e)}
 
