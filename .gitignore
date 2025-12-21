@@ -14,6 +14,9 @@
 /src/archived
 /mistake_models/
 
+# scripts
+/scripts/__pycache__/
+/scripts/*.txt
 
 # env files
 .env
