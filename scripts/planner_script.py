@@ -4,10 +4,10 @@ import json
 import time
 
 # --- CONFIG ---
-API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
+API_KEY = "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" # DO NOT LEAK ENV VARS
 INPUT_FILE = "user_plans_prompts.txt"
 OUTPUT_FILE = "bot_plan_response.json"
-MODEL = "deepseek/deepseek-chat" # DeepSeek V3
+MODEL = "deepseek/deepseek-v3.2" # DeepSeek V3.2
 
 # System prompt optimized for RAW string output only
 SYSTEM_PROMPT = (
@@ -70,7 +70,7 @@ def main():
             with open(OUTPUT_FILE, "w") as f:
                 json.dump(dataset, f, indent=2)
         
-        time.sleep(0.25) # Avoid hitting rate limits too hard
+        time.sleep(0.3) # Avoid hitting rate limits too hard
 
     print(f"Done. Synthetic data saved to {OUTPUT_FILE}")
 

@@ -25,7 +25,7 @@ class ModelArgs:
     q_lora_rank: int = 1536    # Query compression (optional, but follows DeepSeek V3 spec)
     
     # Vocabulary & Normalization
-    vocab_size: int = 65536
+    vocab_size: int = 65535    # 2**16 - 1 to fit in uint16 (maximize tokenizer size)
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     

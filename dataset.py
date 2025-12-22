@@ -6,7 +6,6 @@ import torch
 from torch.utils.data import Dataset, IterableDataset
 import random
 
-
 class IndexedBinaryDataset(Dataset):
     """
     Reads sharded .bin/.idx pairs from makeDatasetFast.py
