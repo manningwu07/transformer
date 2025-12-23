@@ -1,7 +1,5 @@
 import time
 import math
-import torch
-import torch.nn as nn
 import os
 import argparse
 import signal
@@ -9,7 +7,6 @@ import sys
 import traceback
 import glob
 from transformers import Adafactor
-from torch.utils.data import DataLoader
 from dataset import IndexedBinaryDataset
 
 # Imports from your project
@@ -40,6 +37,11 @@ else:
 
 # --- Optimizations (Torch Only) ---
 if args.backend == "torch":
+    
+    from torch.utils.data import DataLoader
+    import torch
+    import torch.nn as nn
+    
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 

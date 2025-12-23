@@ -17,7 +17,7 @@ CHAOS_MODEL = "google/gemini-2.0-flash-001"
 # Using DeepSeek V3 for the "Compression" spec
 COMPRESSOR_MODEL = "deepseek/deepseek-v3.2"
 WORKERS = 10  # Fan out for DeepSeek
-TARGET_COUNT = 950 # Total pairs to generate
+TARGET_COUNT = 250 # Total pairs to generate (10k)
 
 # System prompt for the Compressor
 COMPRESS_SYSTEM_PROMPT = (

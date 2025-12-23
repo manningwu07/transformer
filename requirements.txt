@@ -1,18 +1,31 @@
-# Core ML
-torch>=2.2.0
-torchvision>=0.17.0
-torchaudio>=2.2.0
-datasets>=2.12.0
+# Core runtime (shared)
+numpy>=1.26
+tqdm>=4.66
+datasets>=2.14
+tokenizers>=0.15
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+requests>=2.31
+psutil>=5.9
 
-# Data / utils
-numpy>=1.26.0
-tqdm>=4.66.1
+# Training utils
+transformers>=4.45
+huggingface_hub>=0.25
+safetensors>=0.4
 
-# Server / API
-fastapi>=0.110.0
-uvicorn[standard]>=0.29.0 
-pydantic>=2.6.0
+# Formatting/dev
+black>=24.3
+pre-commit>=3.6
 
-# Optional quality of life
-black>=24.3.0       # code formatter
-pre-commit>=3.6.0   # hooks
+# Apple Silicon (Mac) - install only on macOS
+# pip install mlx mlx-nn mlx-optim
+mlx>=0.16
+mlx-nn>=0.16
+mlx-optim>=0.16
+
+# CUDA Torch (Linux/Windows) – do NOT pip install torch on Mac
+# For Linux/Windows with CUDA 12.1 wheels via pip:
+torch>=2.2
+torchvision>=0.17
+torchaudio>=2.2

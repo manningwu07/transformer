@@ -1,0 +1,27 @@
+name: transformer-lab
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - numpy>=1.26
+  - tqdm>=4.66
+  - datasets>=2.14
+  - tokenizers>=0.15
+  - fastapi>=0.110
+  - uvicorn>=0.29
+  - pydantic>=2.6
+  - requests>=2.31
+  - psutil>=5.9
+  - transformers>=4.45
+  - huggingface_hub>=0.25
+  - safetensors>=0.4
+  - black>=24.3
+  - pre-commit>=3.6
+  - pip:
+      - mlx>=0.30.0
+      - torch>=2.2.0
+      - torchvision
+      - torchaudio
