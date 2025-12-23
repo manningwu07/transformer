@@ -5,7 +5,7 @@ from tqdm import tqdm
 from tokenizers import Tokenizer
 
 # --- CONFIG ---
-RAW_DATA_PATH = "data/raw/corpus.txt" # Output from getData.py
+RAW_DATA_PATH = "data/raw/phase1_corpus.txt" # Output from getData.py
 OUTPUT_DIR = "data/binary/train"
 TOKENIZER_PATH = "data/tokenizer.json"
 # ----------------

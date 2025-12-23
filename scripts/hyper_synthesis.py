@@ -1,20 +1,23 @@
 import os
 import json
+import sys
 import time
 import threading
 import concurrent.futures
 import requests
-from typing import List
+from dotenv import load_dotenv
 
-# --- CONFIG ---
-API_KEY = "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" # DO NOT LEAK ENV VARS
+instance_id = sys.argv[1] if len(sys.argv) > 1 else "1"
+OUTPUT_FILE = f"data/raw/synthetic_reasoning_{instance_id}.jsonl"
+
+load_dotenv()
+API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
 # Using Gemini Flash for the "Chaos" generation (Fast/Cheap)
-CHAOS_MODEL = "google/gemini-2.0-flash-001" 
+CHAOS_MODEL = "google/gemini-2.0-flash-001"
 # Using DeepSeek V3 for the "Compression" spec
 COMPRESSOR_MODEL = "deepseek/deepseek-v3.2"
-OUTPUT_FILE = "data/raw/synthetic_reasoning.jsonl"
-WORKERS = 15  # Fan out for DeepSeek
-TARGET_COUNT = 3050  # 10k is the goal --- Left: 8050
+WORKERS = 10  # Fan out for DeepSeek
+TARGET_COUNT = 950 # Total pairs to generate
 
 # System prompt for the Compressor
 COMPRESS_SYSTEM_PROMPT = (
@@ -63,7 +66,8 @@ def call_openrouter(model: str, system: str, user: str, temp: float = 1.0):
             {"role": "system", "content": system},
             {"role": "user", "content": user}
         ],
-        "temperature": temp
+        "temperature": temp,
+        "include_reasoning": False
     }
     try:
         r = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload, timeout=60)
@@ -100,7 +104,7 @@ def main():
 
     while total_generated < TARGET_COUNT:
         print(f"📦 Fetching batch of chaos from {CHAOS_MODEL}...")
-        batch_text = call_openrouter(CHAOS_MODEL, "You are a creative writer.", CHAOS_PROMPT)
+        batch_text = call_openrouter(CHAOS_MODEL, "You are a creative writer.", CHAOS_PROMPT, temp=1.2)
         
         if not batch_text:
             time.sleep(5)

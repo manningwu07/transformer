@@ -1,10 +1,13 @@
 import os
+from dotenv import load_dotenv
 import requests
 import json
 import time
 
 # --- CONFIG ---
-API_KEY = "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" # DO NOT LEAK ENV VARS
+
+load_dotenv()
+API_KEY = os.getenv("OPEN_ROUTER_API_KEY")
 INPUT_FILE = "user_plans_prompts.txt"
 OUTPUT_FILE = "bot_plan_response.json"
 MODEL = "deepseek/deepseek-v3.2" # DeepSeek V3.2
