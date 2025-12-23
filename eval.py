@@ -7,7 +7,7 @@ from transformer import LLM
 from params import Config
 from torch.utils.data import DataLoader
 # Assuming you use the IndexedBinaryDataset from your train.py logic
-from train import IndexedBinaryDataset 
+from train import PackedBinDataset
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -62,7 +62,7 @@ def main():
         return
 
     # Use a larger batch size for eval since no gradients are stored
-    val_ds = IndexedBinaryDataset(args.data, Config.seq_len)
+    val_ds = PackedBinDataset(args.data, split="val", seq_len=Config.seq_len, pattern="*val-*.bin")
     val_loader = DataLoader(val_ds, batch_size=Config.batch_size * 2, num_workers=4)
     
     # 3. Run Eval

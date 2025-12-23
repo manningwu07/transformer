@@ -1,126 +1,104 @@
 import os
 import glob
-import struct
 import numpy as np
 import torch
-from torch.utils.data import Dataset, IterableDataset
-import random
+from torch.utils.data import Dataset
+import bisect
 
-class IndexedBinaryDataset(Dataset):
+class PackedBinDataset(Dataset):
     """
-    Reads sharded .bin/.idx pairs from makeDatasetFast.py
-    Correctly handles uint32 tokens and variable-length sequences.
+    Reads *flat* packed token stream shards: just .bin files, no .idx.
+    Each shard is a contiguous array of token IDs (uint16 or uint32).
+    We sample fixed windows of length (seq_len + 1) to form (x, y).
     """
 
-    def __init__(self, shard_dir: str, split: str = "train", seq_len: int = 2048):
+    def __init__(
+        self,
+        shard_dir: str,
+        split: str = "train",
+        seq_len: int = 2048,
+        dtype: np.dtype = np.uint16,
+        pattern: str | None = None,
+    ):
         self.shard_dir = shard_dir
         self.split = split
         self.seq_len = seq_len
+        self.block = seq_len + 1
+        self.dtype = dtype
 
-        # Find all shards for this split
-        self.bin_files = sorted(glob.glob(os.path.join(shard_dir, f"{split}-*.bin")))
-        self.idx_files = sorted(glob.glob(os.path.join(shard_dir, f"{split}-*.idx")))
+        # Your files are named like: phase1-train-000.bin
+        # Default pattern: anything containing the split string.
+        pat = pattern or f"*{split}*.bin"
+        self.bin_files = sorted(glob.glob(os.path.join(shard_dir, pat)))
 
         if not self.bin_files:
             raise FileNotFoundError(
-                f"No shards found at {shard_dir}/{split}-*.bin\n"
-                f"Run: python scripts/makeDatasetFast.py"
+                f"No .bin shards found in {shard_dir} matching pattern '{pat}'.\n"
+                f"Examples expected: phase1-train-000.bin"
             )
 
-        # Load all indices into memory (small: 16 bytes per sequence)
-        self.sequences = []  # List of (bin_path, byte_offset, token_count)
-        for bin_path, idx_path in zip(self.bin_files, self.idx_files):
-            with open(idx_path, "rb") as f:
-                while True:
-                    chunk = f.read(16)  # 2x uint64
-                    if not chunk:
-                        break
-                    byte_offset, token_count = struct.unpack("<QQ", chunk)
-                    if token_count >= 4:  # Skip tiny sequences
-                        self.sequences.append((bin_path, byte_offset, token_count))
+        # Memmap shards + build cumulative token offsets for global addressing
+        self.mmaps: list[np.memmap] = []
+        self.cum_tokens = [0]  # cum_tokens[i] = total tokens before shard i
 
-        # Mmap all bin files (lazy, no RAM used until accessed)
-        self.mmaps = {}
-        for bin_path in self.bin_files:
-            self.mmaps[bin_path] = np.memmap(bin_path, dtype=np.uint32, mode="r")
+        total = 0
+        for p in self.bin_files:
+            m = np.memmap(p, dtype=self.dtype, mode="r")
+            self.mmaps.append(m)
+            total += int(m.shape[0])
+            self.cum_tokens.append(total)
+
+        self.total_tokens = total
+        self.num_blocks = self.total_tokens // self.block
+
+        # Drop last partial block (no padding)
+        if self.num_blocks <= 0:
+            raise ValueError(
+                f"Not enough tokens ({self.total_tokens}) for seq_len={seq_len}."
+            )
 
         print(
-            f"📂 IndexedBinaryDataset: {len(self.sequences)} sequences "
-            f"from {len(self.bin_files)} shards [{split}]"
+            f"📦 PackedBinDataset: {self.total_tokens:,} tokens "
+            f"across {len(self.bin_files)} shards | "
+            f"{self.num_blocks:,} blocks of {self.block} tokens"
         )
 
     def __len__(self):
-        return len(self.sequences)
+        return self.num_blocks
 
-    def __getitem__(self, idx):
-        bin_path, byte_offset, token_count = self.sequences[idx]
+    def _slice_global(self, start: int, length: int) -> np.ndarray:
+        """
+        Return a contiguous slice [start:start+length] across shard boundaries.
+        """
+        end = start + length
+        if end > self.total_tokens:
+            raise IndexError("Requested slice exceeds total_tokens")
 
-        # Convert byte offset to token offset (uint32 = 4 bytes)
-        token_offset = byte_offset // 4
+        out = []
+        cur = start
 
-        # Get tokens from mmap
-        mmap = self.mmaps[bin_path]
-        tokens = mmap[token_offset : token_offset + token_count]
+        while cur < end:
+            shard_idx = bisect.bisect_right(self.cum_tokens, cur) - 1
+            shard_start = self.cum_tokens[shard_idx]
+            local = cur - shard_start
 
-        # Handle sequence length
-        if len(tokens) > self.seq_len + 1:
-            # Random window (preserves BOS/EOS somewhere in context)
-            max_start = len(tokens) - self.seq_len - 1
-            start = random.randint(0, max_start)
-            tokens = tokens[start : start + self.seq_len + 1]
-        elif len(tokens) < self.seq_len + 1:
-            # Pad (rare if filtering worked)
-            pad_len = self.seq_len + 1 - len(tokens)
-            tokens = np.concatenate([tokens, np.zeros(pad_len, dtype=np.uint32)])
+            shard = self.mmaps[shard_idx]
+            take = min(end - cur, shard.shape[0] - local)
+            out.append(np.asarray(shard[local : local + take]))
+            cur += take
 
-        # Convert to tensor
-        tokens = torch.from_numpy(tokens.astype(np.int64))
+        if len(out) == 1:
+            return out[0]
+        return np.concatenate(out, axis=0)
 
-        x = tokens[:-1]  # Input
-        y = tokens[1:]  # Target (shifted by 1)
+    def __getitem__(self, idx: int):
+        # Deterministic block start; DataLoader(shuffle=True) randomizes block order
+        start = idx * self.block
+        tokens = self._slice_global(start, self.block).astype(np.int64, copy=False)
 
+        x = torch.from_numpy(tokens[:-1])
+        y = torch.from_numpy(tokens[1:])
         return x, y
 
-
-class StreamingShardDataset(IterableDataset):
-    """
-    Alternative: Streaming dataset for very large corpora.
-    Handles multi-worker correctly, lower memory than indexed.
-    """
-
-    def __init__(self, shard_dir: str, split: str = "train", seq_len: int = 2048):
-        self.shard_dir = shard_dir
-        self.split = split
-        self.seq_len = seq_len
-        self.shards = sorted(glob.glob(os.path.join(shard_dir, f"{split}-*.bin")))
-
-        if not self.shards:
-            raise FileNotFoundError(f"No shards found at {shard_dir}/{split}-*.bin")
-
-    def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-
-        if worker_info is not None:
-            # Split shards across workers
-            shards = self.shards[worker_info.id :: worker_info.num_workers]
-        else:
-            shards = self.shards
-
-        for shard_path in shards:
-            data = np.memmap(shard_path, dtype=np.uint32, mode="r")
-
-            # Random offset for this epoch
-            if len(data) > self.seq_len + 1:
-                offset = random.randint(0, min(1000, len(data) - self.seq_len - 1))
-            else:
-                offset = 0
-
-            for i in range(offset, len(data) - self.seq_len - 1, self.seq_len):
-                chunk = torch.from_numpy(
-                    data[i : i + self.seq_len + 1].astype(np.int64)
-                )
-                yield chunk[:-1], chunk[1:]
-
-
-# Backwards compatibility alias
-BinaryDataset = IndexedBinaryDataset
+# For backward compatibility
+BinaryDataset = PackedBinDataset

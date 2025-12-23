@@ -6,8 +6,9 @@ import signal
 import sys
 import traceback
 import glob
+import numpy as np
 from transformers import Adafactor
-from dataset import IndexedBinaryDataset
+from dataset import PackedBinDataset
 
 # Imports from your project
 from params import Config, TrainCfg
@@ -121,6 +122,35 @@ class LossTracker:
     def is_valid(self, loss_val):
         return math.isfinite(loss_val)
 
+@torch.no_grad()
+def validate(model, val_loader, backend="torch"):
+    model.eval()
+    total_loss = 0
+    steps = 0
+    # Limit validation to 100 steps so it doesn't take forever
+    max_val_steps = 100 
+    
+    for x, y in val_loader:
+        if backend == "torch":
+            x, y = x.cuda(), y.cuda()
+            _, loss, _ = model(x, targets=y)
+        else:
+            # MLX logic
+            x_mlx = mx.array(x.numpy())
+            y_mlx = mx.array(y.numpy())
+            # Simple loss calc for MLX
+            logits, _ = model(x_mlx)
+            loss = mx.mean(mnn.losses.cross_entropy(logits.reshape(-1, logits.shape[-1]), y_mlx.reshape(-1)))
+            
+        total_loss += loss.item()
+        steps += 1
+        if steps >= max_val_steps: break
+    
+    avg_loss = total_loss / steps
+    perplexity = math.exp(avg_loss)
+    model.train()
+    return avg_loss, perplexity
+
 def main():
     # 1. Init Model
     if args.backend == "torch":
@@ -149,8 +179,15 @@ def main():
     if args.resume: start_step = ckpt.load(args.resume)
 
     # 2. Data Loader
-    print(f"📂 Loading Binary Dataset from {args.data_dir}...")
-    train_ds = IndexedBinaryDataset(args.data_dir, split="train", seq_len=TrainCfg.seq_len)
+    print(f"📂 Loading Binary Dataset from {args.train_dir}...")
+    train_ds = PackedBinDataset(
+        args.train_dir,
+        split="train",
+        seq_len=TrainCfg.seq_len,
+        dtype=np.uint16,
+        pattern="*train-*.bin",
+    )
+    val_ds = PackedBinDataset(args.train_dir + "/val", split="val", seq_len=TrainCfg.seq_len, pattern="*val-*.bin")
     
     # We use torch DataLoader even for MLX but convert tensors in the loop
     train_loader = DataLoader(
@@ -161,6 +198,7 @@ def main():
         persistent_workers=(args.backend == "torch" and args.backend != "mlx"),
         shuffle=True
     )
+    val_loader = DataLoader(val_ds, batch_size=TrainCfg.batch_size, shuffle=False)
     
     total_steps = max(int(len(train_ds) / (TrainCfg.batch_size * TrainCfg.grad_accum_steps)), 200_000)
     loss_tracker = LossTracker()
@@ -194,6 +232,8 @@ def main():
             return loss
 
     # --- Unified Loop ---
+    best_val_loss = float('inf')
+    
     while step < total_steps:
         for x, y in train_loader:
             try:
@@ -230,14 +270,24 @@ def main():
                 loss_tracker.update(raw_loss)
                 accum_loss += raw_loss
                 
-                if step % 10 == 0:
+                if step % 25 == 0:
                     dt = time.time() - t0
-                    tps = (TrainCfg.batch_size * TrainCfg.seq_len * 10) / dt
+                    tps = (TrainCfg.batch_size * TrainCfg.seq_len * 25) / dt
                     print(f"Step {step} | Loss: {raw_loss:.4f} | LR: {lr:.2e} | {tps:.0f} tok/s")
                     t0 = time.time()
                 
                 if step % 1000 == 0:
-                    ckpt.save(step, raw_loss)
+                    val_loss, val_ppl = validate(model, val_loader, args.backend)
+                    print(f"📉 [VAL] Step {step} | Loss: {val_loss:.4f} | PPL: {val_ppl:.2f}")
+                    
+                    # 1. Always save a periodic checkpoint for crash recovery
+                    ckpt.save(step, val_loss, is_best=False)
+                    
+                    # 2. Save "best.pt" only if validation improved
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        ckpt.save(step, val_loss, is_best=True)
+                        print(f"🌟 New best model found at step {step}!")
                 
                 step += 1
                 if step >= total_steps: break
