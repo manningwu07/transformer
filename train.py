@@ -9,14 +9,18 @@ import glob
 import numpy as np
 from transformers import Adafactor
 from dataset import PackedBinDataset
-
+from torch.utils.data import DataLoader
+import torch
+import torch.nn as nn
+    
 # Imports from your project
 from params import Config, TrainCfg
 
 # --- Backend Selection Logic ---
 parser = argparse.ArgumentParser()
 parser.add_argument("--resume", type=str, default=None)
-parser.add_argument("--data_dir", type=str, default="data/shards")
+parser.add_argument("--train_dir", type=str, default="data/shards/phase1/train")
+parser.add_argument("--val_dir", type=str, default="data/shards/phase1/val")
 parser.add_argument(
     "--backend", 
     type=str, 
@@ -38,11 +42,6 @@ else:
 
 # --- Optimizations (Torch Only) ---
 if args.backend == "torch":
-    
-    from torch.utils.data import DataLoader
-    import torch
-    import torch.nn as nn
-    
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
@@ -66,8 +65,10 @@ class CheckpointManager:
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
         
-    def save(self, step, loss, is_crash=False):
+    def save(self, step, loss, is_crash=False, is_best=False):
         prefix = "crash_" if is_crash else "ckpt_"
+        if is_best:
+            prefix = "best_"
         path = os.path.join(self.save_dir, f"{prefix}step_{step}.pt")
         
         if args.backend == "torch":
@@ -124,7 +125,8 @@ class LossTracker:
 
 @torch.no_grad()
 def validate(model, val_loader, backend="torch"):
-    model.eval()
+    if backend == "torch":
+        model.eval()
     total_loss = 0
     steps = 0
     # Limit validation to 100 steps so it doesn't take forever
@@ -141,14 +143,16 @@ def validate(model, val_loader, backend="torch"):
             # Simple loss calc for MLX
             logits, _ = model(x_mlx)
             loss = mx.mean(mnn.losses.cross_entropy(logits.reshape(-1, logits.shape[-1]), y_mlx.reshape(-1)))
+            mx.eval(loss)
             
-        total_loss += loss.item()
+        total_loss += float(loss.item())
         steps += 1
         if steps >= max_val_steps: break
     
     avg_loss = total_loss / steps
     perplexity = math.exp(avg_loss)
-    model.train()
+    if backend == "torch":
+        model.train()
     return avg_loss, perplexity
 
 def main():
@@ -187,7 +191,7 @@ def main():
         dtype=np.uint16,
         pattern="*train-*.bin",
     )
-    val_ds = PackedBinDataset(args.train_dir + "/val", split="val", seq_len=TrainCfg.seq_len, pattern="*val-*.bin")
+    val_ds = PackedBinDataset(args.val_dir, split="val", seq_len=TrainCfg.seq_len, pattern="*val-*.bin")
     
     # We use torch DataLoader even for MLX but convert tensors in the loop
     train_loader = DataLoader(
@@ -223,10 +227,10 @@ def main():
             y = y.reshape(-1)
             return mx.mean(mnn.losses.cross_entropy(logits, y))
         
-        state = [model.state, optimizer.state]
-        @mx.compile
+        # Create the gradient function ONCE outside the loop
+        loss_and_grad_fn = mnn.value_and_grad(model, loss_fn)
+        
         def train_step(x, y):
-            loss_and_grad_fn = mnn.value_and_grad(model, loss_fn)
             loss, grads = loss_and_grad_fn(model, x, y)
             optimizer.update(model, grads)
             return loss
@@ -234,8 +238,17 @@ def main():
     # --- Unified Loop ---
     best_val_loss = float('inf')
     
+    print(f"🔥 Training Start: {total_steps} steps total")
+
     while step < total_steps:
-        for x, y in train_loader:
+        for batch_idx, (x, y) in enumerate(train_loader):
+            # DETERMINISTIC SKIP: Skip batches we already trained on
+            if step < start_step:
+                if batch_idx % 100 == 0:
+                    print(f"⏩ Skipping to catch up... ({step}/{start_step})", end="\r")
+                step += 1
+                continue
+
             try:
                 lr = get_lr(step, TrainCfg, total_steps)
 
@@ -264,8 +277,8 @@ def main():
                     optimizer.learning_rate = lr
                     
                     loss_mlx = train_step(x_mlx, y_mlx)
-                    mx.eval(state)
-                    raw_loss = loss_mlx.item()
+                    mx.eval(model.parameters(), optimizer.state, loss_mlx)
+                    raw_loss = float(loss_mlx.item())
 
                 loss_tracker.update(raw_loss)
                 accum_loss += raw_loss

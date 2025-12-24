@@ -4,131 +4,109 @@ from typing import Optional
 from fastapi import FastAPI
 from pydantic import BaseModel
 import torch
-import torch.nn.functional as F
 from transformer import LLM
 from params import Config
-import json
 from tokenizers import Tokenizer as HFTokenizer
-import traceback
 
 # ---------- Config ----------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-VOCAB_PATH = os.path.join(BASE_DIR, "data/json/vocab.json")
-MODEL_PATH = os.path.join(BASE_DIR, "models", "best_model.pt")  # change if needed
+MODEL_PATH = os.path.join(BASE_DIR, "models", "best_step_*.pt")  # or specific checkpoint
 TOK_PATH = os.path.join(BASE_DIR, "data/json/tokenizer.json")
-BAD_IDS_PATH = os.path.join(BASE_DIR, "data/json/bad_ids.json")
 
-# ---------- Load vocab ----------
-print("CWD:", os.getcwd())
-print("Looking for vocab:", os.path.abspath(VOCAB_PATH))
-
-with open(VOCAB_PATH, "r") as f:
-    vocab = json.load(f)
-    
-tok2id = vocab["TokenToID"]
-id2tok = vocab["IDToToken"]
-eos_id = tok2id["<eos>"]
-hf_tok = HFTokenizer.from_file(TOK_PATH)
-
-# ---------- Model ----------
-vocab_size = len(id2tok)
-model = LLM(
-    vocab_size=vocab_size,
-    d_model=Config.d_model,
-    n_heads=Config.num_heads,
-    n_layers=Config.n_layers,
-    d_ff=Config.hidden_size,
-    max_len=Config.max_len
-)
-ckpt = torch.load(MODEL_PATH, map_location="cpu")
-state = ckpt.get("model_state", ckpt)
-model.load_state_dict(state, strict=False)
-model.eval()
-model.eos_id = eos_id
-
-model.load_state_dict(state, strict=False)
-model.head.weight = model.tok_emb.weight
-
-# ---------- FastAPI ----------
+# ---------- Device ----------
 DEVICE = (
-    "mps"
-    if torch.backends.mps.is_available()
+    "mps" if torch.backends.mps.is_available()
     else ("cuda" if torch.cuda.is_available() else "cpu")
 )
-model.to(DEVICE)
 
-# Load bad tokens
-bad_ids = []
-try:
-    if os.path.exists(BAD_IDS_PATH):
-        with open(BAD_IDS_PATH, "r") as f:
-            bad_ids = json.load(f).get("BadTokenIDs", [])
-        print(f"Loaded {len(bad_ids)} bad token ids.")
-    else:
-        print("Warning: bad_ids.json not found.")
-except Exception as e:
-    print("Warning: failed to parse bad_ids.json:", e)
+# ---------- Load Model ----------
+print(f"⏳ Loading model on {DEVICE}...")
+model = LLM(Config)
 
+# Find latest checkpoint
+import glob
+ckpt_files = sorted(glob.glob(MODEL_PATH), key=os.path.getmtime)
+if ckpt_files:
+    ckpt = torch.load(ckpt_files[-1], map_location="cpu")
+    # Handle both formats: {"model": state_dict} or raw state_dict
+    state = ckpt.get("model", ckpt)
+    model.load_state_dict(state, strict=False)
+    print(f"✅ Loaded: {ckpt_files[-1]}")
+else:
+    print("⚠️ No checkpoint found, using random weights")
+
+model.to(DEVICE).to(dtype=torch.bfloat16)
+model.eval()
+
+# ---------- Load Tokenizer ----------
+hf_tok = HFTokenizer.from_file(TOK_PATH)
+vocab_size = hf_tok.get_vocab_size()
+
+# ---------- FastAPI ----------
 app = FastAPI()
 
-# request schema
-class InferRequest(BaseModel):
+class GenerateRequest(BaseModel):
+    prompt: str
+    max_tokens: int = 100
+    temperature: float = 0.7
+    top_k: Optional[int] = 50
+
+class TokenRequest(BaseModel):
     ids: list[int]
-    max_tokens: int = 20
-    top_k: Optional[int] = 10
-    top_p: Optional[float] = None
-    temperature: float = 1.0
-    repetition_penalty: float = 1.0  # default = no penalty
-
-
-# helper: filtering logits
-def filter_logits(logits, top_k=0, top_p=0.0):
-    """Apply top-k and/or nucleus (top-p) filtering to logits"""
-    if top_k > 0:
-        values, _ = torch.topk(logits, top_k)
-        min_values = values[:, -1].unsqueeze(1)
-        logits = torch.where(logits < min_values, torch.full_like(logits, -float("inf")), logits)
-
-    if top_p > 0.0 and top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-
-        # remove tokens with cumulative prob above top_p
-        sorted_indices_to_remove = cumulative_probs > top_p
-        # shift right to keep first above threshold
-        sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-        sorted_indices_to_remove[:, 0] = 0
-
-        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-        logits = logits.masked_fill(indices_to_remove, -float("inf"))
-
-    return logits
+    max_tokens: int = 100
+    temperature: float = 0.7
+    top_k: Optional[int] = 50
 
 @app.post("/generate")
-def generate(req: InferRequest):
-    try:
-        ids = torch.tensor([req.ids], dtype=torch.long, device=DEVICE)
-        
-        # Collect the tokens from the generator
-        generated_tokens = []
+def generate(req: GenerateRequest):
+    # Encode prompt
+    encoded = hf_tok.encode(req.prompt)
+    ids = torch.tensor([encoded.ids], dtype=torch.long, device=DEVICE)
+    
+    # Generate
+    generated = []
+    with torch.no_grad():
         for next_token in model.generate(
             ids,
-            max_new_tokens=req.max_tokens, # Changed from max_tokens to max_new_tokens
-            top_k=req.top_k,
+            max_new_tokens=req.max_tokens,
             temperature=req.temperature,
-            use_cache=True # Now we can use the speed boost!
+            top_k=req.top_k,
+            use_cache=True
         ):
-            generated_tokens.append(next_token.item())
+            tok_id = next_token.item()
+            generated.append(tok_id)
+            # Stop on EOS
+            if tok_id == hf_tok.token_to_id("<eos>"):
+                break
+    
+    # Decode
+    full_ids = encoded.ids + generated
+    text = hf_tok.decode(full_ids, skip_special_tokens=True)
+    
+    return {"text": text.strip(), "ids": full_ids}
 
-        # Final sequence = input + generated
-        full_ids = req.ids + generated_tokens
-        decoded = hf_tok.decode(full_ids, skip_special_tokens=True)
-
-        return {"ids": full_ids, "text": decoded.strip()}
-    except Exception as e:
-        traceback.print_exc()
-        return {"error": str(e)}
+@app.post("/generate_from_ids")
+def generate_from_ids(req: TokenRequest):
+    ids = torch.tensor([req.ids], dtype=torch.long, device=DEVICE)
+    
+    generated = []
+    with torch.no_grad():
+        for next_token in model.generate(
+            ids,
+            max_new_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_k=req.top_k,
+            use_cache=True
+        ):
+            generated.append(next_token.item())
+    
+    full_ids = req.ids + generated
+    text = hf_tok.decode(full_ids, skip_special_tokens=True)
+    
+    return {"text": text.strip(), "ids": full_ids}
 
 @app.get("/health")
 def health():
     return {"status": "ok", "device": DEVICE, "vocab_size": vocab_size}
+
+# Run with: uvicorn server:app --host 0.0.0.0 --port 8000
