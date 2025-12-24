@@ -153,7 +153,7 @@ class CheckpointManager:
 
 
 @torch.no_grad()
-def validate(engine, val_loader, max_val_steps: int = 100):
+def validate(engine, val_loader, max_val_steps: int = 25):
     engine.eval()
 
     total_loss = 0.0
@@ -291,28 +291,27 @@ def main():
             "stage": 2,
             "offload_optimizer": {"device": "cpu", "pin_memory": True},
             "allgather_partitions": True,
-            "allgather_bucket_size": 2e8,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 2e8,
             "contiguous_gradients": True,
         },
         "optimizer": {
-            "type": "AdamW",
+            "type": "Adafactor",
             "params": {
                 "lr": TrainCfg.lr_start,
-                "betas": [0.9, 0.95],
-                "eps": 1e-8,
+                "beta1": 0.9, # Momentum is back
+                "clip_threshold": 1.0,
+                "decay_rate": -0.8,
                 "weight_decay": 0.01,
+                "scale_parameter": False,
+                "relative_step": False,
             },
         },
         "scheduler": {
-            "type": "WarmupDecayLR",
+            "type": "WarmupCosineLR", # Modern LLM standard
             "params": {
+                "total_num_steps": args.total_opt_steps,
                 "warmup_min_lr": TrainCfg.lr_end,
                 "warmup_max_lr": TrainCfg.lr_start,
-                "warmup_num_steps": TrainCfg.warmup_steps,
-                "total_num_steps": args.total_opt_steps,
+                "warmup_num_steps": min(TrainCfg.warmup_steps, args.total_opt_steps // 10),
             },
         },
     }
@@ -425,7 +424,18 @@ def main():
                         * args.log_every_opt
                     )
                     tps = toks / max(dt, 1e-6)
-                    lr = engine.get_lr()[0] if hasattr(engine, "get_lr") else None
+                    # Avoid DeepSpeed warning: don't query LR before scheduler starts.
+                    lr = None
+                    if opt_step > 0 and lr_scheduler is not None:
+                        try:
+                            lr = lr_scheduler.get_last_lr()[0]
+                        except Exception:
+                            lr = None
+                    elif opt_step > 0 and hasattr(engine, "get_lr"):
+                        try:
+                            lr = engine.get_lr()[0]
+                        except Exception:
+                            lr = None
                     lr_str = f"{lr:.2e}" if lr is not None else "n/a"
                     avg = sum(loss_window) / max(1, len(loss_window))
                     print(
@@ -442,17 +452,7 @@ def main():
                             f"📉 [VAL] Opt {opt_step} | "
                             f"Loss {val_loss:.4f} | PPL {val_ppl:.2f}"
                         )
-
-                    ckpt.save(
-                        opt_step=opt_step,
-                        micro_step=micro_step,
-                        epoch=epoch,
-                        micro_step_in_epoch=micro_step_in_epoch,
-                        val_loss=val_loss,
-                        is_crash=False,
-                        is_best=False,
-                    )
-
+    
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         ckpt.save(

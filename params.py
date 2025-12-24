@@ -55,9 +55,9 @@ if MODE == "pretrain_5080":
     # Optimized for RTX 5080 (16GB VRAM)
     Config = ModelArgs()
     TrainCfg = TrainingArgs(
-        batch_size=4,          # Higher BS thanks to MLA (16 original, 4 for MLX)
+        batch_size=2,          # Higher BS thanks to MLA (16 original, 4 for MLX)
         seq_len=2048,           # Standard context
-        grad_accum_steps=8,     # Effective batch ~128
+        grad_accum_steps=64,     # Effective batch ~128
         lr_start=3e-4,
         lr_end=1e-5,
         warmup_steps=2000
@@ -67,9 +67,9 @@ elif MODE == "longctx_5090":
     # Optimized for RTX 5090 (32GB VRAM) - Pushing limits
     Config = ModelArgs()
     TrainCfg = TrainingArgs(
-        batch_size=4,           # Lower BS for massive context
+        batch_size=16,           # Lower BS for massive context
         seq_len=16384,          # 16k Context (MLA makes this possible!)
-        grad_accum_steps=32,
+        grad_accum_steps=8,
         lr_start=5e-5,          # Lower LR for long-context finetuning
         lr_end=1e-6,
         warmup_steps=500
