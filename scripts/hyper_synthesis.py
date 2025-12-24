@@ -76,6 +76,7 @@ def call_openrouter(model: str, system: str, user: str, temp: float = 1.0):
         print(f"Error calling {model}: {e}")
         return None
 
+file_lock = threading.Lock()
 def process_single_example(messy_text: str):
     """DeepSeek Compression Step"""
     spec = call_openrouter(COMPRESSOR_MODEL, COMPRESS_SYSTEM_PROMPT, messy_text, temp=0.1)
@@ -86,7 +87,7 @@ def process_single_example(messy_text: str):
             "output": spec
         }
         # Thread-safe append to JSONL
-        with threading.Lock():
+        with file_lock:
             with open(OUTPUT_FILE, "a") as f:
                 f.write(json.dumps(entry) + "\n")
         return True
