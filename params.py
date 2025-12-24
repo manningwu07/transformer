@@ -51,7 +51,7 @@ if MODE == "pretrain_5080":
     # Optimized for RTX 5080 (16GB VRAM)
     Config = ModelArgs()
     TrainCfg = TrainingArgs(
-        batch_size=16,          # Higher BS thanks to MLA
+        batch_size=12,          # Higher BS thanks to MLA
         seq_len=2048,           # Standard context
         grad_accum_steps=8,     # Effective batch ~128
         lr_start=3e-4,

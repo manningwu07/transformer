@@ -3,14 +3,16 @@ import mlx.core as mx
 import mlx.nn as nn
 from params import Config
 
+DEFAULT_DTYPE = mx.float16
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
-        self.scale = mx.ones((dim,))
+        self.scale = mx.ones((dim,), dtype=DEFAULT_DTYPE)
 
     def __call__(self, x):
+        x = x.astype(DEFAULT_DTYPE)
         norm = mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
         return x * norm * self.scale
 
@@ -18,8 +20,8 @@ class RMSNorm(nn.Module):
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, max_seq_len: int = 32768, theta: float = 10000.0):
         super().__init__()
-        freqs = 1.0 / (theta ** (mx.arange(0, dim, 2).astype(mx.float32) / dim))
-        t = mx.arange(max_seq_len).astype(mx.float32)
+        freqs = 1.0 / (theta ** (mx.arange(0, dim, 2).astype(DEFAULT_DTYPE) / dim))
+        t = mx.arange(max_seq_len).astype(DEFAULT_DTYPE)
         freqs = mx.outer(t, freqs)
         self._cos = mx.cos(freqs)
         self._sin = mx.sin(freqs)
@@ -66,9 +68,10 @@ class MLA(nn.Module):
         self.o_proj = nn.Linear(args.n_heads * args.head_dim, args.d_model, bias=False)
 
         self.rope = RotaryEmbedding(self.rope_dim, theta=args.rope_theta)
-        self.scale = 1.0 / math.sqrt(self.head_dim)
+        self.scale = mx.array(1.0 / math.sqrt(self.head_dim), dtype=DEFAULT_DTYPE)
 
     def __call__(self, x, cache=None):
+        x = x.astype(DEFAULT_DTYPE)
         B, T, C = x.shape
 
         pos_offset = cache["seq_len"] if cache is not None else 0
@@ -170,9 +173,13 @@ class LLM(nn.Module):
 
         # Weight tying
         self.output.weight = self.tok_embeddings.weight
+        
+        # Convert all weights to float16
+        self.set_dtype(DEFAULT_DTYPE)
 
     def __call__(self, idx, cache=None):
         x = self.tok_embeddings(idx)
+        x = x.astype(DEFAULT_DTYPE)
 
         new_caches = []
         for i, layer in enumerate(self.layers):
