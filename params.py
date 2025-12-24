@@ -35,6 +35,10 @@ class ModelArgs:
     
     # Sequence length (for generation crop)
     max_seq_len: int = 16384
+    gradient_checkpointing: bool = True
+
+    # Training seed
+    seed: int = 1337
 
 @dataclass
 class TrainingArgs:

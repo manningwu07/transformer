@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as ckpt
+import math
 from params import Config, TrainCfg
 
 class RMSNorm(nn.Module):
@@ -68,66 +70,122 @@ class MLA(nn.Module):
         # 3. Output
         self.o_proj = nn.Linear(args.n_heads * args.head_dim, args.d_model, bias=False)
         self.rope = RotaryEmbedding(self.rope_dim, theta=args.rope_theta)
+        self.scale = 1.0 / math.sqrt(self.head_dim)
 
     def forward(self, x, kv_cache=None, use_cache=False):
         B, T, C = x.shape
         
-        pos_offset = kv_cache['seq_len'] if kv_cache is not None else 0
+        pos_offset = kv_cache["seq_len"] if kv_cache is not None else 0
         
         # --- Q Processing ---
         q_content = self.q_up(self.q_down(x))       # [B, T, H * content_dim]
         q_pos = self.q_rope(x)                      # [B, T, H * rope_dim]
         
-        # --- KV Processing ---
-        kv_latent = self.kv_down(x)                 # [B, T, d_latent] <-- CACHE THIS IN INFERENCE
-        k_content = self.k_up(kv_latent)            # [B, T, H * content_dim]
-        k_pos = self.k_rope(x)                      # [B, T, H * rope_dim] <-- AND THIS
-        v = self.v_up(kv_latent)                    # [B, T, H * head_dim]
-        
+         # --- KV Processing ---
+        kv_latent_new = self.kv_down(x)  # [B, T, d_latent]
+        k_pos_new = self.k_rope(x)       # [B, T, H * rope_dim] (pre-RoPE)
+
         if kv_cache is not None:
-            kv_latent = torch.cat([kv_cache['latent'], kv_latent], dim=1)
-            k_content = self.k_up(kv_latent)
-            k_pos = torch.cat([kv_cache['k_rope'], k_pos], dim=1)
-            v = self.v_up(kv_latent)
+            kv_latent = torch.cat([kv_cache["latent"], kv_latent_new], dim=1)
+        else:
+            kv_latent = kv_latent_new
         
         # Reshape for Attention
         q_content = q_content.view(B, T, self.n_heads, self.content_dim).transpose(1, 2)
         q_pos = q_pos.view(B, T, self.n_heads, self.rope_dim).transpose(1, 2)
         
-        kv_len = kv_latent.size(1)  # Full KV length (including cache)
-        k_content = k_content.view(B, kv_len, self.n_heads, self.content_dim).transpose(1, 2)
-        k_pos = k_pos.view(B, kv_len, self.n_heads, self.rope_dim).transpose(1, 2)
-        v = v.view(B, kv_len, self.n_heads, self.head_dim).transpose(1, 2)
-        
+        kv_len = kv_latent.size(1)
+
         # Apply RoPE (Only to the position part)
-        cos, sin = self.rope(q_pos, pos_offset + T)
-        
-        # Q gets RoPE at current positions
-        q_cos, q_sin = cos[pos_offset:pos_offset + T], sin[pos_offset:pos_offset + T]
+        # We want RoPE for absolute positions [0..kv_len)
+        cos, sin = self.rope(q_pos, kv_len)
+
+        # Q RoPE for the query positions [pos_offset..pos_offset+T)
+        q_cos = cos[pos_offset:pos_offset + T]
+        q_sin = sin[pos_offset:pos_offset + T]
         q_pos = apply_rope(q_pos, q_cos, q_sin)
         
-        # K gets RoPE at all positions (0 to kv_len)
-        k_cos, k_sin = cos[:kv_len], sin[:kv_len]
-        k_pos = apply_rope(k_pos, k_cos, k_sin)
-        
-        # Re-assemble Q and K (Content + Position)
-        q = torch.cat([q_content, q_pos], dim=-1)   # [B, H, T, head_dim]
-        k = torch.cat([k_content, k_pos], dim=-1)   # [B, H, T, head_dim]
-        
-        # Flash Attention
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        
-        out = out.transpose(1, 2).contiguous().view(B, T, -1)
+        # K RoPE: cache should store *already roped* keys for O(t)
+        k_pos_new = k_pos_new.view(B, T, self.n_heads, self.rope_dim).transpose(1, 2)
+        k_cos_new = cos[pos_offset:pos_offset + T]
+        k_sin_new = sin[pos_offset:pos_offset + T]
+        k_pos_new = apply_rope(k_pos_new, k_cos_new, k_sin_new)  # [B,H,T,rope_dim]
 
+        if kv_cache is not None:
+            k_pos = torch.cat([kv_cache["k_rope"], k_pos_new], dim=2)  # [B,H,kv_len,rope_dim]
+        else:
+            k_pos = k_pos_new  # [B,H,kv_len,rope_dim]
+
+        # =========================
+        # Inference fast path: small cache  O(t) compute
+        # =========================
         if use_cache:
-            # Return compressed cache (much smaller than full KV)
+            # Project Q-content into latent space using k_up weights per head.
+            # k_up.weight: [H*content_dim, d_latent] -> [H, content_dim, d_latent]
+            Wk = self.k_up.weight.view(self.n_heads, self.content_dim, -1)  # [H, Cc, Dl]
+            # q_latent = q_content @ Wk  -> [B,H,T,d_latent]
+            q_latent = torch.einsum("bhtc,hcd->bhtd", q_content, Wk)
+
+            # latent keys shared across heads: [B,kv_len,d_latent] -> [B,1,kv_len,d_latent]
+            lat_k = kv_latent.unsqueeze(1)
+            # scores_content: [B,H,T,kv_len]
+            scores_content = torch.matmul(
+                q_latent.to(torch.float32),
+                lat_k.to(torch.float32).transpose(-1, -2),
+            )
+            # scores_pos: [B,H,T,kv_len]
+            scores_pos = torch.matmul(
+                q_pos.to(torch.float32),
+                k_pos.to(torch.float32).transpose(-1, -2),
+            )
+
+            scores = (scores_content + scores_pos) * self.scale
+
+            # Causal mask (needed for prefill when T>1)
+            # forbid keys with index > pos_offset  query_index
+            if T > 1 or (kv_cache is None and kv_len == T):
+                mask = torch.full(
+                    (T, kv_len),
+                    float("-inf"),
+                    device=scores.device,
+                    dtype=scores.dtype,
+                )
+                mask = torch.triu(mask, diagonal=pos_offset + 1)
+                scores = scores + mask.unsqueeze(0).unsqueeze(0)
+
+            attn = torch.softmax(scores, dim=-1).to(q_latent.dtype)  # [B,H,T,kv_len]
+
+            # latent_context = sum_t attn * latent_t  -> [B,H,T,d_latent]
+            latent_context = torch.matmul(attn, lat_k)
+
+            # Apply v_up after the weighted sum (linearity):
+            # v_up.weight: [H*head_dim, d_latent] -> [H, head_dim, d_latent]
+            Wv = self.v_up.weight.view(self.n_heads, self.head_dim, -1)  # [H, Hd, Dl]
+            out = torch.einsum("bhtd,hmd->bhtm", latent_context, Wv)
+
+            out = out.transpose(1, 2).contiguous().view(B, T, -1)
+
             new_cache = {
-                'latent': kv_latent,  # [B, kv_len, d_latent]
-                'k_rope': k_pos.transpose(1, 2).reshape(B, kv_len, -1),  # [B, kv_len, H * rope_dim]
-                'seq_len': kv_len
+                "latent": kv_latent.detach(),
+                "k_rope": k_pos.detach(),  # [B,H,kv_len,rope_dim] roped
+                "seq_len": kv_len,
             }
             return self.o_proj(out), new_cache
-        
+
+        # =========================
+        # Training path: keep SDPA (FlashAttention) behavior
+        # =========================
+
+        # Recompute full K-content and V for training (uses fast SDPA kernels)
+        k_content = self.k_up(kv_latent).view(B, kv_len, self.n_heads, self.content_dim).transpose(1, 2)
+        v = self.v_up(kv_latent).view(B, kv_len, self.n_heads, self.head_dim).transpose(1, 2)
+
+        # k_pos currently has shape [B,H,kv_len,rope_dim] already
+        q = torch.cat([q_content, q_pos], dim=-1)          # [B,H,T,head_dim]
+        k = torch.cat([k_content, k_pos], dim=-1)          # [B,H,kv_len,head_dim]
+
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out), None
 
 class SwiGLU_MLP(nn.Module):
@@ -154,6 +212,13 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x, new_cache
 
+    def forward_train(self, x):
+            # Training path: no KV cache, returns only x (checkpoint-friendly)
+            attn_out, _ = self.attn(self.norm1(x), kv_cache=None, use_cache=False)
+            x = x + attn_out
+            x = x + self.mlp(self.norm2(x))
+            return x
+
 class LLM(nn.Module):
     def __init__(self, config=None, **kwargs):
         super().__init__()
@@ -171,9 +236,13 @@ class LLM(nn.Module):
         self.norm = RMSNorm(self.config.d_model, eps=self.config.rms_norm_eps)
         self.output = nn.Linear(self.config.d_model, self.config.vocab_size, bias=False)
         
-        # Init weights FIRST, then tie
+         # Init weights, then tie (output shares embedding weights)
         self.apply(self._init_weights)
-        self.tok_embeddings.weight = self.output.weight 
+        self.output.weight = self.tok_embeddings.weight
+        print(
+            f"Model Init: MLA Decoupled RoPE | "
+            f"Dim {self.config.d_model} | Latent {self.config.d_latent}"
+        )
 
         self.apply(self._init_weights)
         print(f"🧠 Model Init: MLA Decoupled RoPE | Dim {self.config.d_model} | Latent {self.config.d_latent}")
@@ -187,19 +256,31 @@ class LLM(nn.Module):
     def forward(self, idx, targets=None, kv_cache=None, use_cache=False):
         B, T = idx.shape
         x = self.tok_embeddings(idx)
-        new_caches = []
+        new_caches = [] if use_cache else None
 
         for i, layer in enumerate(self.layers):
             layer_cache = kv_cache[i] if kv_cache is not None else None
-            x, new_cache = layer(x, layer_cache, use_cache)
-            if use_cache:
-                new_caches.append(new_cache)
+            if (
+                self.training
+                and targets is not None
+                and getattr(self.config, "gradient_checkpointing", False)
+                and not use_cache
+            ):
+                # Important: checkpoint closure must take only tensors
+                x = ckpt.checkpoint(layer.forward_train, x, use_reentrant=False)
+            else:
+                x, new_cache = layer(x, layer_cache, use_cache)
+                if use_cache:
+                    new_caches.append(new_cache)
 
         x = self.norm(x)
         
         if targets is not None:
             logits = self.output(x)
-            loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), targets.view(-1))
+            loss = F.cross_entropy(
+                logits.float().view(-1, self.config.vocab_size),
+                targets.view(-1),
+            )
             return logits, loss, new_caches if use_cache else None
         else:
             logits = self.output(x[:, [-1], :])
