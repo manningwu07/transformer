@@ -24,8 +24,9 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", freqs.sin())
 
     def forward(self, x, seq_len):
-        return self.cos_cached[:seq_len, ...].to(x.device), \
-               self.sin_cached[:seq_len, ...].to(x.device)
+        cos = self.cos_cached[:seq_len, ...].to(device=x.device, dtype=x.dtype)
+        sin = self.sin_cached[:seq_len, ...].to(device=x.device, dtype=x.dtype)
+        return cos, sin
 
 def apply_rope(x, cos, sin):
     d = x.shape[-1] // 2
@@ -273,10 +274,32 @@ class LLM(nn.Module):
         x = self.norm(x)
         
         if targets is not None:
+             # Computing full [B,T,V] logits is huge with V=65535.
+            # Avoid fp32 copies, and optionally compute loss in chunks to reduce peak VRAM.
+            V = self.config.vocab_size
+            chunk = int(getattr(self.config, "loss_chunk_size", 0) or 0)
+
+            if chunk > 0 and chunk < T:
+                loss_sum = None
+                tok_count = 0
+                for s in range(0, T, chunk):
+                    e = min(T, s + chunk)
+                    logits_chunk = self.output(x[:, s:e, :])
+                    targets_chunk = targets[:, s:e]
+                    loss_chunk = F.cross_entropy(
+                        logits_chunk.reshape(-1, V),
+                        targets_chunk.reshape(-1),
+                        reduction="sum",
+                    )
+                    loss_sum = loss_chunk if loss_sum is None else (loss_sum + loss_chunk)
+                    tok_count += int((e - s) * B)
+                loss = loss_sum / max(1, tok_count)
+                return None, loss, new_caches if use_cache else None
+
             logits = self.output(x)
             loss = F.cross_entropy(
-                logits.float().view(-1, self.config.vocab_size),
-                targets.view(-1),
+                logits.reshape(-1, V),
+                targets.reshape(-1),
             )
             return logits, loss, new_caches if use_cache else None
         else:

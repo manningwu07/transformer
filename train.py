@@ -428,7 +428,7 @@ def main():
             "rng": get_rng_state(),
         }
         ckpt.save(
-            tag=f"crash_step_{opt_step}",
+            tag=f"interrupt_step_{opt_step}",
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
@@ -438,7 +438,7 @@ def main():
 
     def handle_sigint(sig, frame):
         if is_main_process():
-            print("\n🛑 SIGINT: saving crash checkpoint and exiting...")
+            print("\nSIGINT: saving interrupt checkpoint and exiting...")
         save_crash_and_exit()
         if is_distributed():
             dist.barrier()
@@ -543,9 +543,8 @@ def main():
 
         except Exception as e:
             if is_main_process():
-                print(f"💥 Crash: {e}")
+                print(f"Crash: {e}")
                 traceback.print_exc()
-            save_crash_and_exit()
             if is_distributed():
                 dist.destroy_process_group()
             return
