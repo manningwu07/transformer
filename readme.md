@@ -93,7 +93,6 @@ If you are working locally on your Mac, the script auto-detects the platform:
 ```bash
 python3 train.py
 ```
-*Note: MLX uses a dedicated memory cache limit of 18GB to prevent system swapping.*
 
 ---
 

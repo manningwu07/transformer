@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 import deepspeed
 from params import Config, TrainCfg
+from mlx.utils import tree_map
 
 # --- Argument Parsing (Before backend selection) ---
 parser = argparse.ArgumentParser()
@@ -37,7 +38,7 @@ if args.backend == "mlx":
     import mlx.nn as mnn
     import mlx.optimizers as mopt
     from transformer_mlx import LLM
-    mx.set_cache_limit(18 * 1024 * 1024 * 1024)
+    mx.set_cache_limit(16 * 1024 * 1024 * 1024)
     print("🍏 Using MLX Backend (Apple Silicon Optimized)")
 
 elif args.backend == "deepspeed":
@@ -355,18 +356,30 @@ def main():
 
         loss_and_grad_fn = mnn.value_and_grad(model, loss_fn)
         GRAD_CLIP = 0.5
+        accumulated_grads = None
 
-        def train_step_mlx(x, y):
+        def train_step_mlx(x, y, accum_step):
+            nonlocal accumulated_grads
             loss, grads = loss_and_grad_fn(model, x, y)
-            grads, grad_norm = mopt.clip_grad_norm(grads, max_norm=GRAD_CLIP)
+            # Scale gradients for accumulation
+            grads = tree_map(lambda g: g / TrainCfg.grad_accum_steps, grads)
             
-            grad_norm_val = grad_norm.item()
-            if not math.isfinite(grad_norm_val):
-                print(f"⚠️ NaN gradient detected, skipping step")
-                return mx.array(0.0), grad_norm
-
-            optimizer.update(model, grads)
-            return loss, grad_norm
+            # Accumulate
+            if accumulated_grads is None:
+                accumulated_grads = grads
+            else:
+                accumulated_grads = tree_map(
+                    lambda a, g: a + g, accumulated_grads, grads
+                )
+            
+            # Only update on final accumulation step
+            if (accum_step + 1) % TrainCfg.grad_accum_steps == 0:
+                clipped, grad_norm = mopt.clip_grad_norm(accumulated_grads, max_norm=GRAD_CLIP)
+                if math.isfinite(grad_norm.item()):
+                    optimizer.update(model, clipped)
+                accumulated_grads = None
+                return loss, grad_norm
+            return loss, mx.array(0.0)
 
     # === 6. Training Loop ===
     best_val_loss = float('inf')
@@ -430,7 +443,7 @@ def main():
                     y_mlx = mx.array(y.numpy().astype("int32"))
                     optimizer.learning_rate = lr
 
-                    loss_mlx, grad_norm = train_step_mlx(x_mlx, y_mlx)
+                    loss_mlx, grad_norm = train_step_mlx(x_mlx, y_mlx, step)
                     mx.eval(model.parameters(), optimizer.state, loss_mlx)
                     raw_loss = float(loss_mlx.item())
 

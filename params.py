@@ -22,7 +22,7 @@ class ModelArgs:
     
     # MLA Specifics (The Compression)
     d_latent: int = 512        # KV Cache is compressed to this size (4x smaller than d_model)
-    q_lora_rank: int = 1536    # Query compression (optional, but follows DeepSeek V3 spec)
+    q_lora_rank: int = 1024    # Query compression (optional, but follows DeepSeek V3 spec)
     
     # Vocabulary & Normalization
     vocab_size: int = 65535    # 2**16 - 1 to fit in uint16 (maximize tokenizer size)
@@ -51,7 +51,7 @@ if MODE == "pretrain_5080":
     # Optimized for RTX 5080 (16GB VRAM)
     Config = ModelArgs()
     TrainCfg = TrainingArgs(
-        batch_size=12,          # Higher BS thanks to MLA
+        batch_size=4,          # Higher BS thanks to MLA (16 original, 4 for MLX)
         seq_len=2048,           # Standard context
         grad_accum_steps=8,     # Effective batch ~128
         lr_start=3e-4,
