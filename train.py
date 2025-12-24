@@ -14,6 +14,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from transformers import Adafactor
 
 from dataset import PackedBinDataset
 from params import Config, TrainCfg
@@ -351,17 +352,18 @@ def main():
         model = DDP(model, device_ids=[get_local_rank()], output_device=get_local_rank())
 
     # === Optimizer (fused AdamW if available) ===
-    opt_kwargs = dict(
+    optimizer = Adafactor(
+        model.parameters(),
         lr=float(TrainCfg.lr_start),
-        betas=(0.9, 0.95),
-        weight_decay=0.1,
+        eps=(1e-30, 1e-3),
+        clip_threshold=1.0,
+        decay_rate=-0.8,
+        beta1=0.9, # Switch to None during long context---will decrease memory by 5GB on VRAM
+        weight_decay=0.01,
+        relative_step=False,
+        scale_parameter=False,
+        warmup_init=False,
     )
-    try:
-        optimizer = torch.optim.AdamW(model.parameters(), fused=True, **opt_kwargs)
-        fused_str = "fused=True"
-    except TypeError:
-        optimizer = torch.optim.AdamW(model.parameters(), **opt_kwargs)
-        fused_str = "fused=unsupported"
 
     scheduler = make_scheduler(
         optimizer,
@@ -372,7 +374,7 @@ def main():
 
     if is_main_process():
         print(
-            f"🧪 Optimizer: AdamW ({fused_str}) | "
+            f"🧪 Optimizer: Adafactor (Memory Optimized) | "
             f"Schedule: warmup={TrainCfg.warmup_steps} + {args.lr_schedule}"
         )
 
