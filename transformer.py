@@ -236,16 +236,13 @@ class LLM(nn.Module):
         self.norm = RMSNorm(self.config.d_model, eps=self.config.rms_norm_eps)
         self.output = nn.Linear(self.config.d_model, self.config.vocab_size, bias=False)
         
-         # Init weights, then tie (output shares embedding weights)
+        # Init weights, then tie (output shares embedding weights)
         self.apply(self._init_weights)
         self.output.weight = self.tok_embeddings.weight
         print(
-            f"Model Init: MLA Decoupled RoPE | "
+            f"🧠 Model Init: MLA Decoupled RoPE | "
             f"Dim {self.config.d_model} | Latent {self.config.d_latent}"
         )
-
-        self.apply(self._init_weights)
-        print(f"🧠 Model Init: MLA Decoupled RoPE | Dim {self.config.d_model} | Latent {self.config.d_latent}")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
