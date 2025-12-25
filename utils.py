@@ -118,6 +118,7 @@ class CheckpointManager:
         state = kwargs.get("client_state", state)
         if not is_main_process(): return
         path = os.path.join(self.save_dir, f"{tag}.pt")
+        tmp_path = path + ".tmp"
         payload = {
             "model": model.module.state_dict() if isinstance(model, DDP) 
                      else model.state_dict(),
@@ -125,7 +126,8 @@ class CheckpointManager:
             "scheduler": sched.state_dict() if sched else None,
             "client_state": state,
         }
-        torch.save(payload, path)
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, path)
         with open(os.path.join(self.save_dir, "latest"), "w") as f:
             f.write(tag)
         if not is_crash: self.prune(keep)
@@ -144,7 +146,11 @@ class CheckpointManager:
             path = resume if resume.endswith(".pt") else resume + ".pt"
         
         if is_main_process(): print(f"🔁 Loading: {path}")
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(
+            path,
+            map_location="cpu",
+            weights_only=False,
+        )
         model.load_state_dict(ckpt["model"], strict=True)
         if opt and ckpt["optimizer"]: opt.load_state_dict(ckpt["optimizer"])
         if sched and ckpt["scheduler"]: sched.load_state_dict(ckpt["scheduler"])

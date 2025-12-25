@@ -4,6 +4,7 @@ import os
 import random
 import signal
 import sys
+import threading
 import time
 import traceback
 
@@ -226,7 +227,12 @@ def main():
             is_crash=True,
         )
 
+    exiting = threading.Event()
     def handle_sigint(sig, frame):
+        if exiting.is_set():
+            return
+        exiting.set()
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         if is_main_process():
             print("\nSIGINT: saving interrupt checkpoint and exiting...")
         save_crash_and_exit()
@@ -254,8 +260,8 @@ def main():
                 train_iter = iter(train_loader)
                 x, y = next(train_iter)
 
-            x = x.to(device, non_blocking=True)
-            y = y.to(device, non_blocking=True)
+            x = x.to(device, dtype=torch.long, non_blocking=True)
+            y = y.to(device, dtype=torch.long, non_blocking=True)
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss, _ = model(x, targets=y)
