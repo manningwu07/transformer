@@ -16,7 +16,8 @@
 
 # scripts
 /scripts/__pycache__/
-/scripts/*.txt
+/scripts/syntheticData/*.json
+/scripts/syntheticData/*.txt
 
 # env files
 .env

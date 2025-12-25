@@ -3,6 +3,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import ByteLevel
+from datasets import load_dataset
 
 # 1. Define every special token you will EVER need
 SPECIAL_TOKENS = [
@@ -13,43 +14,37 @@ SPECIAL_TOKENS = [
     "<file_path>", "<file_content>", "</file_content>", "<code>", "</code>",
     "<plan>", "</plan>"
 ]
-
-def train():
-    # Setup BPE Tokenizer
+def rebuild():
+    # 1. Setup BPE
     tokenizer = Tokenizer(BPE(unk_token="<unk>"))
     tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
 
+    # 2. Configure for 32k
     trainer = BpeTrainer(
-        vocab_size=65535, # GPU friendly 2^16
+        vocab_size=32768, 
         min_frequency=2,
         special_tokens=SPECIAL_TOKENS,
         show_progress=True
     )
 
-    # Iterator to read the file line by line without crashing RAM
-    def batch_iterator(path, total_lines_to_sample=5_000_000):
-        # This skips lines to ensure we see the beginning, middle, and end of the 53GB
-        # Estimate total lines in 53GB is roughly 500M. So we sample every 100th line.
-        skip_step = 100 
-        
-        count = 0
-        with open(path, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i % skip_step == 0:
-                    yield line
-                    count += 1
-                if count >= total_lines_to_sample:
-                    break
+    # 3. Stream from HF (no local corpus needed)
+    print("🌊 Streaming SmollM-Corpus for training...")
+    ds = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True)
+    
+    def batch_iterator(batch_size=1000, limit=5_000_000):
+        lines = []
+        for i, entry in enumerate(ds):
+            lines.append(entry["text"])
+            if len(lines) >= batch_size:
+                yield lines
+                lines = []
+            if i >= limit: break
 
-    print("🛠️ Training tokenizer on sampled Phase 1 corpus...")
-    tokenizer.train_from_iterator(
-        batch_iterator("data/raw/phase1_corpus.txt"), 
-        trainer=trainer
-    )
-
+    tokenizer.train_from_iterator(batch_iterator(), trainer=trainer)
+    
     os.makedirs("data/json", exist_ok=True)
-    tokenizer.save("data/json/tokenizer.json")
-    print("✅ Tokenizer saved to data/json/tokenizer.json")
+    tokenizer.save("data/json/tokenizer_32k.json")
+    print("✅ New 32k Tokenizer saved.")
 
 if __name__ == "__main__":
-    train()
+    rebuild()
