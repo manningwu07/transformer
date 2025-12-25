@@ -274,33 +274,36 @@ class LLM(nn.Module):
         x = self.norm(x)
         
         if targets is not None:
-             # Computing full [B,T,V] logits is huge with V=65535.
-            # Avoid fp32 copies, and optionally compute loss in chunks to reduce peak VRAM.
+            # Shift x and targets for next-token prediction
+            # (If not already handled by your data loader)
+            
             V = self.config.vocab_size
-            chunk = int(getattr(self.config, "loss_chunk_size", 0) or 0)
+            T = x.size(1)
+            chunk_size = 512 # Materialize only 512 tokens at a time (to avoid OOM) --- Change this as needed
+            logits_list = []
+            loss_sum = 0.0
+            
+            # Compute loss in chunks to avoid the 512MB spike
+            for i in range(0, T, chunk_size):
+                end = min(i + chunk_size, T)
+                # Compute logits only for this chunk
+                chunk_logits = self.output(x[:, i:end, :]) # [B, chunk, V]
+                chunk_targets = targets[:, i:end]
+                
+                loss_chunk = F.cross_entropy(
+                    chunk_logits.view(-1, V),
+                    chunk_targets.view(-1),
+                    reduction='sum'
+                )
+                loss_sum += loss_chunk
+                
+                # If you need logits for metrics, detach them; 
+                # otherwise, let them go out of scope to free VRAM
+                if not self.training:
+                    logits_list.append(chunk_logits.detach())
 
-            if chunk > 0 and chunk < T:
-                loss_sum = None
-                tok_count = 0
-                for s in range(0, T, chunk):
-                    e = min(T, s + chunk)
-                    logits_chunk = self.output(x[:, s:e, :])
-                    targets_chunk = targets[:, s:e]
-                    loss_chunk = F.cross_entropy(
-                        logits_chunk.reshape(-1, V),
-                        targets_chunk.reshape(-1),
-                        reduction="sum",
-                    )
-                    loss_sum = loss_chunk if loss_sum is None else (loss_sum + loss_chunk)
-                    tok_count += int((e - s) * B)
-                loss = loss_sum / max(1, tok_count)
-                return None, loss, new_caches if use_cache else None
-
-            logits = self.output(x)
-            loss = F.cross_entropy(
-                logits.reshape(-1, V),
-                targets.reshape(-1),
-            )
+            loss = loss_sum / (B * T)
+            logits = torch.cat(logits_list, dim=1) if not self.training else None
             return logits, loss, new_caches if use_cache else None
         else:
             logits = self.output(x[:, [-1], :])

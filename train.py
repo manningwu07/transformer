@@ -1,5 +1,4 @@
 import argparse
-import glob
 import math
 import os
 import random
@@ -12,213 +11,13 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from transformers import Adafactor
 
-from dataset import PackedBinDataset
-from params import Config, TrainCfg
 from transformer import LLM
-
-
-def is_distributed() -> bool:
-    return int(os.getenv("WORLD_SIZE", "1")) > 1
-
-
-def get_rank() -> int:
-    return int(os.getenv("RANK", "0"))
-
-
-def get_local_rank() -> int:
-    return int(os.getenv("LOCAL_RANK", "0"))
-
-
-def is_main_process() -> bool:
-    return get_rank() == 0
-
-
-def seed_everything(seed: int):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def get_rng_state():
-    return {
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-        "torch_cpu": torch.get_rng_state(),
-        "torch_cuda": torch.cuda.get_rng_state_all(),
-    }
-
-
-def set_rng_state(state):
-    if state is None:
-        return
-    random.setstate(state["python"])
-    np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch_cpu"])
-    torch.cuda.set_rng_state_all(state["torch_cuda"])
-
-
-def write_latest(save_dir: str, tag: str):
-    latest_path = os.path.join(save_dir, "latest")
-    with open(latest_path, "w") as f:
-        f.write(tag)
-
-
-def read_latest(save_dir: str) -> str | None:
-    latest_path = os.path.join(save_dir, "latest")
-    if os.path.isfile(latest_path):
-        with open(latest_path, "r") as f:
-            return f.read().strip()
-    return None
-
-
-class CheckpointManager:
-    def __init__(self, save_dir: str = "models"):
-        self.save_dir = save_dir
-        os.makedirs(save_dir, exist_ok=True)
-
-    def save(
-        self,
-        tag: str,
-        model,
-        optimizer,
-        scheduler,
-        client_state: dict,
-        is_crash: bool = False,
-        keep: int = 3,
-    ):
-        if not is_main_process():
-            return
-
-        path = os.path.join(self.save_dir, f"{tag}.pt")
-        payload = {
-            "model": model.state_dict()
-            if not isinstance(model, DDP)
-            else model.module.state_dict(),
-            "optimizer": optimizer.state_dict() if optimizer is not None else None,
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            "client_state": client_state,
-        }
-        torch.save(payload, path)
-        write_latest(self.save_dir, tag)
-        print(f"💾 Saved checkpoint: {path}")
-
-        if not is_crash:
-            self.prune(keep=keep)
-
-    def load(self, resume: str | None, model, optimizer, scheduler):
-        # resume:
-        #   None -> load save_dir/latest if exists
-        #   "models" -> load models/latest
-        #   "models/ckpt_step_123.pt" or ".../ckpt_step_123" -> load that
-        if resume is None:
-            root = self.save_dir
-            tag = read_latest(root)
-            if tag is None:
-                return None
-            path = os.path.join(root, f"{tag}.pt")
-        else:
-            resume = os.path.abspath(os.path.expanduser(resume))
-            if os.path.isdir(resume):
-                root = resume
-                tag = read_latest(root)
-                if tag is None:
-                    return None
-                path = os.path.join(root, f"{tag}.pt")
-            else:
-                path = resume
-                if not path.endswith(".pt"):
-                    path = path + ".pt"
-                if not os.path.isfile(path):
-                    raise FileNotFoundError(f"--resume path not found: {path}")
-
-        if is_main_process():
-            print(f"🔁 Resuming from {path}")
-
-        ckpt = torch.load(path, map_location="cpu")
-        state_dict = ckpt["model"]
-        if isinstance(model, DDP):
-            model.module.load_state_dict(state_dict, strict=True)
-        else:
-            model.load_state_dict(state_dict, strict=True)
-
-        if optimizer is not None and ckpt.get("optimizer") is not None:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        if scheduler is not None and ckpt.get("scheduler") is not None:
-            scheduler.load_state_dict(ckpt["scheduler"])
-
-        return ckpt.get("client_state", None)
-
-    def prune(self, keep: int = 3):
-        if not is_main_process():
-            return
-        ckpts = sorted(
-            glob.glob(os.path.join(self.save_dir, "*.pt")),
-            key=os.path.getmtime,
-        )
-        to_delete = ckpts[:-keep]
-        for p in to_delete:
-            try:
-                os.remove(p)
-            except Exception as e:
-                print(f"⚠️ Failed pruning {p}: {e}")
-
-
-@torch.no_grad()
-def validate(model, device, val_loader, max_val_steps: int = 100):
-    model.eval()
-    total_loss = 0.0
-    steps = 0
-
-    for x, y in val_loader:
-        x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
-
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss, _ = model(x, targets=y)
-
-        total_loss += float(loss.item())
-        steps += 1
-        if steps >= max_val_steps:
-            break
-
-    avg_loss = total_loss / max(1, steps)
-    ppl = math.exp(avg_loss)
-    model.train()
-    return avg_loss, ppl
-
-
-def make_scheduler(optimizer, total_opt_steps: int, warmup_steps: int, schedule: str):
-    lr_start = float(TrainCfg.lr_start)
-    lr_end = float(TrainCfg.lr_end)
-    warmup_steps = int(warmup_steps)
-    total_opt_steps = int(total_opt_steps)
-
-    def lr_at(step: int) -> float:
-        if total_opt_steps <= 1:
-            return lr_end
-
-        if warmup_steps > 0 and step < warmup_steps:
-            t = step / max(1, warmup_steps)
-            return lr_end + (lr_start - lr_end) * t
-
-        t = (step - warmup_steps) / max(1, total_opt_steps - warmup_steps)
-        t = min(max(t, 0.0), 1.0)
-
-        if schedule == "linear":
-            return lr_start + (lr_end - lr_start) * t
-
-        # cosine
-        return lr_end + 0.5 * (lr_start - lr_end) * (1.0 + math.cos(math.pi * t))
-
-    def lr_mult(step: int) -> float:
-        return lr_at(step) / max(lr_start, 1e-12)
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_mult)
+from dataset import PackedBinDataset, get_dataloader
+from utils import *
+from params import Config, TrainCfg
 
 
 def main():
@@ -316,36 +115,32 @@ def main():
         np.random.seed(base)
         random.seed(base)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=TrainCfg.batch_size,
-        shuffle=shuffle,
-        sampler=train_sampler,
-        num_workers=args.num_workers, # num_workers=8 (Optimal for most systems)
-        pin_memory=True,
-        persistent_workers=(args.num_workers > 0),
-        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None, # prefetch_factor=4 (default)
-        drop_last=True,
-        worker_init_fn=worker_init_fn if args.num_workers > 0 else None,
-    )
-
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=TrainCfg.batch_size,
-        shuffle=False,
-        sampler=val_sampler,
-        num_workers=max(0, args.num_workers // 2),
-        pin_memory=True,
-        persistent_workers=(args.num_workers > 0),
-        drop_last=False,
-        worker_init_fn=worker_init_fn if args.num_workers > 0 else None,
-    )
-
     # === Model ===
     model = LLM(Config).to(device)
+    
+    ckpt = CheckpointManager(save_dir=args.save_dir)
+
+    resume_state = ckpt.load(args.resume, model=model, optimizer=None, scheduler=None)
+
+    opt_step = 0
+    micro_step_in_epoch = 0
+    if resume_state is not None:
+        opt_step = int(resume_state.get("opt_step", 0))
+        micro_step_in_epoch = int(resume_state.get("micro_step_in_epoch", 0))
+
+    # === Initialize DataLoaders WITH OFFSET ===
+    train_loader = get_dataloader(
+        train_ds, train_sampler, TrainCfg.batch_size, 
+        args.num_workers, args.prefetch_factor, shuffle, args.seed, 
+        offset=micro_step_in_epoch
+    )
+    val_loader = get_dataloader(
+        val_ds, val_sampler, TrainCfg.batch_size, 
+        max(0, args.num_workers // 2), args.prefetch_factor, False, args.seed
+    )
 
     if args.compile:
-        # Keep it simple: compile before DDP for single GPU; for DDP this may vary by version.
+        os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
         model = torch.compile(model, mode="max-autotune")
 
     if is_distributed():
@@ -371,12 +166,6 @@ def main():
         warmup_steps=TrainCfg.warmup_steps,
         schedule=args.lr_schedule,
     )
-
-    if is_main_process():
-        print(
-            f"🧪 Optimizer: Adafactor (Memory Optimized) | "
-            f"Schedule: warmup={TrainCfg.warmup_steps} + {args.lr_schedule}"
-        )
 
     ckpt = CheckpointManager(save_dir=args.save_dir)
 
@@ -406,16 +195,6 @@ def main():
         train_sampler.set_epoch(epoch)
 
     train_iter = iter(train_loader)
-    if micro_step_in_epoch > 0:
-        if is_main_process():
-            print(f"⏩ Skipping {micro_step_in_epoch} batches to restore dataloader position...")
-        for _ in range(micro_step_in_epoch):
-            try:
-                next(train_iter)
-            except StopIteration:
-                train_iter = iter(train_loader)
-                next(train_iter)
-
     optimizer.zero_grad(set_to_none=True)
 
     def save_crash_and_exit():
