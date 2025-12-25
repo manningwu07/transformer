@@ -29,12 +29,15 @@ def seed_everything(seed: int):
     torch.cuda.manual_seed_all(seed)
 
 def get_rng_state():
-    return {
+    state = {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch_cpu": torch.get_rng_state(),
-        "torch_cuda": torch.cuda.get_rng_state_all(),
     }
+    # Only grab CUDA state if we are in a process that can actually talk to the GPU
+    if torch.cuda.is_initialized():
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
 
 def set_rng_state(state):
     if state is None: return

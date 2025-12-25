@@ -1,3 +1,4 @@
+import torch._inductor.config as inductor_config
 import argparse
 import math
 import os
@@ -23,6 +24,11 @@ from params import Config, TrainCfg
 
 
 def main():
+    import torch.multiprocessing as mp
+    
+    if mp.get_start_method(allow_none=True) != 'spawn':
+        mp.set_start_method('spawn', force=True)
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_dir", type=str, default="data/shards/phase1/train")
     parser.add_argument("--val_dir", type=str, default="data/shards/phase1/val")
@@ -70,6 +76,15 @@ def main():
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(False)
+    torch.cuda.set_per_process_memory_fraction(0.875, device=0) # Fits in 14GB VRAM (Increase this if you have more VRAM available)
+    
+     # Prevents the "Tree" optimization which shares memory across 
+    # multiple captured graphs. Slower compilation, but saves ~1-1.5GB VRAM.
+    inductor_config.triton.cudagraph_trees = False
+
+    # Increase the threshold for when Inductor decides a kernel 
+    # is "large" enough to deserve its own pool.
+    inductor_config.triton.cudagraph_pool_allocation_threshold = 0.1
 
     seed_everything(args.seed)
 
@@ -192,7 +207,7 @@ def main():
 
     if args.compile:
         os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
-        model = torch.compile(model, mode="max-autotune")
+        model = torch.compile(model, mode="reduce-overhead")
 
     if is_distributed():
         model = DDP(model, device_ids=[get_local_rank()], output_device=get_local_rank())
@@ -229,16 +244,25 @@ def main():
 
     exiting = threading.Event()
     def handle_sigint(sig, frame):
-        if exiting.is_set():
-            return
-        exiting.set()
-        signal.signal(signal.SIGINT, signal.SIG_IGN)
-        if is_main_process():
+        # Get the current process ID
+        import os
+        main_pid = os.getpgrp() 
+        
+        # Only the main process should save checkpoints
+        # Workers should just exit
+        if is_main_process() and torch.cuda.is_initialized():
+            # Prevent multiple triggers if you mash Ctrl+C
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
             print("\nSIGINT: saving interrupt checkpoint and exiting...")
-        save_crash_and_exit()
+            try:
+                save_crash_and_exit()
+            except Exception as e:
+                print(f"Failed to save interrupt checkpoint: {e}")
+        
+        # Kill the process group to ensure workers die too
         if is_distributed():
-            dist.barrier()
             dist.destroy_process_group()
+        
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_sigint)
@@ -250,6 +274,9 @@ def main():
     model.train()
     while opt_step < args.total_opt_steps:
         try:
+            if args.compile:
+                torch.compiler.cudagraph_mark_step_begin()
+
             try:
                 x, y = next(train_iter)
             except StopIteration:
