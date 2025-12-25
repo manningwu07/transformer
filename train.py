@@ -13,6 +13,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from transformers import Adafactor
+from typing import Optional
 
 from transformer import LLM
 from dataset import PackedBinDataset, get_dataloader
@@ -52,6 +53,7 @@ def main():
     if is_distributed():
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(get_local_rank())
+        dist.barrier()
 
     device = torch.device("cuda", get_local_rank())
     
@@ -69,6 +71,54 @@ def main():
     torch.backends.cuda.enable_math_sdp(False)
 
     seed_everything(args.seed)
+
+
+    # === Model ===
+    model = LLM(Config).to(device)
+
+    # === Optimizer / Scheduler ===
+    optimizer = Adafactor(
+        model.parameters(),
+        lr=float(TrainCfg.lr_start),
+        eps=(1e-30, 1e-3),
+        clip_threshold=1.0,
+        decay_rate=-0.8,
+        beta1=0.9,  # set to None if you want to trade compute for lower VRAM
+        weight_decay=0.01,
+        relative_step=False,
+        scale_parameter=False,
+        warmup_init=False,
+    )
+
+    scheduler = make_scheduler(
+        optimizer,
+        total_opt_steps=args.total_opt_steps,
+        warmup_steps=TrainCfg.warmup_steps,
+        schedule=args.lr_schedule,
+    )
+
+    ckpt = CheckpointManager(save_dir=args.save_dir)
+
+    # === State (single load path) ===
+    opt_step = 0
+    micro_step = 0
+    epoch = 0
+    micro_step_in_epoch = 0
+    best_val_loss = float("inf")
+
+    state = ckpt.load(
+        args.resume,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
+    if state is not None:
+        opt_step = int(state.get("opt_step", 0))
+        micro_step = int(state.get("micro_step", 0))
+        epoch = int(state.get("epoch", 0))
+        micro_step_in_epoch = int(state.get("micro_step_in_epoch", 0))
+        best_val_loss = float(state.get("best_val_loss", best_val_loss))
+        set_rng_state(state.get("rng", None))
 
     # === Dataset ===
     if is_main_process():
@@ -115,28 +165,28 @@ def main():
         np.random.seed(base)
         random.seed(base)
 
-    # === Model ===
-    model = LLM(Config).to(device)
-    
-    ckpt = CheckpointManager(save_dir=args.save_dir)
-
-    resume_state = ckpt.load(args.resume, model=model, optimizer=None, scheduler=None)
-
-    opt_step = 0
-    micro_step_in_epoch = 0
-    if resume_state is not None:
-        opt_step = int(resume_state.get("opt_step", 0))
-        micro_step_in_epoch = int(resume_state.get("micro_step_in_epoch", 0))
-
     # === Initialize DataLoaders WITH OFFSET ===
     train_loader = get_dataloader(
-        train_ds, train_sampler, TrainCfg.batch_size, 
-        args.num_workers, args.prefetch_factor, shuffle, args.seed, 
-        offset=micro_step_in_epoch
+        train_ds,
+        train_sampler,
+        TrainCfg.batch_size,
+        args.num_workers,
+        args.prefetch_factor,
+        shuffle,
+        args.seed,
+        offset=micro_step_in_epoch,
+        drop_last=True,
     )
     val_loader = get_dataloader(
-        val_ds, val_sampler, TrainCfg.batch_size, 
-        max(0, args.num_workers // 2), args.prefetch_factor, False, args.seed
+        val_ds,
+        val_sampler,
+        TrainCfg.batch_size,
+        max(0, args.num_workers // 2),
+        args.prefetch_factor,
+        False,
+        args.seed,
+        offset=0,
+        drop_last=False,
     )
 
     if args.compile:
@@ -145,45 +195,6 @@ def main():
 
     if is_distributed():
         model = DDP(model, device_ids=[get_local_rank()], output_device=get_local_rank())
-
-    # === Optimizer (fused AdamW if available) ===
-    optimizer = Adafactor(
-        model.parameters(),
-        lr=float(TrainCfg.lr_start),
-        eps=(1e-30, 1e-3),
-        clip_threshold=1.0,
-        decay_rate=-0.8,
-        beta1=0.9, # Switch to None during long context---will decrease memory by 5GB on VRAM
-        weight_decay=0.01,
-        relative_step=False,
-        scale_parameter=False,
-        warmup_init=False,
-    )
-
-    scheduler = make_scheduler(
-        optimizer,
-        total_opt_steps=args.total_opt_steps,
-        warmup_steps=TrainCfg.warmup_steps,
-        schedule=args.lr_schedule,
-    )
-
-    ckpt = CheckpointManager(save_dir=args.save_dir)
-
-    opt_step = 0
-    micro_step = 0
-    epoch = 0
-    micro_step_in_epoch = 0
-    best_val_loss = float("inf")
-
-    # Resume
-    state = ckpt.load(args.resume, model=model, optimizer=optimizer, scheduler=scheduler)
-    if state is not None:
-        opt_step = int(state.get("opt_step", 0))
-        micro_step = int(state.get("micro_step", 0))
-        epoch = int(state.get("epoch", 0))
-        micro_step_in_epoch = int(state.get("micro_step_in_epoch", 0))
-        best_val_loss = float(state.get("best_val_loss", best_val_loss))
-        set_rng_state(state.get("rng", None))
 
     if is_main_process():
         print(

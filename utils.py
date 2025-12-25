@@ -4,6 +4,7 @@ import random
 import glob
 import torch
 import numpy as np
+from typing import Any
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -54,7 +55,7 @@ def validate(model, device, val_loader, max_val_steps: int = 100):
         y = y.to(device, dtype=torch.long, non_blocking=True)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss, _ = model(x, targets=y)
+            _, loss, _ = model(x, targets=y, return_logits=False)
 
         total_loss += float(loss.item())
         steps += 1
@@ -100,7 +101,21 @@ class CheckpointManager:
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
 
-    def save(self, tag, model, opt, sched, state, is_crash=False, keep=3):
+    def save(
+        self,
+        tag,
+        model,
+        opt=None,
+        sched=None,
+        state=None,
+        is_crash: bool = False,
+        keep: int = 3,
+        **kwargs: Any,
+    ):
+        # Back-compat with newer call sites
+        opt = kwargs.get("optimizer", opt)
+        sched = kwargs.get("scheduler", sched)
+        state = kwargs.get("client_state", state)
         if not is_main_process(): return
         path = os.path.join(self.save_dir, f"{tag}.pt")
         payload = {
@@ -115,7 +130,11 @@ class CheckpointManager:
             f.write(tag)
         if not is_crash: self.prune(keep)
 
-    def load(self, resume, model, opt=None, sched=None):
+    def load(self, resume, model, opt=None, sched=None, **kwargs: Any):
+        # Back-compat with newer call sites
+        opt = kwargs.get("optimizer", opt)
+        sched = kwargs.get("scheduler", sched)
+        
         if resume is None:
             latest = os.path.join(self.save_dir, "latest")
             if not os.path.exists(latest): return None

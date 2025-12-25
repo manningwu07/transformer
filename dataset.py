@@ -69,24 +69,43 @@ class ResumableSampler(Sampler):
         return iter(indices[self.start_idx :])
 
     def __len__(self):
-        return len(self.sampler) - self.start_idx
+        return max(0, len(self.sampler) - self.start_idx)
 
-def get_dataloader(ds, sampler, cfg, args, offset=0):
+def get_dataloader(
+    ds,
+    sampler,
+    batch_size: int,
+    num_workers: int,
+    prefetch_factor: int,
+    shuffle: bool,
+    seed: int,
+    offset: int = 0,
+    drop_last: bool = True,
+):
+    # If a sampler is provided, DataLoader requires shuffle=False
+    if sampler is not None:
+        shuffle = False
+
+    # Interpret offset as "number of batches already consumed" (your train.py passes
+    # micro_step_in_epoch), convert to "number of sample indices to skip".
     if offset > 0:
         base_sampler = sampler or RandomSampler(ds)
-        sampler = ResumableSampler(base_sampler, offset)
+        start_idx = int(offset) * int(batch_size)
+        sampler = ResumableSampler(base_sampler, start_idx)
         shuffle = False
-    else:
-        shuffle = (sampler is None)
+
+    g = torch.Generator()
+    g.manual_seed(int(seed))
 
     return DataLoader(
         ds,
-        batch_size=cfg.batch_size,
+        batch_size=int(batch_size),
         shuffle=shuffle,
         sampler=sampler,
-        num_workers=args.num_workers,
+        num_workers=int(num_workers),
         pin_memory=True,
-        persistent_workers=(args.num_workers > 0),
-        prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
-        drop_last=True,
+        persistent_workers=(int(num_workers) > 0),
+        prefetch_factor=int(prefetch_factor) if int(num_workers) > 0 else None,
+        drop_last=bool(drop_last),
+        generator=g,
     )

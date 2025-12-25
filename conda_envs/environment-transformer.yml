@@ -20,8 +20,7 @@ dependencies:
   - safetensors>=0.4
   - black>=24.3
   - pre-commit>=3.6
-  - pip:
-      - mlx>=0.30.0
-      - torch>=2.2.0
-      - torchvision
-      - torchaudio
+  - pytorch>=2.2
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1

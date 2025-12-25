@@ -70,7 +70,12 @@ class MLA(nn.Module):
 
         # 3. Output
         self.o_proj = nn.Linear(args.n_heads * args.head_dim, args.d_model, bias=False)
-        self.rope = RotaryEmbedding(self.rope_dim, theta=args.rope_theta)
+        max_seq_len = int(getattr(args, "max_seq_len", 32768))
+        self.rope = RotaryEmbedding(
+            self.rope_dim,
+            max_seq_len=max_seq_len,
+            theta=args.rope_theta,
+        )
         self.scale = 1.0 / math.sqrt(self.head_dim)
 
     def forward(self, x, kv_cache=None, use_cache=False):
@@ -251,7 +256,14 @@ class LLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None, kv_cache=None, use_cache=False):
+    def forward(
+        self,
+        idx,
+        targets=None,
+        kv_cache=None,
+        use_cache: bool = False,
+        return_logits: bool = False,
+    ):
         B, T = idx.shape
         x = self.tok_embeddings(idx)
         new_caches = [] if use_cache else None
@@ -280,7 +292,7 @@ class LLM(nn.Module):
             V = self.config.vocab_size
             T = x.size(1)
             chunk_size = 512 # Materialize only 512 tokens at a time (to avoid OOM) --- Change this as needed
-            logits_list = []
+            logits_list = [] if return_logits else None
             loss_sum = 0.0
             
             # Compute loss in chunks to avoid the 512MB spike
@@ -297,13 +309,11 @@ class LLM(nn.Module):
                 )
                 loss_sum += loss_chunk
                 
-                # If you need logits for metrics, detach them; 
-                # otherwise, let them go out of scope to free VRAM
-                if not self.training:
+                if return_logits:
                     logits_list.append(chunk_logits.detach())
 
             loss = loss_sum / (B * T)
-            logits = torch.cat(logits_list, dim=1) if not self.training else None
+            logits = torch.cat(logits_list, dim=1) if return_logits else None
             return logits, loss, new_caches if use_cache else None
         else:
             logits = self.output(x[:, [-1], :])
