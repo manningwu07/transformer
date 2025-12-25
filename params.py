@@ -14,31 +14,31 @@ MODE = "pretrain_5080"
 
 @dataclass
 class ModelArgs:
-    # 1B Model Dimensions
-    d_model: int = 2048        # Core thinking dimension
+    d_model: int = 1792        # Core thinking dimension
     n_layers: int = 24         # Depth
     n_heads: int = 16          # Attention heads
-    head_dim: int = 128        # d_model // n_heads
-    
+    head_dim: int = 112        # d_model // n_heads
+
     # MLA Specifics (The Compression)
-    d_latent: int = 512        # KV Cache is compressed to this size (4x smaller than d_model)
-    q_lora_rank: int = 1024    # Query compression (optional, but follows DeepSeek V3 spec)
-    
+    d_latent: int = 448        # KV Cache is compressed to this size (4x smaller than d_model)
+    q_lora_rank: int = 896    # Query compression (optional, but follows DeepSeek V3 spec)
+
     # Vocabulary & Normalization
     vocab_size: int = 32768
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
-    
+
     # Architecture
-    hidden_size: int = 5632    # MLP Expansion (~2.75x d_model for SwiGLU efficiency)
+    hidden_size: int = 4928    # MLP Expansion (~2.5x d_model for SwiGLU efficiency)
     dropout: float = 0.0
-    
+
     # Sequence length (for generation crop)
-    max_seq_len: int = 16384
+    max_seq_len: int = 12288
     gradient_checkpointing: bool = True
 
     # Training seed
     seed: int = 1337
+
 
 @dataclass
 class TrainingArgs:
@@ -55,9 +55,9 @@ if MODE == "pretrain_5080":
     # Optimized for RTX 5080 (16GB VRAM)
     Config = ModelArgs()
     TrainCfg = TrainingArgs(
-        batch_size=2,          # Higher BS thanks to MLA (16 original, 4 for MLX)
+        batch_size=1,
         seq_len=2048,           # Standard context
-        grad_accum_steps=32,     # Effective batch ~64
+        grad_accum_steps=256,     # Effective batch ~256 to maximize GPU throughput
         lr_start=3e-4,
         lr_end=1e-5,
         warmup_steps=2000
@@ -67,7 +67,7 @@ elif MODE == "longctx_5090":
     # Optimized for RTX 5090 (32GB VRAM) - Pushing limits
     Config = ModelArgs()
     TrainCfg = TrainingArgs(
-        batch_size=2,           # Lower BS for massive context
+        batch_size=1,           # Lower BS for massive context
         seq_len=8192,          # 16k Context (MLA makes this possible!)
         grad_accum_steps=32,
         lr_start=5e-5,          # Lower LR for long-context finetuning
