@@ -24,12 +24,6 @@ from utils import *
 from params import Config, TrainCfg
 
 def main():
-    
-    # Sanity checks    
-    print("torch:", torch.__version__)
-    print("cuda:", torch.version.cuda)
-    print("device:", torch.cuda.get_device_name(0))
-    print("capability:", torch.cuda.get_device_capability(0))
         
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_dir", type=str, default="data/shards/phase1/train")
@@ -265,12 +259,9 @@ def main():
     signal.signal(signal.SIGINT, handle_sigint)
 
     t0 = time.time()
+    tokens_since_log = 0
     loss_window = []
     world_size = int(os.getenv("WORLD_SIZE", "1"))
-    
-    # Print Float8 usage stats
-    types = {type(m).__name__ for m in model.modules()}
-    print([t for t in sorted(types) if "Float8" in t or "float8" in t.lower()])
 
     model.train()
     while opt_step < args.total_opt_steps:
@@ -318,7 +309,9 @@ def main():
                 opt_step += 1
 
                 if opt_step % args.log_every_opt == 0 and is_main_process():
-                    dt = time.time() - t0
+                    end_compute_t = time.time()
+                    dt = end_compute_t - last_log_t if 'last_log_t' in locals() else end_compute_t - t0
+                    tps = tokens_since_log / dt
                     toks = (
                         TrainCfg.batch_size
                         * TrainCfg.grad_accum_steps
@@ -334,7 +327,8 @@ def main():
                         f"Loss {raw_loss:.4f} (avg {avg:.4f}) | "
                         f"LR {lr:.2e} | {tps:.0f} tok/s"
                     )
-                    t0 = time.time()
+                    tokens_since_log = 0
+                    last_log_t = time.time()
 
                 if opt_step % args.val_every_opt == 0:
                     val_loss, val_ppl = validate(model, device, val_loader, max_val_steps=100)
@@ -361,6 +355,7 @@ def main():
                             client_state=client_state,
                             is_crash=False,
                         )
+                    last_log_t = time.time()
 
         except Exception as e:
             if is_main_process():
