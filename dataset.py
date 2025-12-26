@@ -57,7 +57,7 @@ class PackedBinDataset(Dataset):
     def __getitem__(self, idx: int):
         start = idx * self.block
         tokens = self._slice_global(start, self.block)
-        return torch.from_numpy(tokens[:-1]), torch.from_numpy(tokens[1:])
+        return torch.from_numpy(tokens[:-1].copy()), torch.from_numpy(tokens[1:].copy())
 
 class ResumableSampler(Sampler):
     def __init__(self, sampler, start_idx):

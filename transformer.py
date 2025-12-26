@@ -229,11 +229,11 @@ class TransformerBlock(nn.Module):
         return x, new_cache
 
     def forward_train(self, x):
-            # Training path: no KV cache, returns only x (checkpoint-friendly)
-            attn_out, _ = self.attn(self.norm1(x), kv_cache=None, use_cache=False)
-            x = x + attn_out
-            x = x + self.mlp(self.norm2(x))
-            return x
+        # Training path: no KV cache, returns only x (checkpoint-friendly)
+        attn_out, _ = self.attn(self.norm1(x), kv_cache=None, use_cache=False)
+        x = x + attn_out
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 class LLM(nn.Module):
     def __init__(self, config=None, **kwargs):
@@ -248,7 +248,25 @@ class LLM(nn.Module):
         self.max_seq_len = getattr(self.config, 'max_seq_len', 16384)
         
         self.tok_embeddings = nn.Embedding(self.config.vocab_size, self.config.d_model)
-        self.layers = nn.ModuleList([TransformerBlock(self.config) for _ in range(self.config.n_layers)])
+        
+         # Build layers - optionally compile each block individually
+        self._compile_layers = getattr(self.config, "compile_layers", False)
+        if self._compile_layers:
+            print("⚡ Compiling individual TransformerBlocks (regional compilation)...")
+            self.layers = nn.ModuleList([
+                torch.compile(
+                    TransformerBlock(self.config),
+                    mode="default",
+                    fullgraph=False,  # Allow graph breaks (safer with checkpointing)
+                )
+                for _ in range(self.config.n_layers)
+            ])
+        else:
+            self.layers = nn.ModuleList([
+                TransformerBlock(self.config) 
+                for _ in range(self.config.n_layers)
+            ])
+        
         self.norm = RMSNorm(self.config.d_model, eps=self.config.rms_norm_eps)
         self.output = nn.Linear(self.config.d_model, self.config.vocab_size, bias=False)
         

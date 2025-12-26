@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
 
 import numpy as np
 import torch
@@ -81,6 +81,9 @@ def main():
 
     seed_everything(args.seed)
 
+    # Set compile flag BEFORE model creation
+    if args.compile:
+        Config.compile_layers = True
 
     # === Model ===
     model = LLM(Config).to(device)
@@ -198,9 +201,7 @@ def main():
         drop_last=False,
     )
 
-    if args.compile:
-        os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
-        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
+    # Compilation now handled inside LLM.__init__ via Config.compile_layers
 
     if is_distributed():
         model = DDP(model, device_ids=[get_local_rank()], output_device=get_local_rank())
