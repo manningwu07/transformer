@@ -302,9 +302,9 @@ class LLM(nn.Module):
         for i, layer in enumerate(self.layers):
             if use_ckpt:
                 if (i % checkpoint_every_n == 0):
-                    x = ckpt.checkpoint(layer.forward_train, x, use_reentrant=False)
-                else:
                     x, _ = layer(x, None, False)
+                else:
+                    x = ckpt.checkpoint(layer.forward_train, x, use_reentrant=False)
             else:
                 x, _ = layer(x, None, False)
 

@@ -14,12 +14,12 @@ MODE = "pretrain_5080"  # or "longctx_5090"
 class ModelArgs:
     # Alignment-first core (Maximize GPU utilization by making powers of 2 for d_model + head_dim)
     d_model: int = 2048
-    n_layers: int = 24
+    n_layers: int = 21
     n_heads: int = 16
     head_dim: int = 128 
 
     # MLA compression
-    d_latent: int = 384
+    d_latent: int = 256
     q_lora_rank: int = 512
 
     # Vocab & norms
@@ -28,13 +28,13 @@ class ModelArgs:
     rope_theta: float = 10000.0
 
     # MLP
-    hidden_size: int = 3584
+    hidden_size: int = 5120
     dropout: float = 0.0
 
     # Runtime toggles
     max_seq_len: int = 12288
     gradient_checkpointing: bool = True
-    checkpoint_every_n: int = 1
+    checkpoint_every_n: int = 3 # (Does the opposite now---dont checkpoint every n layers ==> VRAM tradeoff ease)
     compile_layers: bool = False
 
     seed: int = 1337
