@@ -215,15 +215,7 @@ class TransformerBlock(nn.Module):
         self.norm1 = RMSNorm(args.d_model, eps=args.rms_norm_eps)
         self.attn = MLA(args)
         self.norm2 = RMSNorm(args.d_model, eps=args.rms_norm_eps)
-        self.mlp = SwiGLU_MLP(args) 
-    
-    @torch._dynamo.disable
-    def _norm1_nocompile(self, x):
-        return self.norm1(x)
-
-    @torch._dynamo.disable
-    def _norm2_nocompile(self, x):
-        return self.norm2(x)
+        self.mlp = SwiGLU_MLP(args)
 
     def forward(self, x, kv_cache=None, use_cache=False, use_checkpoint=False):
         if use_checkpoint and self.training:
@@ -236,9 +228,9 @@ class TransformerBlock(nn.Module):
             attn_out = ckpt.checkpoint(create_custom_forward(self.attn), self.norm1(x), use_reentrant=False)
             new_cache = None
         else:
-            attn_out, new_cache = self.attn(self._norm1_nocompile(x), kv_cache, use_cache)
+            attn_out, new_cache = self.attn(self.norm1(x), kv_cache, use_cache)
         x = x + attn_out
-        x = x + self.mlp(self._norm2_nocompile(x))
+        x = x + self.mlp(self.norm2(x))
         return x, new_cache
 
     def forward_no_cache(self, x):
@@ -246,9 +238,9 @@ class TransformerBlock(nn.Module):
         Training/checkpoint-friendly forward. No KV cache, returns only x.
         This is what we compile and what checkpoint() calls.
         """
-        attn_out, _ = self.attn(self._norm1_nocompile(x), kv_cache=None, use_cache=False)    
+        attn_out, _ = self.attn(self.norm1(x), kv_cache=None, use_cache=False)
         x = x + attn_out
-        x = x + self.mlp(self._norm2_nocompile(x))
+        x = x + self.mlp(self.norm2(x))
         return x
 
     # Alias for backward compat (your checkpoint calls this)
