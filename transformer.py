@@ -212,8 +212,18 @@ class TransformerBlock(nn.Module):
         self.norm2 = RMSNorm(args.d_model, eps=args.rms_norm_eps)
         self.mlp = SwiGLU_MLP(args)
 
-    def forward(self, x, kv_cache=None, use_cache=False):
-        attn_out, new_cache = self.attn(self.norm1(x), kv_cache, use_cache)
+    def forward(self, x, kv_cache=None, use_cache=False, use_checkpoint=False):
+        if use_checkpoint and self.training:
+            # Checkpoint ONLY the MLA part (the biggest activation hog)
+            def create_custom_forward(module):
+                def custom_forward(inputs):
+                    out, _ = module(inputs, None, False)
+                    return out
+                return custom_forward
+            attn_out = ckpt.checkpoint(create_custom_forward(self.attn), self.norm1(x), use_reentrant=False)
+            new_cache = None
+        else:
+            attn_out, new_cache = self.attn(self.norm1(x), kv_cache, use_cache)
         x = x + attn_out
         x = x + self.mlp(self.norm2(x))
         return x, new_cache
@@ -261,7 +271,9 @@ class LLM(nn.Module):
         
         # Simple loop is best for Inductor to trace
         for layer in self.layers:
-            x, _ = layer(x, None, False) 
+            # Checkpoint every other layer to balance speed/memory, or all if 16GB is tight
+            do_ckpt = getattr(self.config, "gradient_checkpointing", False)
+            x, _ = layer(x, None, False, use_checkpoint=do_ckpt)
 
         x = self.norm(x)
         logits = self.output(x)

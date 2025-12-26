@@ -75,7 +75,7 @@ def main():
     torch.backends.cuda.enable_flash_sdp(True)
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(False)
-    torch.cuda.set_per_process_memory_fraction(0.875, device=0) # Fits in 14GB VRAM (Increase this if you have more VRAM available)
+    # torch.cuda.set_per_process_memory_fraction(0.875, device=0) # Fits in 14GB VRAM (Increase this if you have more VRAM available)
 
     seed_everything(args.seed)
 
