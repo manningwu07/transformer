@@ -13,14 +13,14 @@ MODE = "pretrain_5080"  # or "longctx_5090"
 @dataclass
 class ModelArgs:
     # Alignment-first core (Maximize GPU utilization by making powers of 2 for d_model + head_dim)
-    d_model: int = 2048
-    n_layers: int = 21
-    n_heads: int = 16
+    d_model: int = 1792
+    n_layers: int = 28
+    n_heads: int = 14
     head_dim: int = 128 
 
     # MLA compression
-    d_latent: int = 256
-    q_lora_rank: int = 512
+    d_latent: int = 320
+    q_lora_rank = d_latent
 
     # Vocab & norms
     vocab_size: int = 32768
@@ -28,13 +28,13 @@ class ModelArgs:
     rope_theta: float = 10000.0
 
     # MLP
-    hidden_size: int = 5120
+    hidden_size: int = 4928 # x2.75 d_model
     dropout: float = 0.0
 
     # Runtime toggles
-    max_seq_len: int = 12288
+    max_seq_len: int = 8192
     gradient_checkpointing: bool = True
-    checkpoint_every_n: int = 3 # (Does the opposite now---dont checkpoint every n layers ==> VRAM tradeoff ease)
+    checkpoint_skip_every_n: int = 4 # 0 = no skipping, 1 = skip all, N = skip all but every Nth
     compile_layers: bool = False
 
     seed: int = 1337
