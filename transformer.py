@@ -268,18 +268,28 @@ class LLM(nn.Module):
 
     def forward(self, idx, targets=None, kv_cache=None, use_cache: bool = False):
         x = self.tok_embeddings(idx)
-        
-        # Simple loop is best for Inductor to trace
+
+        use_ckpt = (
+            self.training
+            and targets is not None
+            and getattr(self.config, "gradient_checkpointing", False)
+            and not use_cache
+        )
+
         for layer in self.layers:
-            # Checkpoint every other layer to balance speed/memory, or all if 16GB is tight
-            do_ckpt = getattr(self.config, "gradient_checkpointing", False)
-            x, _ = layer(x, None, False, use_checkpoint=do_ckpt)
+            if use_ckpt:
+                x = ckpt.checkpoint(layer.forward_train, x, use_reentrant=False)
+            else:
+                x, _ = layer(x, None, False)
 
         x = self.norm(x)
         logits = self.output(x)
 
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), targets.view(-1))
+            loss = F.cross_entropy(
+                logits.view(-1, self.config.vocab_size),
+                targets.view(-1),
+            )
             return logits, loss, None
         
         return logits, None, None

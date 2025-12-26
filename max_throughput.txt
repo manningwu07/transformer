@@ -1,8 +1,7 @@
 export CUDA_MODULE_LOADING=LAZY
-export PYTORCH_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.8
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256,garbage_collection_threshold:0.8
 export TORCHINDUCTOR_CUDAGRAPHS=0
 export OMP_NUM_THREADS=8
 export MKL_NUM_THREADS=8
 
-export TORCH_LOGS="none"
 export TRITON_PRINT_AUTOTUNING=0

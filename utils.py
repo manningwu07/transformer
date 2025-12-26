@@ -58,7 +58,7 @@ def validate(model, device, val_loader, max_val_steps: int = 100):
         y = y.to(device, dtype=torch.long, non_blocking=True)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss, _ = model(x, targets=y, return_logits=False)
+            _, loss, _ = model(x, targets=y)
 
         total_loss += float(loss.item())
         steps += 1

@@ -8,6 +8,8 @@ import threading
 import time
 import traceback
 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import numpy as np
 import torch
 import torch.distributed as dist
