@@ -22,7 +22,7 @@ else:
             )
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=32768, theta=10000.0):
+    def __init__(self, dim, max_seq_len=Config.max_seq_len, theta=10000.0):
         super().__init__()
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_seq_len)
@@ -31,9 +31,7 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", freqs.sin())
 
     def forward(self, x, seq_len):
-        cos = self.cos_cached[:seq_len, ...].to(device=x.device, dtype=x.dtype)
-        sin = self.sin_cached[:seq_len, ...].to(device=x.device, dtype=x.dtype)
-        return cos, sin
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
 def apply_rope(x, cos, sin):
     d = x.shape[-1] // 2
@@ -143,13 +141,13 @@ class MLA(nn.Module):
             lat_k = kv_latent.unsqueeze(1)
             # scores_content: [B,H,T,kv_len]
             scores_content = torch.matmul(
-                q_latent.to(torch.float32),
-                lat_k.to(torch.float32).transpose(-1, -2),
+                q_latent,
+                lat_k.transpose(-1, -2),
             )
             # scores_pos: [B,H,T,kv_len]
             scores_pos = torch.matmul(
-                q_pos.to(torch.float32),
-                k_pos.to(torch.float32).transpose(-1, -2),
+                q_pos,
+                k_pos.transpose(-1, -2),
             )
 
             scores = (scores_content + scores_pos) * self.scale
@@ -278,20 +276,6 @@ class LLM(nn.Module):
         ])
         
         self._maybe_enable_torchao_float8()
-        
-        # Compile the inner forward_train method (what gets checkpointed)
-        # This way: checkpointing controls memory, compile speeds up the ops inside
-        self._compile_layers = getattr(self.config, "compile_layers", False)
-        if self._compile_layers:
-            print("⚡ Compiling TransformerBlock.forward_no_cache...")
-            for layer in self.layers:
-                layer.forward_no_cache = torch.compile(
-                    layer.forward_no_cache,
-                    mode="default",
-                    fullgraph=False,
-                )
-                
-                layer.forward_train = layer.forward_no_cache
 
         self.norm = RMSNorm(self.config.d_model, eps=self.config.rms_norm_eps)
         self.output = nn.Linear(self.config.d_model, self.config.vocab_size, bias=False)
@@ -303,6 +287,32 @@ class LLM(nn.Module):
             f"🧠 Model Init: MLA Decoupled RoPE | "
             f"Dim {self.config.d_model} | Latent {self.config.d_latent}"
         )
+        
+        self._apply_compilation()
+
+    def _apply_compilation(self):
+        mode = getattr(self.config, "compile_mode", "none")
+        
+        if mode == "none":
+            return
+        
+        if mode == "layers":
+            print("⚡ Compiling TransformerBlock.forward_no_cache (per-layer)...")
+            for layer in self.layers:
+                layer.forward_no_cache = torch.compile(
+                    layer.forward_no_cache,
+                    mode="default",
+                    fullgraph=False,
+                )
+                layer.forward_train = layer.forward_no_cache
+        
+        elif mode == "model":
+            # NOTE: We don't compile here — we return self and let train.py wrap it
+            # This is because compile should happen AFTER .to(device) and before DDP
+            print("⚡ Model marked for whole-model compilation (apply in train.py)")
+            self._needs_whole_model_compile = True
+        else:
+            raise ValueError(f"Unknown compile_mode: {mode}")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):

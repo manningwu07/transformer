@@ -15,6 +15,8 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+import torch._dynamo
+from torch._dynamo.backends.common import aot_autograd
 from transformers import Adafactor
 from typing import Optional
 
@@ -78,10 +80,28 @@ def main():
 
     # Set compile flag BEFORE model creation
     if args.compile:
-        Config.compile_layers = True
+        Config.compile_mode = "model"
+    else:
+        Config.compile_mode = "none"
 
     # === Model ===
     model = LLM(Config).to(device)
+    
+    # Whole-model compile (AFTER .to(device), BEFORE DDP)
+    if getattr(model, "_needs_whole_model_compile", False):
+        print("⚡ Compiling entire model (this may take 2-5 minutes on first forward   backward)...")
+        
+        # Suppress excessive recompilation from dynamic shapes
+        torch._dynamo.config.suppress_errors = False
+        torch._dynamo.config.cache_size_limit = 64
+        
+        model = torch.compile(
+            model,
+            mode="default",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
+            fullgraph=False,      # Allow graph breaks (safer with checkpointing)
+            dynamic=False,        # Static shapes = faster compiled code
+        )
+        print("✅ Model compiled (warmup will happen on first batch)")
 
     # === Optimizer / Scheduler ===
     optimizer = Adafactor(
@@ -257,11 +277,27 @@ def main():
         sys.exit(0)
 
     signal.signal(signal.SIGINT, handle_sigint)
-
+    
+    # Compiled autograd context manager
+    compiled_autograd_ctx = None
+    if getattr(Config, "use_compiled_autograd", False):
+        try:
+            import torch._dynamo.compiled_autograd as ca
+            compiled_autograd_ctx = ca.enable(
+                compiler=lambda gm: torch.compile(gm, mode="default", fullgraph=False)
+            )
+            print("⚡ compiled_autograd enabled (experimental)")
+        except Exception as e:
+            print(f"⚠️ compiled_autograd not available: {e}")
+            compiled_autograd_ctx = None
+            
+    # === Training Loop ===
     t0 = time.time()
-    tokens_since_log = 0
+    last_log_t = t0
     loss_window = []
     world_size = int(os.getenv("WORLD_SIZE", "1"))
+    # GPU-side loss accumulator to avoid per-micro-batch sync
+    accum_loss = torch.zeros(1, device=device)
 
     model.train()
     while opt_step < args.total_opt_steps:
@@ -282,36 +318,42 @@ def main():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss, _ = model(x, targets=y)
 
-            raw_loss = float(loss.item())
-            if not math.isfinite(raw_loss):
-                micro_step += 1
-                micro_step_in_epoch += 1
-                continue
-
             # grad accumulation
+            accum_loss += loss.detach() / TrainCfg.grad_accum_steps
             loss = loss / float(TrainCfg.grad_accum_steps)
-            loss.backward()
-
+            if compiled_autograd_ctx is not None:
+                with compiled_autograd_ctx:
+                    loss.backward()
+            else:
+                loss.backward()
+                
             micro_step += 1
             micro_step_in_epoch += 1
 
-            loss_window.append(raw_loss)
-            if len(loss_window) > 100:
-                loss_window.pop(0)
-
-            is_boundary = (micro_step % int(TrainCfg.grad_accum_steps)) == 0
+            is_boundary = (micro_step > 0 and micro_step % int(TrainCfg.grad_accum_steps) == 0)
             if is_boundary:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                raw_loss = accum_loss.item()
+                accum_loss.zero_()
+                loss_window.append(raw_loss)
+                if len(loss_window) > 100: loss_window.pop(0)                
+    
+                if not torch.isfinite(total_norm):
+                    print(f"⚠️ Skip step {opt_step}: Gradient norm is {total_norm.item()}")
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
+                
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
                 opt_step += 1
 
+                # 3. Log (Only on Boundary)
                 if opt_step % args.log_every_opt == 0 and is_main_process():
                     end_compute_t = time.time()
-                    dt = end_compute_t - last_log_t if 'last_log_t' in locals() else end_compute_t - t0
-                    tps = tokens_since_log / dt
+                    dt = end_compute_t - last_log_t
+                    
                     toks = (
                         TrainCfg.batch_size
                         * TrainCfg.grad_accum_steps
@@ -322,13 +364,13 @@ def main():
                     tps = toks / max(dt, 1e-6)
                     lr = optimizer.param_groups[0]["lr"]
                     avg = sum(loss_window) / max(1, len(loss_window))
+                    
                     print(
                         f"Opt {opt_step} | Micro {micro_step} | "
                         f"Loss {raw_loss:.4f} (avg {avg:.4f}) | "
                         f"LR {lr:.2e} | {tps:.0f} tok/s"
                     )
-                    tokens_since_log = 0
-                    last_log_t = time.time()
+                    last_log_t = end_compute_t
 
                 if opt_step % args.val_every_opt == 0:
                     val_loss, val_ppl = validate(model, device, val_loader, max_val_steps=100)
