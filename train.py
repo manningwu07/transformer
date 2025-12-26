@@ -379,7 +379,8 @@ def main():
                     last_log_t = end_compute_t
 
                 if opt_step % args.val_every_opt == 0:
-                    val_loss, val_ppl = validate(model, device, val_loader, max_val_steps=100)
+                    with torch._dynamo.disable():
+                        val_loss, val_ppl = validate(model, device, val_loader)
                     if is_main_process():
                         print(
                             f"📉 [VAL] Opt {opt_step} | Loss {val_loss:.4f} | PPL {val_ppl:.2f}"
