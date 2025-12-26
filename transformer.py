@@ -250,23 +250,23 @@ class LLM(nn.Module):
         self.tok_embeddings = nn.Embedding(self.config.vocab_size, self.config.d_model)
         
          # Build layers - optionally compile each block individually
+        self.layers = nn.ModuleList([
+            TransformerBlock(self.config) 
+            for _ in range(self.config.n_layers)
+        ])
+        
+        # Compile the inner forward_train method (what gets checkpointed)
+        # This way: checkpointing controls memory, compile speeds up the ops inside
         self._compile_layers = getattr(self.config, "compile_layers", False)
         if self._compile_layers:
-            print("⚡ Compiling individual TransformerBlocks (regional compilation)...")
-            self.layers = nn.ModuleList([
-                torch.compile(
-                    TransformerBlock(self.config),
+            print("⚡ Compiling TransformerBlock.forward_train (compatible with grad ckpt)...")
+            for layer in self.layers:
+                layer.forward_train = torch.compile(
+                    layer.forward_train,
                     mode="default",
-                    fullgraph=False,  # Allow graph breaks (safer with checkpointing)
+                    fullgraph=False,
                 )
-                for _ in range(self.config.n_layers)
-            ])
-        else:
-            self.layers = nn.ModuleList([
-                TransformerBlock(self.config) 
-                for _ in range(self.config.n_layers)
-            ])
-        
+
         self.norm = RMSNorm(self.config.d_model, eps=self.config.rms_norm_eps)
         self.output = nn.Linear(self.config.d_model, self.config.vocab_size, bias=False)
         

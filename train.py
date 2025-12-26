@@ -157,12 +157,14 @@ def main():
             shuffle=True,
             seed=args.seed,
             drop_last=True,
+            worker_init_fn=worker_init_fn
         )
         val_sampler = DistributedSampler(
             val_ds,
             shuffle=False,
             seed=args.seed,
             drop_last=False,
+            worker_init_fn=worker_init_fn
         )
         shuffle = False
     else:
@@ -268,9 +270,6 @@ def main():
     model.train()
     while opt_step < args.total_opt_steps:
         try:
-            if args.compile:
-                torch.compiler.cudagraph_mark_step_begin()
-
             try:
                 x, y = next(train_iter)
             except StopIteration:

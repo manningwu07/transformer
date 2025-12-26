@@ -35,6 +35,7 @@ class ModelArgs:
     # Sequence length (for generation crop)
     max_seq_len: int = 12288
     gradient_checkpointing: bool = True
+    compile_layers: bool = False  # Set via --compile flag in train.py
 
     # Training seed
     seed: int = 1337
