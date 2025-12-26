@@ -25,10 +25,6 @@ from params import Config, TrainCfg
 
 
 def main():
-    import torch.multiprocessing as mp
-    
-    if mp.get_start_method(allow_none=True) != 'spawn':
-        mp.set_start_method('spawn', force=True)
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_dir", type=str, default="data/shards/phase1/train")
