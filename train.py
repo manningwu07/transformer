@@ -207,7 +207,7 @@ def main():
 
     if args.compile:
         os.environ["TORCHINDUCTOR_CUDAGRAPHS"] = "0"
-        model = torch.compile(model, mode="reduce-overhead")
+        model = torch.compile(model, mode="max-autotune-no-cudagraphs")
 
     if is_distributed():
         model = DDP(model, device_ids=[get_local_rank()], output_device=get_local_rank())

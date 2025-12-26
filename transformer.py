@@ -262,7 +262,6 @@ class LLM(nn.Module):
         targets=None,
         kv_cache=None,
         use_cache: bool = False,
-        return_logits: bool = False,
     ):
         B, T = idx.shape
         x = self.tok_embeddings(idx)
@@ -270,52 +269,26 @@ class LLM(nn.Module):
 
         for i, layer in enumerate(self.layers):
             layer_cache = kv_cache[i] if kv_cache is not None else None
-            if (
-                self.training
-                and targets is not None
-                and getattr(self.config, "gradient_checkpointing", False)
-                and not use_cache
-            ):
-                # Important: checkpoint closure must take only tensors
-                x = ckpt.checkpoint(layer.forward_train, x, use_reentrant=False)
-            else:
-                x, new_cache = layer(x, layer_cache, use_cache)
-                if use_cache:
-                    new_caches.append(new_cache)
+            # Standard forward pass - Let torch.compile handle the heavy lifting
+            x, new_cache = layer(x, layer_cache, use_cache)
+            if use_cache:
+                new_caches.append(new_cache)
 
         x = self.norm(x)
         
         if targets is not None:
-            # Shift x and targets for next-token prediction
-            # (If not already handled by your data loader)
+            # Shift happens inside F.cross_entropy if you pass it correctly, 
+            # or your DataLoader already handles it.
+            logits = self.output(x) # [B, T, V]
             
-            V = self.config.vocab_size
-            T = x.size(1)
-            chunk_size = 512 # Materialize only 512 tokens at a time (to avoid OOM) --- Change this as needed
-            logits_list = [] if return_logits else None
-            loss_sum = 0.0
-            
-            # Compute loss in chunks to avoid the 512MB spike
-            for i in range(0, T, chunk_size):
-                end = min(i + chunk_size, T)
-                # Compute logits only for this chunk
-                chunk_logits = self.output(x[:, i:end, :]) # [B, chunk, V]
-                chunk_targets = targets[:, i:end]
-                
-                loss_chunk = F.cross_entropy(
-                    chunk_logits.view(-1, V),
-                    chunk_targets.view(-1),
-                    reduction='sum'
-                )
-                loss_sum += loss_chunk
-                
-                if return_logits:
-                    logits_list.append(chunk_logits.detach())
-
-            loss = loss_sum / (B * T)
-            logits = torch.cat(logits_list, dim=1) if return_logits else None
-            return logits, loss, new_caches if use_cache else None
+            # Cross entropy is now a single fused Triton kernel in Inductor
+            loss = F.cross_entropy(
+                logits.view(-1, self.config.vocab_size), 
+                targets.view(-1)
+            )
+            return logits, loss, None
         else:
+            # Inference path
             logits = self.output(x[:, [-1], :])
             return logits, None, new_caches if use_cache else None
 

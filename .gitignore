@@ -22,3 +22,6 @@
 # env files
 .env
 *.env
+
+# hardware
+hardware_config.txt
