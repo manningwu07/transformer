@@ -1,4 +1,3 @@
-import torch._inductor.config as inductor_config
 import argparse
 import math
 import os
@@ -77,14 +76,6 @@ def main():
     torch.backends.cuda.enable_mem_efficient_sdp(True)
     torch.backends.cuda.enable_math_sdp(False)
     torch.cuda.set_per_process_memory_fraction(0.875, device=0) # Fits in 14GB VRAM (Increase this if you have more VRAM available)
-    
-     # Prevents the "Tree" optimization which shares memory across 
-    # multiple captured graphs. Slower compilation, but saves ~1-1.5GB VRAM.
-    inductor_config.triton.cudagraph_trees = False
-
-    # Increase the threshold for when Inductor decides a kernel 
-    # is "large" enough to deserve its own pool.
-    inductor_config.triton.cudagraph_pool_allocation_threshold = 0.1
 
     seed_everything(args.seed)
 
