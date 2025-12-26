@@ -256,41 +256,21 @@ class LLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(
-        self,
-        idx,
-        targets=None,
-        kv_cache=None,
-        use_cache: bool = False,
-    ):
-        B, T = idx.shape
+    def forward(self, idx, targets=None, kv_cache=None, use_cache: bool = False):
         x = self.tok_embeddings(idx)
-        new_caches = [] if use_cache else None
-
-        for i, layer in enumerate(self.layers):
-            layer_cache = kv_cache[i] if kv_cache is not None else None
-            # Standard forward pass - Let torch.compile handle the heavy lifting
-            x, new_cache = layer(x, layer_cache, use_cache)
-            if use_cache:
-                new_caches.append(new_cache)
+        
+        # Simple loop is best for Inductor to trace
+        for layer in self.layers:
+            x, _ = layer(x, None, False) 
 
         x = self.norm(x)
-        
+        logits = self.output(x)
+
         if targets is not None:
-            # Shift happens inside F.cross_entropy if you pass it correctly, 
-            # or your DataLoader already handles it.
-            logits = self.output(x) # [B, T, V]
-            
-            # Cross entropy is now a single fused Triton kernel in Inductor
-            loss = F.cross_entropy(
-                logits.view(-1, self.config.vocab_size), 
-                targets.view(-1)
-            )
+            loss = F.cross_entropy(logits.view(-1, self.config.vocab_size), targets.view(-1))
             return logits, loss, None
-        else:
-            # Inference path
-            logits = self.output(x[:, [-1], :])
-            return logits, None, new_caches if use_cache else None
+        
+        return logits, None, None
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=100, temperature=0.7, top_k=50, use_cache=True):
