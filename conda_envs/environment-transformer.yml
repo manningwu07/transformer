@@ -23,4 +23,5 @@ dependencies:
   - pytorch>=2.2
   - torchvision
   - torchaudio
-  - pytorch-cuda=12.1
+  - pip:
+      - torchao

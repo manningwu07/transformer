@@ -3,16 +3,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
 import math
-from params import Config, TrainCfg
+from params import Config
+import inspect
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
+if hasattr(nn, "RMSNorm"):
+    RMSNorm = nn.RMSNorm
+else:
+    class RMSNorm(nn.Module):
+        """Fallback RMSNorm for older PyTorch."""
+        def __init__(self, dim, eps=1e-6):
+            super().__init__()
+            self.weight = nn.Parameter(torch.ones(dim))
+            self.eps = eps
 
-    def forward(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        def forward(self, x):
+            return (
+                x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+            )
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=32768, theta=10000.0):
@@ -228,12 +235,27 @@ class TransformerBlock(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x, new_cache
 
-    def forward_train(self, x):
-        # Training path: no KV cache, returns only x (checkpoint-friendly)
+    def forward_no_cache(self, x):
+        """
+        Training/checkpoint-friendly forward. No KV cache, returns only x.
+        This is what we compile and what checkpoint() calls.
+        """
         attn_out, _ = self.attn(self.norm1(x), kv_cache=None, use_cache=False)
         x = x + attn_out
         x = x + self.mlp(self.norm2(x))
         return x
+
+    # Alias for backward compat (your checkpoint calls this)
+    forward_train = forward_no_cache
+
+
+# Fused cross-entropy (avoids materializing huge logit tensor)
+try:
+    from liger_kernel.ops.cross_entropy import LigerCrossEntropyLoss
+    _fused_ce = LigerCrossEntropyLoss()
+    USE_FUSED_CE = True
+except ImportError:
+    USE_FUSED_CE = False
 
 class LLM(nn.Module):
     def __init__(self, config=None, **kwargs):
@@ -255,17 +277,21 @@ class LLM(nn.Module):
             for _ in range(self.config.n_layers)
         ])
         
+        self._maybe_enable_torchao_float8()
+        
         # Compile the inner forward_train method (what gets checkpointed)
         # This way: checkpointing controls memory, compile speeds up the ops inside
         self._compile_layers = getattr(self.config, "compile_layers", False)
         if self._compile_layers:
-            print("⚡ Compiling TransformerBlock.forward_train (compatible with grad ckpt)...")
+            print("⚡ Compiling TransformerBlock.forward_no_cache...")
             for layer in self.layers:
-                layer.forward_train = torch.compile(
-                    layer.forward_train,
+                layer.forward_no_cache = torch.compile(
+                    layer.forward_no_cache,
                     mode="default",
                     fullgraph=False,
                 )
+                
+                layer.forward_train = layer.forward_no_cache
 
         self.norm = RMSNorm(self.config.d_model, eps=self.config.rms_norm_eps)
         self.output = nn.Linear(self.config.d_model, self.config.vocab_size, bias=False)
@@ -299,18 +325,22 @@ class LLM(nn.Module):
 
         for i, layer in enumerate(self.layers):
             if use_ckpt and (skip_every_n == 0 or (i % skip_every_n) != 0):
-                x = ckpt.checkpoint(layer.forward_train, x, use_reentrant=False)
+                x = ckpt.checkpoint(layer.forward_no_cache, x, use_reentrant=False)
             else:
-                x, _ = layer(x, None, False)
+                x = layer.forward_no_cache(x)
 
         x = self.norm(x)
         logits = self.output(x)
 
         if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, self.config.vocab_size),
-                targets.view(-1),
-            )
+            if USE_FUSED_CE:
+                # Fused CE: doesn't materialize [B*T, V] intermediate
+                loss = _fused_ce(logits.view(-1, self.config.vocab_size), targets.view(-1))
+            else:
+                loss = F.cross_entropy(
+                    logits.view(-1, self.config.vocab_size),
+                    targets.view(-1),
+                )
             return logits, loss, None
         
         return logits, None, None
@@ -345,3 +375,39 @@ class LLM(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
             
             yield idx_next # Yield token-by-token for streaming
+            
+    def _maybe_enable_torchao_float8(self) -> None:
+        if not getattr(self.config, "use_float8", False):
+            return
+
+        try:
+            from torchao.float8 import convert_to_float8_training
+        except Exception as e:
+            raise RuntimeError(
+                "use_float8=True but torchao.float8 is not available. "
+                "Install torchao and ensure it matches your torch build."
+            ) from e
+
+        # Optional: try to pass a Float8LinearConfig if the torchao version supports it.
+        cfg = None
+        try:
+            from torchao.float8 import Float8LinearConfig
+
+            recipe = getattr(self.config, "float8_recipe", "rowwise")
+            sig = inspect.signature(Float8LinearConfig)
+            kwargs = {}
+            if "recipe_name" in sig.parameters:
+                kwargs["recipe_name"] = recipe
+            cfg = Float8LinearConfig(**kwargs) if kwargs else Float8LinearConfig()
+        except Exception:
+            cfg = None
+
+        # Convert only the transformer layers (keeps tok_embeddings  lm_head BF16).
+        convert_sig = inspect.signature(convert_to_float8_training)
+        kwargs = {}
+        if "config" in convert_sig.parameters and cfg is not None:
+            kwargs["config"] = cfg
+
+        out = convert_to_float8_training(self.layers, **kwargs)
+        if out is not None:
+            self.layers = out

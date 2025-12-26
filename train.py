@@ -25,6 +25,12 @@ from params import Config, TrainCfg
 
 def main():
     
+    # Sanity checks    
+    print("torch:", torch.__version__)
+    print("cuda:", torch.version.cuda)
+    print("device:", torch.cuda.get_device_name(0))
+    print("capability:", torch.cuda.get_device_capability(0))
+        
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_dir", type=str, default="data/shards/phase1/train")
     parser.add_argument("--val_dir", type=str, default="data/shards/phase1/val")
@@ -261,6 +267,10 @@ def main():
     t0 = time.time()
     loss_window = []
     world_size = int(os.getenv("WORLD_SIZE", "1"))
+    
+    # Print Float8 usage stats
+    types = {type(m).__name__ for m in model.modules()}
+    print([t for t in sorted(types) if "Float8" in t or "float8" in t.lower()])
 
     model.train()
     while opt_step < args.total_opt_steps:

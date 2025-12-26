@@ -1,6 +1,7 @@
 # params.py
 from dataclasses import dataclass
 import os
+from typing import Literal
 
 DATA_DIR = "data"
 TOKENIZER_PATH = os.path.join(DATA_DIR, "json", "tokenizer.json")
@@ -35,9 +36,17 @@ class ModelArgs:
     max_seq_len: int = 8192
     gradient_checkpointing: bool = True
     checkpoint_skip_every_n: int = 4 # 0 = no skipping, 1 = skip all, N = skip all but every Nth
-    compile_layers: bool = False
+    compile_layers: bool = True  # ← Enable this now
+    use_float8: bool = True
 
     seed: int = 1337
+    
+    # Float8 (torchao)
+    # Converts Linear layers inside Transformer blocks to Float8Linear for training
+    # Keep embeddings + lm_head in BF16 (weight-tying + stability).
+    use_float8: bool = True
+    # Common recipe names in torchao docs: "rowwise" or "tensorwise"
+    float8_recipe: Literal["rowwise", "tensorwise"] = "tensorwise"
 
 
 @dataclass
