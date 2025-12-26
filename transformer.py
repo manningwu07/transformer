@@ -293,10 +293,18 @@ class LLM(nn.Module):
             and getattr(self.config, "gradient_checkpointing", False)
             and not use_cache
         )
+        
+        checkpoint_every_n = getattr(self.config, "checkpoint_every_n", 1)
 
-        for layer in self.layers:
+        # Every 'n' layers we will NOT checkpoint to save compute
+        # 1 = checkpoint everything (current)
+        # 2 = checkpoint every 2nd layer (faster)
+        for i, layer in enumerate(self.layers):
             if use_ckpt:
-                x = ckpt.checkpoint(layer.forward_train, x, use_reentrant=False)
+                if (i % checkpoint_every_n == 0):
+                    x = ckpt.checkpoint(layer.forward_train, x, use_reentrant=False)
+                else:
+                    x, _ = layer(x, None, False)
             else:
                 x, _ = layer(x, None, False)
 
