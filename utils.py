@@ -48,6 +48,7 @@ def set_rng_state(state):
     
 
 @torch.no_grad()
+@torch._dynamo.disable
 def validate(model, device, val_loader, max_val_steps: int = 100):
     model.eval()
     total_loss = 0.0

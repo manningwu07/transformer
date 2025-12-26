@@ -370,6 +370,12 @@ def main():
                         f"Loss {raw_loss:.4f} (avg {avg:.4f}) | "
                         f"LR {lr:.2e} | {tps:.0f} tok/s"
                     )
+                    
+                    torch.cuda.reset_peak_memory_stats()
+                    # run one full optimizer step (all micro steps)
+                    print("max allocated GB", torch.cuda.max_memory_allocated() / 1e9)
+                    print("max reserved  GB", torch.cuda.max_memory_reserved() / 1e9)
+                    
                     last_log_t = end_compute_t
 
                 if opt_step % args.val_every_opt == 0:
