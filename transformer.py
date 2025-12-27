@@ -6,20 +6,18 @@ import math
 from params import Config
 import inspect
 
-if hasattr(nn, "RMSNorm"):
-    RMSNorm = nn.RMSNorm
-else:
-    class RMSNorm(nn.Module):
-        """Fallback RMSNorm for older PyTorch."""
-        def __init__(self, dim, eps=1e-6):
-            super().__init__()
-            self.weight = nn.Parameter(torch.ones(dim))
-            self.eps = eps
+class RMSNorm(nn.Module):
+    """
+    Custom RMSNorm to avoid PyTorch's fused RMSNorm kernels that can produce
+    oversized Triton shared-mem requirements on some builds/GPUs.
+    """
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
 
-        def forward(self, x):
-            return (
-                x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
-            )
+    def forward(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=Config.max_seq_len, theta=10000.0):
