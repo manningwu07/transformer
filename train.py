@@ -96,7 +96,7 @@ def main():
         
         model = torch.compile(
             model,
-            mode="default",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
+            mode="reduce-overhead",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
             fullgraph=False,      # Allow graph breaks (safer with checkpointing)
             dynamic=False,        # Static shapes = faster compiled code
         )
@@ -292,7 +292,7 @@ def main():
         try:
             import torch._dynamo.compiled_autograd as ca
             compiled_autograd_ctx = ca.enable(
-                compiler=lambda gm: torch.compile(gm, mode="default", fullgraph=False)
+                compiler=lambda gm: torch.compile(gm, mode="reduce-overhead", fullgraph=False)
             )
             print("⚡ compiled_autograd enabled (experimental)")
         except Exception as e:
@@ -322,12 +322,17 @@ def main():
 
             x = x.to(device, dtype=torch.long, non_blocking=True)
             y = y.to(device, dtype=torch.long, non_blocking=True)
+            
+            # Needed for torch.compile(mode="reduce-overhead") / CUDA Graph replay
+            if args.compile:
+                torch.compiler.cudagraph_mark_step_begin()
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss, _ = model(x, targets=y)
 
             # grad accumulation
-            accum_loss += loss.detach() / TrainCfg.grad_accum_steps
+            loss_for_log = loss.detach().float().clone()
+            accum_loss += loss_for_log / TrainCfg.grad_accum_steps
             loss = loss / float(TrainCfg.grad_accum_steps)
             if compiled_autograd_ctx is not None:
                 with compiled_autograd_ctx:
