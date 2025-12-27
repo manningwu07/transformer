@@ -305,6 +305,14 @@ def main():
     model.train()
     while opt_step < args.total_opt_steps:
         try:
+            def maybe_cudagraph_step_begin() -> None:
+                if not args.compile:
+                    return
+                try:
+                    torch.compiler.cudagraph_mark_step_begin()
+                except Exception:
+                    pass
+
             try:
                 x, y = next(train_iter)
             except StopIteration:
@@ -318,23 +326,24 @@ def main():
             x = x.to(device, dtype=torch.long, non_blocking=True).clone()
             y = y.to(device, dtype=torch.long, non_blocking=True).clone()
             
-            
-            try:
-                torch.compiler.cudagraph_mark_step_begin()
-            except Exception:
-                pass
+            next_micro_step = int(micro_step) + 1
+            will_boundary = (
+                next_micro_step > 0
+                and next_micro_step % int(TrainCfg.grad_accum_steps) == 0
+            )
 
+            maybe_cudagraph_step_begin()
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss, _ = model(x, targets=y)
 
+            raw_loss = None
+            if will_boundary:
+                # This is one sync every grad_accum_steps, not every micro-step.
+                raw_loss = float(loss.detach().float().cpu().item())
 
             # Keep a reference only within this iteration.
             loss_for_backward = loss / float(TrainCfg.grad_accum_steps)
-            
-            try:
-                torch.compiler.cudagraph_mark_step_begin()
-            except Exception:
-                pass
+            maybe_cudagraph_step_begin()
             
             if compiled_autograd_ctx is not None:
                 with compiled_autograd_ctx:
@@ -345,10 +354,9 @@ def main():
             micro_step += 1
             micro_step_in_epoch += 1
 
-            is_boundary = (micro_step > 0 and micro_step % int(TrainCfg.grad_accum_steps) == 0)
-            if is_boundary:
+            if will_boundary:
                 total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                raw_loss = float(loss.detach().float().item())
+                assert raw_loss is not None
                 loss_window.append(raw_loss)
                 if len(loss_window) > 100: loss_window.pop(0)                
     
@@ -357,6 +365,7 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     continue
                 
+                maybe_cudagraph_step_begin()
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
