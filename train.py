@@ -174,7 +174,7 @@ def main():
             val_ds,
             shuffle=False,
             seed=args.seed,
-            drop_last=False,
+            drop_last=True,
             worker_init_fn=worker_init_fn
         )
         shuffle = False
@@ -296,6 +296,44 @@ def main():
             print(f"⚠️ compiled_autograd not available: {e}")
             compiled_autograd_ctx = None
             
+    # --------------------------------------------
+    # One-shot compiled train_step (forward + backward)
+    # --------------------------------------------
+    def maybe_cudagraph_step_begin() -> None:
+        if not args.compile:
+            return
+        try:
+            torch.compiler.cudagraph_mark_step_begin()
+        except Exception:
+            pass
+
+    # Compile a single micro-step: forward + loss + backward.
+    # This avoids passing cudagraph outputs across Python boundaries.
+    def train_step(x, y):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, loss, _ = model(x, targets=y)
+        loss = loss / float(TrainCfg.grad_accum_steps)
+
+        # If compiled_autograd is enabled, wrap the backward
+        if compiled_autograd_ctx is not None:
+            with compiled_autograd_ctx:
+                loss.backward()
+        else:
+            loss.backward()
+
+        # Return a detached scalar tensor for logging (read immediately).
+        return loss.detach()
+
+    train_step_compiled = train_step
+    if args.compile:
+        # fullgraph=True encourages Inductor to capture forward + backward as a unit
+        train_step_compiled = torch.compile(
+            train_step,
+            mode="max-autotune",
+            fullgraph=True,
+            dynamic=False,
+        )
+            
     # === Training Loop ===
     t0 = time.time()
     last_log_t = t0
@@ -305,14 +343,6 @@ def main():
     model.train()
     while opt_step < args.total_opt_steps:
         try:
-            def maybe_cudagraph_step_begin() -> None:
-                if not args.compile:
-                    return
-                try:
-                    torch.compiler.cudagraph_mark_step_begin()
-                except Exception:
-                    pass
-
             try:
                 x, y = next(train_iter)
             except StopIteration:
@@ -332,25 +362,21 @@ def main():
                 and next_micro_step % int(TrainCfg.grad_accum_steps) == 0
             )
 
+            # Single compiled invocation (forward+backward)
             maybe_cudagraph_step_begin()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                _, loss, _ = model(x, targets=y)
+            loss_scaled_detached = train_step_compiled(x, y)
 
             raw_loss = None
             if will_boundary:
-                # This is one sync every grad_accum_steps, not every micro-step.
-                raw_loss = float(loss.detach().float().cpu().item())
+                # loss_scaled_detached is already scaled by grad_accum_steps.
+                # Convert back to "raw" loss for logging.
+                raw_loss = float(
+                    (loss_scaled_detached * float(TrainCfg.grad_accum_steps))
+                    .float()
+                    .cpu()
+                    .item()
+                )
 
-            # Keep a reference only within this iteration.
-            loss_for_backward = loss / float(TrainCfg.grad_accum_steps)
-            maybe_cudagraph_step_begin()
-            
-            if compiled_autograd_ctx is not None:
-                with compiled_autograd_ctx:
-                    loss_for_backward.backward()
-            else:
-                loss_for_backward.backward()
-                
             micro_step += 1
             micro_step_in_epoch += 1
 
@@ -365,6 +391,7 @@ def main():
                     optimizer.zero_grad(set_to_none=True)
                     continue
                 
+                # optimizer step is outside the compiled train_step
                 maybe_cudagraph_step_begin()
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)

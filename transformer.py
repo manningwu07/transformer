@@ -285,32 +285,6 @@ class LLM(nn.Module):
             f"🧠 Model Init: MLA Decoupled RoPE | "
             f"Dim {self.config.d_model} | Latent {self.config.d_latent}"
         )
-        
-        self._apply_compilation()
-
-    def _apply_compilation(self):
-        mode = getattr(self.config, "compile_mode", "none")
-        
-        if mode == "none":
-            return
-        
-        if mode == "layers":
-            print("⚡ Compiling TransformerBlock.forward_no_cache (per-layer)...")
-            for layer in self.layers:
-                layer.forward_no_cache = torch.compile(
-                    layer.forward_no_cache,
-                    mode="default",
-                    fullgraph=False,
-                )
-                layer.forward_train = layer.forward_no_cache
-        
-        elif mode == "model":
-            # NOTE: We don't compile here — we return self and let train.py wrap it
-            # This is because compile should happen AFTER .to(device) and before DDP
-            print("⚡ Model marked for whole-model compilation (apply in train.py)")
-            self._needs_whole_model_compile = True
-        else:
-            raise ValueError(f"Unknown compile_mode: {mode}")
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -320,26 +294,9 @@ class LLM(nn.Module):
 
     def forward(self, idx, targets=None, kv_cache=None, use_cache: bool = False):
         x = self.tok_embeddings(idx)
+        
         for layer in self.layers:
             x = layer.forward_no_cache(x)
-        # force_no_ckpt = getattr(self.config, "compile_mode", "none") == "model"
-        
-        # use_ckpt = (
-        #     self.training
-        #     and targets is not None
-        #     and getattr(self.config, "gradient_checkpointing", False)
-        #     and not use_cache
-        #     and not force_no_ckpt    
-        # )
-
-        # # checkpoint all layers except every Nth layer (skip to save compute)
-        # skip_every_n = getattr(self.config, "checkpoint_skip_every_n", 0)
-
-        # for i, layer in enumerate(self.layers):
-        #     if use_ckpt and (skip_every_n == 0 or (i % skip_every_n) != 0):
-        #         x = ckpt.checkpoint(layer.forward_no_cache, x, use_reentrant=False)
-        #     else:
-        #         x = layer.forward_no_cache(x)
 
         x = self.norm(x)
         logits = self.output(x)
@@ -353,9 +310,9 @@ class LLM(nn.Module):
                     logits.view(-1, self.config.vocab_size),
                     targets.view(-1),
                 )
-            return logits, loss, None
+            return None, loss, None
         
-        return logits, None, None
+        return logits, loss, None
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=100, temperature=0.7, top_k=50, use_cache=True):
