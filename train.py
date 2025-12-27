@@ -5,6 +5,7 @@ import signal
 import sys
 import threading
 import time
+import gc
 import traceback
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
@@ -245,6 +246,9 @@ def main():
     static_loss = None
 
     if use_cuda_graphs:
+        graph_stream = torch.cuda.Stream()
+        torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+        
         if is_main_process():
             print("📌 Capturing manual CUDA graph (forward + backward micro-step)...")
 
@@ -260,26 +264,51 @@ def main():
         static_x.random_(0, int(Config.vocab_size))
         static_y.random_(0, int(Config.vocab_size))
 
-        # Warmup (outside capture): triggers torch.compile compilation/autotune,
-        # allocates grad buffers, SDPA workspaces, CE buffers, etc.
-        for _ in range(2):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                _, warm_loss, _ = model(static_x, targets=static_y)
-            (warm_loss / float(TrainCfg.grad_accum_steps)).backward()
-            optimizer.zero_grad(set_to_none=False)
+         # Warmup + capture must run on the SAME non-default stream to avoid
+        # autograd trying to join legacy stream with capture stream.
+        torch.cuda.synchronize()
+        with torch.cuda.stream(graph_stream):
+            # Wait for any work enqueued on legacy default stream
+            graph_stream.wait_stream(torch.cuda.default_stream())
 
-        torch.cuda.synchronize()
-        optimizer.zero_grad(set_to_none=False)
-        torch.cuda.synchronize()
+            # Warmup (outside capture): trigger torch.compile/autotune and allocate buffers.
+            for _ in range(5):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    _, warm_loss, _ = model(static_x, targets=static_y)
+                (warm_loss / float(TrainCfg.grad_accum_steps)).backward()
+                optimizer.zero_grad(set_to_none=False)
+                del warm_loss
+
+            # Make sure no Python refs keep autograd graphs alive
+            gc.collect()
+            torch.cuda.synchronize()
+            optimizer.zero_grad(set_to_none=False)
+            torch.cuda.synchronize()
 
         micro_graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(micro_graph):
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                _, loss, _ = model(static_x, targets=static_y)
-            # Store raw loss for logging (GPU op; no sync).
-            static_loss.copy_(loss)
-            # Backward is captured inside the graph.
-            (loss / float(TrainCfg.grad_accum_steps)).backward()
+        
+        # Use a dedicated graph memory pool handle to reduce allocator surprises.
+        graph_pool = torch.cuda.graphs.graph_pool_handle()
+
+        with torch.cuda.stream(graph_stream):
+            graph_stream.wait_stream(torch.cuda.default_stream())
+            try:
+                with torch.cuda.graph(
+                    micro_graph,
+                    pool=graph_pool,
+                    capture_error_mode="global",
+                ):
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        _, loss, _ = model(static_x, targets=static_y)
+                    static_loss.copy_(loss)
+                    (loss / float(TrainCfg.grad_accum_steps)).backward()
+            except TypeError:
+                # Older torch may not support capture_error_mode kwarg.
+                with torch.cuda.graph(micro_graph, pool=graph_pool):
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                        _, loss, _ = model(static_x, targets=static_y)
+                    static_loss.copy_(loss)
+                    (loss / float(TrainCfg.grad_accum_steps)).backward()
 
         torch.cuda.synchronize()
         if is_main_process():
@@ -312,12 +341,7 @@ def main():
             is_crash=True,
         )
 
-    exiting = threading.Event()
-    def handle_sigint(sig, frame):
-        # Get the current process ID
-        import os
-        main_pid = os.getpgrp() 
-        
+    def handle_sigint(sig, frame):        
         # Only the main process should save checkpoints
         # Workers should just exit
         if is_main_process() and torch.cuda.is_initialized():
@@ -407,9 +431,16 @@ def main():
             if use_cuda_graphs:
                 assert static_x is not None and static_y is not None
                 assert static_loss is not None and micro_graph is not None
-                static_x.copy_(x, non_blocking=True)
-                static_y.copy_(y, non_blocking=True)
-                micro_graph.replay()
+                assert "graph_stream" in locals()
+
+                # Copy + replay on the SAME non-default stream used for capture.
+                with torch.cuda.stream(graph_stream):
+                    static_x.copy_(x, non_blocking=True)
+                    static_y.copy_(y, non_blocking=True)
+                    micro_graph.replay()
+
+                # Ensure optimizer step on default stream is ordered after replay.
+                torch.cuda.default_stream().wait_stream(graph_stream)
                 loss_for_log = static_loss
             else:
                 x = x.to(device, dtype=torch.long, non_blocking=True).clone()
