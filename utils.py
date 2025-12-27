@@ -28,13 +28,6 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-def unwrap_model(m):
-    # DDP unwrap
-    if isinstance(m, DDP):
-        m = m.module
-    # torch.compile unwrap (OptimizedModule exposes _orig_mod)
-    return getattr(m, "_orig_mod", m)
-
 def get_rng_state():
     state = {
         "python": random.getstate(),
@@ -61,11 +54,6 @@ def validate(model, device, val_loader, max_val_steps: int = 100):
     steps = 0
 
     for x, y in val_loader:
-        try:
-            torch.compiler.cudagraph_mark_step_begin()
-        except Exception:
-            pass
-        
         x = x.to(device, dtype=torch.long, non_blocking=True)
         y = y.to(device, dtype=torch.long, non_blocking=True)
 
@@ -134,9 +122,9 @@ class CheckpointManager:
         if not is_main_process(): return
         path = os.path.join(self.save_dir, f"{tag}.pt")
         tmp_path = path + ".tmp"
-        m = unwrap_model(model)
         payload = {
-            "model": m.state_dict(),
+            "model": model.module.state_dict() if isinstance(model, DDP) 
+                     else model.state_dict(),
             "optimizer": opt.state_dict() if opt else None,
             "scheduler": sched.state_dict() if sched else None,
             "client_state": state,
@@ -166,8 +154,7 @@ class CheckpointManager:
             map_location="cpu",
             weights_only=False,
         )
-        m = unwrap_model(model)
-        m.load_state_dict(ckpt["model"], strict=True)
+        model.load_state_dict(ckpt["model"], strict=True)
         if opt and ckpt["optimizer"]: opt.load_state_dict(ckpt["optimizer"])
         if sched and ckpt["scheduler"]: sched.load_state_dict(ckpt["scheduler"])
         return ckpt.get("client_state")
@@ -178,5 +165,3 @@ class CheckpointManager:
         for p in ckpts[:-keep]:
             try: os.remove(p)
             except: pass
-            
-            
