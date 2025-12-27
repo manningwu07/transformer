@@ -321,11 +321,14 @@ class LLM(nn.Module):
     def forward(self, idx, targets=None, kv_cache=None, use_cache: bool = False):
         x = self.tok_embeddings(idx)
 
+        force_no_ckpt = getattr(self.config, "compile_mode", "none") == "model"
+        
         use_ckpt = (
             self.training
             and targets is not None
             and getattr(self.config, "gradient_checkpointing", False)
             and not use_cache
+            and not force_no_ckpt    
         )
 
         # checkpoint all layers except every Nth layer (skip to save compute)
