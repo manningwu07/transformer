@@ -214,7 +214,7 @@ def main():
         False,
         args.seed,
         offset=0,
-        drop_last=False,
+        drop_last=True,
     )
 
     # Compilation now handled inside LLM.__init__ via Config.compile_layers
@@ -233,6 +233,15 @@ def main():
 
     train_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
+    
+    def get_eager_model(m):
+        # If using DDP, unwrap.
+        if isinstance(m, DDP):
+            m = m.module
+        # If compiled, prefer the original eager module.
+        return getattr(m, "_orig_mod", m)
+
+    eager_model_for_val = get_eager_model(model)
 
     def save_crash_and_exit():
         client_state = {
@@ -378,8 +387,7 @@ def main():
                     last_log_t = end_compute_t
 
                 if opt_step % args.val_every_opt == 0:
-                    with torch._dynamo.disable():
-                        val_loss, val_ppl = validate(model, device, val_loader)
+                    val_loss, val_ppl = validate(eager_model_for_val, device, val_loader)
                     if is_main_process():
                         print(
                             f"📉 [VAL] Opt {opt_step} | Loss {val_loss:.4f} | PPL {val_ppl:.2f}"
