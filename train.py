@@ -1,5 +1,4 @@
 import argparse
-import math
 import os
 import random
 import signal
@@ -15,7 +14,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-import torch.compiler
+import torch._dynamo
 from torch._dynamo.backends.common import aot_autograd
 from transformers import Adafactor
 from typing import Optional
@@ -379,7 +378,7 @@ def main():
                     last_log_t = end_compute_t
 
                 if opt_step % args.val_every_opt == 0:
-                    with torch.compiler.disable():
+                    with torch._dynamo.disable():
                         val_loss, val_ppl = validate(model, device, val_loader)
                     if is_main_process():
                         print(
