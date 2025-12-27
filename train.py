@@ -27,6 +27,7 @@ def main():
     parser.add_argument("--train_dir", type=str, default="data/shards/phase1/train")
     parser.add_argument("--val_dir", type=str, default="data/shards/phase1/val")
     parser.add_argument("--save_dir", type=str, default="models")
+    parser.add_argument("--cuda_graphs", action="store_true")
     parser.add_argument("--resume", type=str, default=None)
 
     parser.add_argument("--seed", type=int, default=getattr(Config, "seed", 1337))
@@ -229,7 +230,60 @@ def main():
         train_sampler.set_epoch(epoch)
 
     train_iter = iter(train_loader)
-    optimizer.zero_grad(set_to_none=True)
+    
+    use_cuda_graphs = bool(args.cuda_graphs) and not is_distributed()
+    if args.cuda_graphs and is_distributed() and is_main_process():
+        print("⚠️  --cuda_graphs disabled under DDP (NCCL not capture-safe).")
+
+    # For CUDA graph replay, grads must exist (cannot be None) across replays.
+    # So we must NOT use set_to_none=True once graphs are enabled.
+    optimizer.zero_grad(set_to_none=not use_cuda_graphs)
+
+    micro_graph = None
+    static_x = None
+    static_y = None
+    static_loss = None
+
+    if use_cuda_graphs:
+        if is_main_process():
+            print("📌 Capturing manual CUDA graph (forward + backward micro-step)...")
+
+        static_x = torch.empty(
+            (int(TrainCfg.batch_size), int(TrainCfg.seq_len)),
+            device=device,
+            dtype=torch.long,
+        )
+        static_y = torch.empty_like(static_x)
+        static_loss = torch.empty((), device=device, dtype=torch.float32)
+
+        # Dummy data just to compile kernels, allocate buffers, and capture.
+        static_x.random_(0, int(Config.vocab_size))
+        static_y.random_(0, int(Config.vocab_size))
+
+        # Warmup (outside capture): triggers torch.compile compilation/autotune,
+        # allocates grad buffers, SDPA workspaces, CE buffers, etc.
+        for _ in range(2):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _, warm_loss, _ = model(static_x, targets=static_y)
+            (warm_loss / float(TrainCfg.grad_accum_steps)).backward()
+            optimizer.zero_grad(set_to_none=False)
+
+        torch.cuda.synchronize()
+        optimizer.zero_grad(set_to_none=False)
+        torch.cuda.synchronize()
+
+        micro_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(micro_graph):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                _, loss, _ = model(static_x, targets=static_y)
+            # Store raw loss for logging (GPU op; no sync).
+            static_loss.copy_(loss)
+            # Backward is captured inside the graph.
+            (loss / float(TrainCfg.grad_accum_steps)).backward()
+
+        torch.cuda.synchronize()
+        if is_main_process():
+            print("✅ CUDA graph captured.")
     
     def get_eager_model(m):
         # If using DDP, unwrap.
@@ -284,7 +338,8 @@ def main():
     signal.signal(signal.SIGINT, handle_sigint)
     
     # Compiled autograd context manager
-    compiled_autograd_ctx = None
+    if use_cuda_graphs:
+        compiled_autograd_ctx = None    
     if getattr(Config, "use_compiled_autograd", False):
         try:
             import torch._dynamo.compiled_autograd as ca
@@ -300,7 +355,9 @@ def main():
     # Compile forward+loss
     # --------------------------------------------
     def maybe_cudagraph_step_begin() -> None:
-        if not args.compile:
+        # Only for Inductor-managed cudagraphs. When using manual
+        # torch.cuda.CUDAGraph, this is unnecessary.
+        if not args.compile or use_cuda_graphs:
             return
         try:
             torch.compiler.cudagraph_mark_step_begin()
@@ -340,36 +397,43 @@ def main():
                     train_sampler.set_epoch(epoch)
                 train_iter = iter(train_loader)
                 x, y = next(train_iter)
-
-            x = x.to(device, dtype=torch.long, non_blocking=True).clone()
-            y = y.to(device, dtype=torch.long, non_blocking=True).clone()
             
             next_micro_step = int(micro_step) + 1
             will_boundary = (
                 next_micro_step > 0
                 and next_micro_step % int(TrainCfg.grad_accum_steps) == 0
             )
+            
+            if use_cuda_graphs:
+                assert static_x is not None and static_y is not None
+                assert static_loss is not None and micro_graph is not None
+                static_x.copy_(x, non_blocking=True)
+                static_y.copy_(y, non_blocking=True)
+                micro_graph.replay()
+                loss_for_log = static_loss
+            else:
+                x = x.to(device, dtype=torch.long, non_blocking=True).clone()
+                y = y.to(device, dtype=torch.long, non_blocking=True).clone()
 
-            # Single compiled invocation (forward+backward)
-            maybe_cudagraph_step_begin()
-            loss = forward_loss_compiled(x, y)
-            if args.compile:
-                loss = loss.clone()
+                maybe_cudagraph_step_begin()
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    _, loss, _ = model(x, targets=y)
+
+                loss_for_backward = loss / float(TrainCfg.grad_accum_steps)
+                maybe_cudagraph_step_begin()
+
+                if compiled_autograd_ctx is not None:
+                    with compiled_autograd_ctx:
+                        loss_for_backward.backward()
+                else:
+                    loss_for_backward.backward()
+
+                loss_for_log = loss
             
 
             raw_loss = None
             if will_boundary:
-                # This is one sync every grad_accum_steps, not every micro-step.
-                raw_loss = float(loss.detach().float().cpu().item())
-                
-            loss_for_backward = loss / float(TrainCfg.grad_accum_steps)
-            maybe_cudagraph_step_begin()
-
-            if compiled_autograd_ctx is not None:
-                with compiled_autograd_ctx:
-                    loss_for_backward.backward()
-            else:
-                loss_for_backward.backward()
+                raw_loss = float(loss_for_log.detach().float().cpu().item())
 
             micro_step += 1
             micro_step_in_epoch += 1
@@ -382,13 +446,13 @@ def main():
     
                 if not torch.isfinite(total_norm):
                     print(f"⚠️ Skip step {opt_step}: Gradient norm is {total_norm.item()}")
-                    optimizer.zero_grad(set_to_none=True)
+                    optimizer.zero_grad(set_to_none=not use_cuda_graphs)
                     continue
                 
                 # optimizer step is outside the compiled train_step
                 maybe_cudagraph_step_begin()
                 optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
+                optimizer.zero_grad(set_to_none=not use_cuda_graphs)
                 scheduler.step()
 
                 opt_step += 1
