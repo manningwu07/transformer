@@ -35,7 +35,7 @@ class ModelArgs:
     # Runtime toggles
     max_seq_len: int = 8192
     gradient_checkpointing: bool = True
-    checkpoint_skip_every_n: int = 4 # 0 = no skipping, 1 = skip all, N = skip all but every Nth
+    checkpoint_skip_every_n: int = 1 # 0 = no skipping, 1 = skip all, N = skip all but every Nth
     compile_layers: bool = True  # ← Enable this now
     use_float8: bool = True
     
