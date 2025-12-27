@@ -320,25 +320,26 @@ class LLM(nn.Module):
 
     def forward(self, idx, targets=None, kv_cache=None, use_cache: bool = False):
         x = self.tok_embeddings(idx)
-
-        force_no_ckpt = getattr(self.config, "compile_mode", "none") == "model"
+        for layer in self.layers:
+            x = layer.forward_no_cache(x)
+        # force_no_ckpt = getattr(self.config, "compile_mode", "none") == "model"
         
-        use_ckpt = (
-            self.training
-            and targets is not None
-            and getattr(self.config, "gradient_checkpointing", False)
-            and not use_cache
-            and not force_no_ckpt    
-        )
+        # use_ckpt = (
+        #     self.training
+        #     and targets is not None
+        #     and getattr(self.config, "gradient_checkpointing", False)
+        #     and not use_cache
+        #     and not force_no_ckpt    
+        # )
 
-        # checkpoint all layers except every Nth layer (skip to save compute)
-        skip_every_n = getattr(self.config, "checkpoint_skip_every_n", 0)
+        # # checkpoint all layers except every Nth layer (skip to save compute)
+        # skip_every_n = getattr(self.config, "checkpoint_skip_every_n", 0)
 
-        for i, layer in enumerate(self.layers):
-            if use_ckpt and (skip_every_n == 0 or (i % skip_every_n) != 0):
-                x = ckpt.checkpoint(layer.forward_no_cache, x, use_reentrant=False)
-            else:
-                x = layer.forward_no_cache(x)
+        # for i, layer in enumerate(self.layers):
+        #     if use_ckpt and (skip_every_n == 0 or (i % skip_every_n) != 0):
+        #         x = ckpt.checkpoint(layer.forward_no_cache, x, use_reentrant=False)
+        #     else:
+        #         x = layer.forward_no_cache(x)
 
         x = self.norm(x)
         logits = self.output(x)
