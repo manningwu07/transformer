@@ -40,9 +40,6 @@ class ModelArgs:
     use_float8: bool = True
     
     # Compilation options (mutually exclusive — pick one)
-    # "none": no compilation
-    # "layers": compile each TransformerBlock.forward_no_cache individually
-    # "model": compile entire LLM.forward (better fusion, longer warmup)
     compile_mode: str = "model"  # "none" | "layers" | "model"
     
     # Experimental: compile autograd dispatcher (gradient accumulation, etc.)

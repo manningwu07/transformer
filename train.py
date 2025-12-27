@@ -297,7 +297,7 @@ def main():
             compiled_autograd_ctx = None
             
     # --------------------------------------------
-    # One-shot compiled train_step (forward + backward)
+    # Compile forward+loss
     # --------------------------------------------
     def maybe_cudagraph_step_begin() -> None:
         if not args.compile:
@@ -307,28 +307,16 @@ def main():
         except Exception:
             pass
 
-    # Compile a single micro-step: forward + loss + backward.
-    # This avoids passing cudagraph outputs across Python boundaries.
-    def train_step(x, y):
+    def forward_loss(x, y):
+        # forward + loss only (safe for torch.compile)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             _, loss, _ = model(x, targets=y)
-        loss = loss / float(TrainCfg.grad_accum_steps)
+        return loss
 
-        # If compiled_autograd is enabled, wrap the backward
-        if compiled_autograd_ctx is not None:
-            with compiled_autograd_ctx:
-                loss.backward()
-        else:
-            loss.backward()
-
-        # Return a detached scalar tensor for logging (read immediately).
-        return loss.detach()
-
-    train_step_compiled = train_step
+    forward_loss_compiled = forward_loss
     if args.compile:
-        # fullgraph=True encourages Inductor to capture forward + backward as a unit
-        train_step_compiled = torch.compile(
-            train_step,
+        forward_loss_compiled = torch.compile(
+            forward_loss,
             mode="max-autotune",
             fullgraph=True,
             dynamic=False,
@@ -364,18 +352,24 @@ def main():
 
             # Single compiled invocation (forward+backward)
             maybe_cudagraph_step_begin()
-            loss_scaled_detached = train_step_compiled(x, y)
+            loss = forward_loss_compiled(x, y)
+            if args.compile:
+                loss = loss.clone()
+            
 
             raw_loss = None
             if will_boundary:
-                # loss_scaled_detached is already scaled by grad_accum_steps.
-                # Convert back to "raw" loss for logging.
-                raw_loss = float(
-                    (loss_scaled_detached * float(TrainCfg.grad_accum_steps))
-                    .float()
-                    .cpu()
-                    .item()
-                )
+                # This is one sync every grad_accum_steps, not every micro-step.
+                raw_loss = float(loss.detach().float().cpu().item())
+                
+            loss_for_backward = loss / float(TrainCfg.grad_accum_steps)
+            maybe_cudagraph_step_begin()
+
+            if compiled_autograd_ctx is not None:
+                with compiled_autograd_ctx:
+                    loss_for_backward.backward()
+            else:
+                loss_for_backward.backward()
 
             micro_step += 1
             micro_step_in_epoch += 1
