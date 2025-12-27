@@ -14,10 +14,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-import torch._dynamo
-from torch._dynamo.backends.common import aot_autograd
 from transformers import Adafactor
-from typing import Optional
 
 from transformer import LLM
 from dataset import PackedBinDataset, get_dataloader
@@ -318,16 +315,14 @@ def main():
                 train_iter = iter(train_loader)
                 x, y = next(train_iter)
 
-            x = x.to(device, dtype=torch.long, non_blocking=True)
-            y = y.to(device, dtype=torch.long, non_blocking=True)
+            x = x.to(device, dtype=torch.long, non_blocking=True).clone()
+            y = y.to(device, dtype=torch.long, non_blocking=True).clone()
             
-            # For reduce-overhead / cudagraph replay, mark step begin before
-            # EACH compiled invocation. Safe to call even if not using cudagraphs.
-            if args.compile:
-                try:
-                    torch.compiler.cudagraph_mark_step_begin()
-                except Exception:
-                    pass
+            
+            try:
+                torch.compiler.cudagraph_mark_step_begin()
+            except Exception:
+                pass
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss, _ = model(x, targets=y)
@@ -335,6 +330,12 @@ def main():
 
             # Keep a reference only within this iteration.
             loss_for_backward = loss / float(TrainCfg.grad_accum_steps)
+            
+            try:
+                torch.compiler.cudagraph_mark_step_begin()
+            except Exception:
+                pass
+            
             if compiled_autograd_ctx is not None:
                 with compiled_autograd_ctx:
                     loss_for_backward.backward()
