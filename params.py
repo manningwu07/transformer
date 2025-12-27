@@ -20,7 +20,7 @@ class ModelArgs:
     head_dim: int = 128 
 
     # MLA compression
-    d_latent: int = 320
+    d_latent: int = 384
     q_lora_rank = d_latent
 
     # Vocab & norms
@@ -29,7 +29,7 @@ class ModelArgs:
     rope_theta: float = 10000.0
 
     # MLP
-    hidden_size: int = 4928 # x2.75 d_model
+    hidden_size: int = 4608 # ~x2.5 d_model
     dropout: float = 0.0
 
     # Runtime toggles

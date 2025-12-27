@@ -96,8 +96,8 @@ def main():
         
         model = torch.compile(
             model,
-            mode="reduce-overhead",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
-            fullgraph=False,      # Allow graph breaks (safer with checkpointing)
+            mode="max-autotune",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
+            fullgraph=True,      # Allow graph breaks (safer with checkpointing)
             dynamic=False,        # Static shapes = faster compiled code
         )
         print("✅ Model compiled (warmup will happen on first batch)")
@@ -292,7 +292,7 @@ def main():
         try:
             import torch._dynamo.compiled_autograd as ca
             compiled_autograd_ctx = ca.enable(
-                compiler=lambda gm: torch.compile(gm, mode="reduce-overhead", fullgraph=False)
+                compiler=lambda gm: torch.compile(gm, mode="max-autotune", fullgraph=True)
             )
             print("⚡ compiled_autograd enabled (experimental)")
         except Exception as e:
@@ -304,8 +304,6 @@ def main():
     last_log_t = t0
     loss_window = []
     world_size = int(os.getenv("WORLD_SIZE", "1"))
-    # GPU-side loss accumulator to avoid per-micro-batch sync
-    accum_loss = torch.zeros(1, device=device)
 
     model.train()
     while opt_step < args.total_opt_steps:
@@ -323,22 +321,25 @@ def main():
             x = x.to(device, dtype=torch.long, non_blocking=True)
             y = y.to(device, dtype=torch.long, non_blocking=True)
             
-            # Needed for torch.compile(mode="reduce-overhead") / CUDA Graph replay
+            # For reduce-overhead / cudagraph replay, mark step begin before
+            # EACH compiled invocation. Safe to call even if not using cudagraphs.
             if args.compile:
-                torch.compiler.cudagraph_mark_step_begin()
+                try:
+                    torch.compiler.cudagraph_mark_step_begin()
+                except Exception:
+                    pass
 
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss, _ = model(x, targets=y)
 
-            # grad accumulation
-            loss_for_log = loss.detach().float().clone()
-            accum_loss += loss_for_log / TrainCfg.grad_accum_steps
-            loss = loss / float(TrainCfg.grad_accum_steps)
+
+            # Keep a reference only within this iteration.
+            loss_for_backward = loss / float(TrainCfg.grad_accum_steps)
             if compiled_autograd_ctx is not None:
                 with compiled_autograd_ctx:
-                    loss.backward()
+                    loss_for_backward.backward()
             else:
-                loss.backward()
+                loss_for_backward.backward()
                 
             micro_step += 1
             micro_step_in_epoch += 1
@@ -346,8 +347,7 @@ def main():
             is_boundary = (micro_step > 0 and micro_step % int(TrainCfg.grad_accum_steps) == 0)
             if is_boundary:
                 total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                raw_loss = accum_loss.item()
-                accum_loss.zero_()
+                raw_loss = float(loss.detach().float().item())
                 loss_window.append(raw_loss)
                 if len(loss_window) > 100: loss_window.pop(0)                
     
