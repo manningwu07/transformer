@@ -40,7 +40,7 @@ class ModelArgs:
     use_float8: bool = True
     
     # Compilation options (mutually exclusive — pick one)
-    compile_mode: str = "model"  # "none" | "layers" | "model"
+    compile_mode: str = "model"  # "none" | "model"
     
     # Experimental: compile autograd dispatcher (gradient accumulation, etc.)
     use_compiled_autograd: bool = False
@@ -70,10 +70,10 @@ if MODE == "pretrain_5080":
     TrainCfg = TrainingArgs(
         batch_size=1,
         seq_len=2048,
-        grad_accum_steps=256,
-        lr_start=3e-4,
-        lr_end=1e-5,
-        warmup_steps=2000,
+        grad_accum_steps=16,
+        lr_start=0.02,      # MUON LR
+        lr_end=0.002,
+        warmup_steps=500,
     )
 
 elif MODE == "longctx_5090":

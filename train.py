@@ -14,7 +14,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from transformers import Adafactor
+from muon import Muon
 
 from transformer import LLM
 from dataset import PackedBinDataset, get_dataloader
@@ -39,6 +39,8 @@ def main():
     parser.add_argument("--prefetch_factor", type=int, default=4)
 
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--swap_optimizer", action="store_true",
+                        help="Discard optimizer state when resuming (for optimizer swap)")
     parser.add_argument(
         "--lr_schedule",
         type=str,
@@ -100,21 +102,19 @@ def main():
         print("✅ Model compiled (warmup will happen on first batch)")
 
     # === Optimizer / Scheduler ===
-    optimizer = Adafactor(
+    optimizer = Muon(
         model.parameters(),
-        lr=float(TrainCfg.lr_start),
-        eps=(1e-30, 1e-3),
-        clip_threshold=1.0,
-        decay_rate=-0.8,
-        beta1=0.9,  # set to None if you want to trade compute for lower VRAM
-        weight_decay=0.01,
-        relative_step=False,
-        scale_parameter=False,
-        warmup_init=False,
+        lr=0.02,                    # MUON LR (for 2D params)
+        momentum=0.95,
+        nesterov=True,
+        ns_steps=5,
+        adamw_lr=3e-4,              # AdamW LR (for 1D: embeds, norms)
+        adamw_betas=(0.9, 0.95),
+        adamw_wd=0.01,
     )
 
     scheduler = make_scheduler(
-        optimizer,
+        optimizer,  
         total_opt_steps=args.total_opt_steps,
         warmup_steps=TrainCfg.warmup_steps,
         schedule=args.lr_schedule,
@@ -132,9 +132,12 @@ def main():
     state = ckpt.load(
         args.resume,
         model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-    )
+     optimizer=None if args.swap_optimizer else optimizer,
+        scheduler=None if args.swap_optimizer else scheduler,
+     )
+    if args.swap_optimizer and state is not None:
+        print("⚠️ Optimizer swap: discarding old optimizer/scheduler state, keeping model weights")
+
     if state is not None:
         opt_step = int(state.get("opt_step", 0))
         micro_step = int(state.get("micro_step", 0))

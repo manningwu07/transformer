@@ -294,17 +294,7 @@ class LLM(nn.Module):
         if mode == "none":
             return
         
-        if mode == "layers":
-            print("⚡ Compiling TransformerBlock.forward_no_cache (per-layer)...")
-            for layer in self.layers:
-                layer.forward_no_cache = torch.compile(
-                    layer.forward_no_cache,
-                    mode="default",
-                    fullgraph=False,
-                )
-                layer.forward_train = layer.forward_no_cache
-        
-        elif mode == "model":
+        if mode == "model":
             # NOTE: We don't compile here — we return self and let train.py wrap it
             # This is because compile should happen AFTER .to(device) and before DDP
             print("⚡ Model marked for whole-model compilation (apply in train.py)")
