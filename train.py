@@ -39,8 +39,6 @@ def main():
     parser.add_argument("--prefetch_factor", type=int, default=4)
 
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--swap_optimizer", action="store_true",
-                        help="Discard optimizer state when resuming (for optimizer swap)")
     parser.add_argument(
         "--lr_schedule",
         type=str,
@@ -95,8 +93,8 @@ def main():
         
         model = torch.compile(
             model,
-            mode="max-autotune-no-cudagraphs",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
-            fullgraph=False,      # Allow graph breaks (safer with checkpointing)
+            mode="max-autotune",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
+            fullgraph=True,      # Allow graph breaks (safer with checkpointing)
             dynamic=False,        # Static shapes = faster compiled code
         )
         print("✅ Model compiled (warmup will happen on first batch)")
@@ -114,11 +112,10 @@ def main():
     )
 
     scheduler = make_scheduler(
-        optimizer,  
+        optimizer,
         total_opt_steps=args.total_opt_steps,
-        warmup_steps=500,
+        warmup_steps=TrainCfg.warmup_steps,
         schedule=args.lr_schedule,
-        start_step=int(state.get("opt_step", 0)) if args.swap_optimizer else 0
     )
 
     ckpt = CheckpointManager(save_dir=args.save_dir)
@@ -133,12 +130,9 @@ def main():
     state = ckpt.load(
         args.resume,
         model=model,
-     optimizer=None if args.swap_optimizer else optimizer,
-        scheduler=None if args.swap_optimizer else scheduler,
-     )
-    if args.swap_optimizer and state is not None:
-        print("⚠️ Optimizer swap: discarding old optimizer/scheduler state, keeping model weights")
-
+        optimizer=optimizer,
+        scheduler=scheduler,
+    )
     if state is not None:
         opt_step = int(state.get("opt_step", 0))
         micro_step = int(state.get("micro_step", 0))
@@ -293,7 +287,7 @@ def main():
         try:
             import torch._dynamo.compiled_autograd as ca
             compiled_autograd_ctx = ca.enable(
-                compiler=lambda gm: torch.compile(gm, mode="max-autotune-no-cudagraphs", fullgraph=False)
+                compiler=lambda gm: torch.compile(gm, mode="max-autotune", fullgraph=True)
             )
             print("⚡ compiled_autograd enabled (experimental)")
         except Exception as e:

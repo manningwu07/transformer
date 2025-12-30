@@ -37,7 +37,6 @@ class ModelArgs:
     gradient_checkpointing: bool = True
     checkpoint_skip_every_n: int = 1 # 0 = no skipping, 1 = skip all, N = skip all but every Nth
     compile_layers: bool = True  # ← Enable this now
-    use_float8: bool = True
     
     # Compilation options (mutually exclusive — pick one)
     compile_mode: str = "model"  # "none" | "model"
@@ -51,7 +50,6 @@ class ModelArgs:
     # Converts Linear layers inside Transformer blocks to Float8Linear for training
     # Keep embeddings + lm_head in BF16 (weight-tying + stability).
     use_float8: bool = True
-    # Common recipe names in torchao docs: "rowwise" or "tensorwise"
     float8_recipe: Literal["rowwise", "tensorwise"] = "tensorwise"
 
 
