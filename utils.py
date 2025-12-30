@@ -71,21 +71,21 @@ def validate(model, device, val_loader, max_val_steps: int = 100):
     return avg_loss, ppl
 
 
-def make_scheduler(optimizer, total_opt_steps: int, warmup_steps: int, schedule: str):
+def make_scheduler(optimizer, total_opt_steps: int, warmup_steps: int, schedule: str, start_step: int = 0):
     lr_start = float(TrainCfg.lr_start)
     lr_end = float(TrainCfg.lr_end)
     warmup_steps = int(warmup_steps)
     total_opt_steps = int(total_opt_steps)
 
     def lr_at(step: int) -> float:
-        if total_opt_steps <= 1:
-            return lr_end
+        rel_step = step - start_step
+        
+        if rel_step < 0: return 0.0 # Should not happen
 
-        if warmup_steps > 0 and step < warmup_steps:
-            t = step / max(1, warmup_steps)
-            return lr_end + (lr_start - lr_end) * t
+        if rel_step < warmup_steps:
+            return lr_start * (rel_step / max(1, warmup_steps))
 
-        t = (step - warmup_steps) / max(1, total_opt_steps - warmup_steps)
+        t = (step - (start_step + warmup_steps)) / max(1, total_opt_steps - (start_step + warmup_steps))
         t = min(max(t, 0.0), 1.0)
 
         if schedule == "linear":
