@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 
+os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.expanduser("~/.inductor_cache")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
 
 import numpy as np
@@ -106,7 +107,7 @@ def main():
         eps=(1e-30, 1e-3),
         clip_threshold=1.0,
         decay_rate=-0.8,
-        beta1=0.9,  # set to None if you want to trade compute for lower VRAM
+        beta1=None,
         weight_decay=0.01,
         relative_step=False,
         scale_parameter=False,
