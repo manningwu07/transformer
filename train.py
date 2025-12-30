@@ -93,8 +93,8 @@ def main():
         
         model = torch.compile(
             model,
-            mode="max-autotune",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
-            fullgraph=True,      # Allow graph breaks (safer with checkpointing)
+            mode="max-autotune-no-cudagraphs",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
+            fullgraph=False,      # Allow graph breaks (safer with checkpointing)
             dynamic=False,        # Static shapes = faster compiled code
         )
         print("✅ Model compiled (warmup will happen on first batch)")
@@ -287,7 +287,7 @@ def main():
         try:
             import torch._dynamo.compiled_autograd as ca
             compiled_autograd_ctx = ca.enable(
-                compiler=lambda gm: torch.compile(gm, mode="max-autotune", fullgraph=True)
+                compiler=lambda gm: torch.compile(gm, mode="max-autotune-no-cudagraphs", fullgraph=False)
             )
             print("⚡ compiled_autograd enabled (experimental)")
         except Exception as e:
