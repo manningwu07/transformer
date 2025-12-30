@@ -118,7 +118,7 @@ def main():
         total_opt_steps=args.total_opt_steps,
         warmup_steps=500,
         schedule=args.lr_schedule,
-        start_step=opt_step if args.swap_optimizer else 0
+        start_step=int(state.get("opt_step", 0)) if args.swap_optimizer else 0
     )
 
     ckpt = CheckpointManager(save_dir=args.save_dir)
