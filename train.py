@@ -22,6 +22,15 @@ from dataset import PackedBinDataset, get_dataloader
 from utils import *
 from params import Config, TrainCfg
 import signal
+import atexit
+
+def cleanup_gpu():
+    """Force CUDA cleanup on exit"""
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+atexit.register(cleanup_gpu)
 
 def main():
         
@@ -281,12 +290,14 @@ def main():
         if is_distributed():
             dist.destroy_process_group()
         
+        os.killpg(os.getpgrp(), signal.SIGKILL)
         sys.exit(0)
         
     def watchdog_handler(signum, frame):
         print("⚠️ Watchdog triggered - forcing checkpoint save")
         save_crash_and_exit()
-        os._exit(1)
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+        sys.exit(1)
 
     # Set alarm for 30 seconds per batch (adjust as needed)
     signal.signal(signal.SIGALRM, watchdog_handler)
