@@ -21,6 +21,7 @@ from transformer import LLM
 from dataset import PackedBinDataset, get_dataloader
 from utils import *
 from params import Config, TrainCfg
+import signal
 
 def main():
         
@@ -281,6 +282,14 @@ def main():
             dist.destroy_process_group()
         
         sys.exit(0)
+        
+    def watchdog_handler(signum, frame):
+        print("⚠️ Watchdog triggered - forcing checkpoint save")
+        save_crash_and_exit()
+        os._exit(1)
+
+    # Set alarm for 30 seconds per batch (adjust as needed)
+    signal.signal(signal.SIGALRM, watchdog_handler)
 
     signal.signal(signal.SIGINT, handle_sigint)
     
@@ -306,6 +315,7 @@ def main():
     model.train()
     while opt_step < args.total_opt_steps:
         try:
+            signal.alarm(90) # 90-second watchdog timer per batch (Should take only 30-40 seconds though)
             try:
                 x, y = next(train_iter)
             except StopIteration:
@@ -415,6 +425,7 @@ def main():
                             is_crash=False,
                         )
                     last_log_t = time.time()
+            signal.alarm(0) # Disable alarm on successful batch
 
         except Exception as e:
             if is_main_process():

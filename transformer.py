@@ -73,7 +73,7 @@ class MLA(nn.Module):
 
         # 3. Output
         self.o_proj = nn.Linear(args.n_heads * args.head_dim, args.d_model, bias=False)
-        max_seq_len = int(getattr(args, "max_seq_len", 32768))
+        max_seq_len = int(getattr(args, "max_seq_len", Config.max_seq_len))
         self.rope = RotaryEmbedding(
             self.rope_dim,
             max_seq_len=max_seq_len,
@@ -263,7 +263,7 @@ class LLM(nn.Module):
             if hasattr(self.config, k):
                 setattr(self.config, k, v)
         
-        self.max_seq_len = getattr(self.config, 'max_seq_len', 16384)
+        self.max_seq_len = getattr(self.config, 'max_seq_len', Config.max_seq_len)
         
         self.tok_embeddings = nn.Embedding(self.config.vocab_size, self.config.d_model)
         
