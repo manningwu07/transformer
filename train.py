@@ -94,22 +94,6 @@ def main():
 
     # === Model ===
     model = LLM(Config).to(device)
-    
-    # Whole-model compile (AFTER .to(device), BEFORE DDP)
-    if getattr(model, "_needs_whole_model_compile", False):
-        print("⚡ Compiling entire model (this may take 2-5 minutes on first forward   backward)...")
-        
-        # Suppress excessive recompilation from dynamic shapes
-        torch._dynamo.config.suppress_errors = False
-        torch._dynamo.config.cache_size_limit = 64
-        
-        model = torch.compile(
-            model,
-            mode="max-autotune-no-cudagraphs",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
-            fullgraph=True,      # Allow graph breaks (safer with checkpointing)
-            dynamic=False,        # Static shapes = faster compiled code
-        )
-        print("✅ Model compiled (warmup will happen on first batch)")
 
     # === Optimizer / Scheduler ===
     optimizer = FusedAdafactor(
@@ -151,6 +135,22 @@ def main():
         best_val_loss = float(state.get("best_val_loss", best_val_loss))
         set_rng_state(state.get("rng", None))
 
+    # Whole-model compile (AFTER .to(device), BEFORE DDP)
+    if getattr(model, "_needs_whole_model_compile", False):
+        print("⚡ Compiling entire model (this may take 2-5 minutes on first forward   backward)...")
+        
+        # Suppress excessive recompilation from dynamic shapes
+        torch._dynamo.config.suppress_errors = False
+        torch._dynamo.config.cache_size_limit = 64
+        
+        model = torch.compile(
+            model,
+            mode="max-autotune-no-cudagraphs",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
+            fullgraph=True,      # Allow graph breaks (safer with checkpointing)
+            dynamic=False,        # Static shapes = faster compiled code
+        )
+        print("✅ Model compiled (warmup will happen on first batch)")
+        
     # === Dataset ===
     if is_main_process():
         print(f"📂 Loading datasets: train={args.train_dir} val={args.val_dir}")
@@ -265,6 +265,7 @@ def main():
             client_state=client_state,
             is_crash=True,
         )
+        os.sync()
 
     exiting = threading.Event()
     def save_current_state(tag, is_crash=False):

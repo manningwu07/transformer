@@ -4,7 +4,7 @@ import json
 import os
 import random
 from dataclasses import dataclass
-from typing import Iterator, Optional, List
+from typing import Iterator, Optional, List, Tuple
 
 import numpy as np
 from datasets import load_dataset
@@ -19,8 +19,8 @@ def load_dataset_streaming(
     token: Optional[str] = None,
 ):
     """
-    Loads a streaming dataset with auth that works across datasets versions.
-    Tries `token=` first, falls back to `use_auth_token=`.
+    Streaming loader that works across HF datasets versions.
+    Forces python format to avoid Arrow schema inference hangs.
     """
     kwargs = {"split": split, "streaming": True}
     if config is not None:
@@ -30,11 +30,14 @@ def load_dataset_streaming(
 
     if token:
         try:
-            return load_dataset(*args, token=token, **kwargs)
+            ds = load_dataset(*args, token=token, **kwargs)
         except TypeError:
-            return load_dataset(*args, use_auth_token=token, **kwargs)
+            ds = load_dataset(*args, use_auth_token=token, **kwargs)
+    else:
+        ds = load_dataset(*args, **kwargs)
 
-    return load_dataset(*args, **kwargs)
+    # Critical: avoid Arrow iteration/schema inference that can hang
+    return ds.with_format("python")
 
 
 def _hf_token_from_env(explicit: Optional[str]) -> Optional[str]:
@@ -51,7 +54,12 @@ def format_chatml(user: str, assistant: str) -> str:
     return f"<|user|>\n{user}\n<|assistant|>\n{assistant}\n"
 
 
-def format_jsonl_chat(ex: dict) -> Optional[str]:
+def format_synth_chat(ex: dict) -> Optional[str]:
+    """
+    Your synthetic JSONL:
+      {"instruction": "...", "input": "...", "output": "..."}
+    -> ChatML
+    """
     inst = (ex.get("instruction", "") or "").strip()
     inp = (ex.get("input", "") or "").strip()
     out = (ex.get("output", "") or "").strip()
@@ -74,10 +82,15 @@ def probabilistic_interleave(
     probs: list[float],
     seed: int,
 ) -> Iterator[str]:
+    """
+    Interleave arbitrary generators by probability.
+    Removes sources as they exhaust.
+    """
     assert len(sources) == len(probs)
     rng = random.Random(seed)
     active = [True] * len(sources)
     weights = probs[:]
+
     while any(active):
         idx = rng.choices(range(len(sources)), weights=weights, k=1)[0]
         if not active[idx] or weights[idx] <= 0.0:
@@ -137,24 +150,24 @@ class DpoShardWriter:
     shard_idx: int = 0
     n_written: int = 0
 
+    prompt_tokens: List[int] = None
     chosen_tokens: List[int] = None
     rejected_tokens: List[int] = None
-    prompt_tokens: List[int] = None
+    prompt_offsets: List[int] = None
     chosen_offsets: List[int] = None
     rejected_offsets: List[int] = None
-    prompt_offsets: List[int] = None
 
     def __post_init__(self):
         os.makedirs(self.out_dir, exist_ok=True)
         self._reset()
 
     def _reset(self):
+        self.prompt_tokens = []
         self.chosen_tokens = []
         self.rejected_tokens = []
-        self.prompt_tokens = []
+        self.prompt_offsets = [0]
         self.chosen_offsets = [0]
         self.rejected_offsets = [0]
-        self.prompt_offsets = [0]
 
     def _path(self) -> str:
         return os.path.join(self.out_dir, f"{self.prefix}-{self.shard_idx:05d}.npz")
@@ -166,6 +179,7 @@ class DpoShardWriter:
         self.prompt_offsets.append(len(self.prompt_tokens))
         self.chosen_offsets.append(len(self.chosen_tokens))
         self.rejected_offsets.append(len(self.rejected_tokens))
+
         self.n_written += 1
         if self.n_written >= self.shard_examples:
             self.flush()
@@ -236,6 +250,27 @@ def encode_text_stream_to_bin(
     return written
 
 
+def get_fineweb_score(ex: dict) -> Optional[float]:
+    """
+    fineweb-edu-dedup sometimes has metadata as dict; be defensive.
+    """
+    md = ex.get("metadata", None)
+    if isinstance(md, dict):
+        sc = md.get("score", None)
+        if isinstance(sc, (int, float)):
+            return float(sc)
+        return None
+    if isinstance(md, str):
+        try:
+            obj = json.loads(md)
+            sc = obj.get("score", None)
+            if isinstance(sc, (int, float)):
+                return float(sc)
+        except Exception:
+            return None
+    return None
+
+
 def degrade_answer(answer: str, seed: int) -> str:
     """
     Deterministic "worse answer" for DPO rejected samples.
@@ -258,10 +293,11 @@ def degrade_answer(answer: str, seed: int) -> str:
 
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--tokenizer", type=str, default="data/json/tokenizer_32k.json")
     ap.add_argument("--out_dir", type=str, default="data/shards/phase3")
-    ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--hf_token", type=str, default=None)
+    ap.add_argument("--seed", type=int, default=1337)
 
     ap.add_argument("--encode_batch_size", type=int, default=512)
     ap.add_argument("--bin_shard_size", type=int, default=50_000_000)
@@ -277,24 +313,24 @@ def main():
         default="data/raw/synthetic_reasoning_master.jsonl",
     )
 
-    ap.add_argument("--fineweb_score_min", type=float, default=3.0)
-
-    # Switches for reasoning datasets
+    # Reasoning dataset switches
     ap.add_argument("--use_smollm_corpus", action="store_true")
     ap.add_argument("--use_finemath", action="store_true")
     ap.add_argument("--use_stack_edu", action="store_true")
     ap.add_argument("--use_gsm8k", action="store_true")
     ap.add_argument("--use_apps", action="store_true")
 
-    # Stack-edu config list (required if --use_stack_edu)
+    # Fineweb quality gate (only applied if metadata.score exists)
+    ap.add_argument("--fineweb_score_min", type=float, default=3.0)
+
+    # stack-edu configs (REQUIRED if use_stack_edu)
     ap.add_argument(
         "--stack_edu_configs",
         type=str,
         default="Python,Cpp,Go,JavaScript,Rust",
         help=(
-            "Comma-separated stack-edu configs. "
-            "Valid: C,CSharp,Cpp,Go,Java,JavaScript,Markdown,PHP,Python,"
-            "Ruby,Rust,SQL,Shell,Swift,TypeScript"
+            "Comma-separated stack-edu configs. Valid: C,CSharp,Cpp,Go,Java,"
+            "JavaScript,Markdown,PHP,Python,Ruby,Rust,SQL,Shell,Swift,TypeScript"
         ),
     )
 
@@ -304,13 +340,12 @@ def main():
     tok = Tokenizer.from_file(args.tokenizer)
     eos_id = tok.token_to_id("<|endoftext|>")
     if eos_id is None:
-        raise ValueError("Tokenizer is missing <|endoftext|>.")
-
+        raise ValueError("Tokenizer is missing <|endoftext|> token.")
     dtype = np.uint16 if tok.get_vocab_size() <= 65536 else np.uint32
 
-    # --------------------
-    # LONGCTX shards (8k continuation pretraining)
-    # --------------------
+    # -------------------------
+    # (A) LONGCTX STREAM -> .bin
+    # -------------------------
     long_out = BinShardWriter(
         out_dir=os.path.join(args.out_dir, "longctx"),
         prefix="phase3-longctx",
@@ -328,23 +363,22 @@ def main():
             split="train",
             token=hf_token,
         )
-
-        def fw_iter() -> Iterator[str]:
-            for ex in fw:
-                text = ex.get("text", "")
-                md = ex.get("metadata", {}) or {}
-                score = md.get("score", None)
-                if isinstance(score, (int, float)) and score < args.fineweb_score_min:
-                    continue
-                if isinstance(text, str) and text.strip():
-                    yield text
-
         cosmo = load_dataset_streaming(
             "HuggingFaceTB/smollm-corpus",
             config="cosmopedia-v2",
             split="train",
             token=hf_token,
         )
+
+        def fw_iter() -> Iterator[str]:
+            for ex in fw:
+                t = ex.get("text", "")
+                if not isinstance(t, str) or not t.strip():
+                    continue
+                sc = get_fineweb_score(ex)
+                if sc is not None and sc < args.fineweb_score_min:
+                    continue
+                yield t
 
         def cosmo_iter() -> Iterator[str]:
             for ex in cosmo:
@@ -358,7 +392,7 @@ def main():
     if args.use_stack_edu:
         cfgs = [c.strip() for c in args.stack_edu_configs.split(",") if c.strip()]
         if not cfgs:
-            raise ValueError("Empty --stack_edu_configs.")
+            raise ValueError("Empty --stack_edu_configs, but --use_stack_edu was set.")
 
         stack_iters: list[Iterator[str]] = []
         for cfg in cfgs:
@@ -408,9 +442,7 @@ def main():
         long_probs.append(0.05)
 
     if not long_sources:
-        raise ValueError(
-            "No longctx sources selected. Use --use_smollm_corpus at minimum."
-        )
+        raise ValueError("No longctx sources selected. Use --use_smollm_corpus at minimum.")
 
     long_text = probabilistic_interleave(long_sources, long_probs, seed=args.seed)
     wrote_long = encode_text_stream_to_bin(
@@ -424,9 +456,9 @@ def main():
     )
     long_out.finalize()
 
-    # --------------------
-    # SFT shards
-    # --------------------
+    # -------------------------
+    # (B) SFT STREAM -> .bin
+    # -------------------------
     sft_out = BinShardWriter(
         out_dir=os.path.join(args.out_dir, "sft"),
         prefix="phase3-sft",
@@ -437,16 +469,11 @@ def main():
     sft_sources: list[Iterator[str]] = []
     sft_probs: list[float] = []
 
-    syn = load_dataset(
-        "json",
-        data_files=args.synthetic_jsonl,
-        split="train",
-        streaming=True,
-    )
+    syn = load_dataset("json", data_files=args.synthetic_jsonl, split="train", streaming=True).with_format("python")
 
     def syn_sft_iter() -> Iterator[str]:
         for ex in syn:
-            s = format_jsonl_chat(ex)
+            s = format_synth_chat(ex)
             if s:
                 yield s
 
@@ -455,12 +482,7 @@ def main():
     sft_probs.append(0.45)
 
     if args.use_gsm8k:
-        gsm = load_dataset_streaming(
-            "gsm8k",
-            config="main",
-            split="train",
-            token=hf_token,
-        )
+        gsm = load_dataset_streaming("gsm8k", config="main", split="train", token=hf_token)
 
         def gsm_iter() -> Iterator[str]:
             for ex in gsm:
@@ -473,11 +495,7 @@ def main():
         sft_probs.append(0.25)
 
     if args.use_apps:
-        apps = load_dataset_streaming(
-            "codeparrot/apps",
-            split="train",
-            token=hf_token,
-        )
+        apps = load_dataset_streaming("codeparrot/apps", split="train", token=hf_token)
 
         def apps_iter() -> Iterator[str]:
             for ex in apps:
@@ -514,15 +532,11 @@ def main():
         sft_sources.append(fm_sft_iter())
         sft_probs.append(0.10)
 
-    # Normalize SFT mix
+    # Normalize SFT probs
     tot = sum(sft_probs)
     sft_probs = [p / tot for p in sft_probs]
 
-    sft_text = probabilistic_interleave(
-        sft_sources,
-        sft_probs,
-        seed=args.seed + 1,
-    )
+    sft_text = probabilistic_interleave(sft_sources, sft_probs, seed=args.seed + 1)
     wrote_sft = encode_text_stream_to_bin(
         text_iter=sft_text,
         tok=tok,
@@ -534,9 +548,9 @@ def main():
     )
     sft_out.finalize()
 
-    # --------------------
-    # DPO shards (prompt/chosen/rejected)
-    # --------------------
+    # -------------------------
+    # (C) DPO PAIRS -> .npz
+    # -------------------------
     dpo_out = DpoShardWriter(
         out_dir=os.path.join(args.out_dir, "dpo"),
         prefix="phase3-dpo",
@@ -544,15 +558,10 @@ def main():
         dtype=dtype,
     )
 
+    syn2 = load_dataset("json", data_files=args.synthetic_jsonl, split="train", streaming=True).with_format("python")
+
     pbar = tqdm(total=args.target_dpo_pairs, unit="pair", desc="Phase3 DPO")
     pairs_written = 0
-
-    syn2 = load_dataset(
-        "json",
-        data_files=args.synthetic_jsonl,
-        split="train",
-        streaming=True,
-    )
 
     for ex in syn2:
         inst = (ex.get("instruction", "") or "").strip()
@@ -563,7 +572,6 @@ def main():
 
         user = f"{inst}\n\nInput:\n{inp}" if inp else inst
 
-        # Deterministic rejected variant
         seed_val = (hash(inst + "\n" + chosen_text) & 0xFFFFFFFF)
         rejected_text = degrade_answer(chosen_text, seed=seed_val)
 
@@ -574,6 +582,7 @@ def main():
 
         if not prompt_ids or not chosen_ids or not rejected_ids:
             continue
+
         if chosen_ids[-1] != eos_id:
             chosen_ids.append(eos_id)
         if rejected_ids[-1] != eos_id:
@@ -588,7 +597,7 @@ def main():
     pbar.close()
     dpo_out.finalize()
 
-    print("Phase 3 build complete:")
+    print("✅ Phase 3 complete:")
     print(f"  longctx tokens: {wrote_long:,}")
     print(f"  sft tokens:     {wrote_sft:,}")
     print(f"  dpo pairs:      {pairs_written:,}")

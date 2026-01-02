@@ -103,6 +103,20 @@ class CheckpointManager:
     def __init__(self, save_dir: str = "models"):
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
+        
+    def _unwrap_model(self, model):
+        # DDP wrapper
+        if isinstance(model, DDP):
+            model = model.module
+        # torch.compile wrapper
+        model = getattr(model, "_orig_mod", model)
+        return model
+
+    def _strip_orig_mod_prefix(self, sd: dict):
+        # Normalize compiled checkpoints to eager key format
+        if any(k.startswith("_orig_mod.") for k in sd.keys()):
+            return {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
+        return sd
 
     def save(
         self,
@@ -122,9 +136,9 @@ class CheckpointManager:
         if not is_main_process(): return
         path = os.path.join(self.save_dir, f"{tag}.pt")
         tmp_path = path + ".tmp"
+        m = self._unwrap_model(model)
         payload = {
-            "model": model.module.state_dict() if isinstance(model, DDP) 
-                     else model.state_dict(),
+            "model": m.state_dict(),
             "optimizer": opt.state_dict() if opt else None,
             "scheduler": sched.state_dict() if sched else None,
             "client_state": state,
@@ -154,7 +168,9 @@ class CheckpointManager:
             map_location="cpu",
             weights_only=False,
         )
-        model.load_state_dict(ckpt["model"], strict=True)
+        m = self._unwrap_model(model)
+        sd = self._strip_orig_mod_prefix(ckpt["model"])
+        m.load_state_dict(sd, strict=True)
         if opt and ckpt["optimizer"]: opt.load_state_dict(ckpt["optimizer"])
         if sched and ckpt["scheduler"]: sched.load_state_dict(ckpt["scheduler"])
         return ckpt.get("client_state")
