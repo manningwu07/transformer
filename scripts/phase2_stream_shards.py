@@ -20,14 +20,11 @@ def load_dataset_streaming(
     token: Optional[str] = None,
 ):
     """
-    Loads a streaming dataset with auth that works across datasets versions.
-    Tries `token=` first, falls back to `use_auth_token=`.
+    Streaming loader compatible with different datasets versions:
+    tries token= first, falls back to use_auth_token=.
     """
     kwargs = {"split": split, "streaming": True}
-    if config is not None:
-        args = (name, config)
-    else:
-        args = (name,)
+    args = (name, config) if config is not None else (name,)
 
     if token:
         try:
@@ -48,11 +45,10 @@ def _hf_token_from_env(explicit: Optional[str]) -> Optional[str]:
     )
 
 
+# -------- Formatting --------
 def format_jsonl_chat(instruction: str, inp: str, out: str) -> str:
     """
     Your synthetic JSONL -> ChatML
-    Example input:
-      {"instruction": "...", "input": "...", "output": "..."}
     """
     instruction = instruction or ""
     inp = inp or ""
@@ -63,23 +59,21 @@ def format_jsonl_chat(instruction: str, inp: str, out: str) -> str:
 
 def format_glaive_v2(ex: dict) -> str:
     """
-    Converts Glaive v2 turns into:
-      - ChatML markers: <|system|>, <|user|>, <|assistant|>
-      - Tool calls: <call:tool>{...}</call>, <call:search>{...}</call>
-      - Tool responses: <response>...</response>
+    Converts Glaive v2 'chat' into ChatML + your custom tool tags.
     """
     text = (ex.get("chat", "") or "").strip()
     if not text:
         return ""
 
+    # Standardize ChatML labels
     text = text.replace("SYSTEM: ", "<|system|>\n")
     text = text.replace("USER: ", "\n<|user|>\n")
     text = text.replace("ASSISTANT: ", "\n<|assistant|>\n")
 
-    # Avoid double EOS; we append EOS at tokenization time
+    # Remove dataset EOS; we append EOS later
     text = text.replace("<|endoftext|>", "")
 
-    # Wrap tool/function responses
+    # Wrap function responses
     text = re.sub(
         r"FUNCTION RESPONSE:\s*(.*?)(?=\n<\|user\|>|\n<\|assistant\|>|\n<\|system\|>|\Z)",
         r"<response>\1</response>",
@@ -87,7 +81,7 @@ def format_glaive_v2(ex: dict) -> str:
         flags=re.DOTALL,
     )
 
-    # Convert OpenAI-ish tool call JSON blobs into <call:...> tags
+    # Convert OpenAI-ish tool call JSON blobs into tags
     def json_call_replacer(m):
         raw = m.group(0)
         try:
@@ -99,7 +93,6 @@ def format_glaive_v2(ex: dict) -> str:
                     args = json.loads(args)
                 except Exception:
                     pass
-
             tag = "call:search" if "search" in str(name).lower() else "call:tool"
             payload = {"name": name, "args": args}
             return f"<{tag}>{json.dumps(payload)}</call>"
@@ -124,15 +117,12 @@ def pick_first_present(ex: dict, keys: list[str]) -> Optional[str]:
     return None
 
 
+# -------- Interleave without HF schema inference --------
 def probabilistic_interleave(
     sources: list[Iterator[str]],
     probs: list[float],
     seed: int,
 ) -> Iterator[str]:
-    """
-    Interleave arbitrary generators without HF schema inference.
-    Removes sources as they exhaust.
-    """
     assert len(sources) == len(probs)
     rng = random.Random(seed)
     active = [True] * len(sources)
@@ -149,6 +139,7 @@ def probabilistic_interleave(
             weights[idx] = 0.0
 
 
+# -------- Sharding --------
 @dataclass
 class ShardState:
     split: str
@@ -254,37 +245,34 @@ def main():
     ap.add_argument("--seed", type=int, default=1337)
     ap.add_argument("--encode_batch_size", type=int, default=1024)
 
+    # Your synthetic planning JSONL
     ap.add_argument(
         "--synthetic_jsonl",
         type=str,
         default="data/raw/synthetic_reasoning_master.jsonl",
     )
+
     ap.add_argument("--hf_token", type=str, default=None)
 
-    # Code source: stack-edu REQUIRES a config (language).
+    # Stack-Edu MUST have config(s)
     ap.add_argument(
-        "--code_dataset",
-        type=str,
-        default="HuggingFaceTB/stack-edu",
-        help="Default: HuggingFaceTB/stack-edu (requires --code_configs).",
-    )
-    ap.add_argument(
-        "--code_configs",
+        "--stack_edu_configs",
         type=str,
         default="Python,Cpp,Go,JavaScript,Rust",
         help=(
-            "Comma-separated configs for stack-edu. "
-            "Valid: C,CSharp,Cpp,Go,Java,JavaScript,Markdown,PHP,Python,"
-            "Ruby,Rust,SQL,Shell,Swift,TypeScript"
+            "Comma-separated stack-edu configs. Valid: "
+            "C,CSharp,Cpp,Go,Java,JavaScript,Markdown,PHP,Python,Ruby,Rust,"
+            "SQL,Shell,Swift,TypeScript"
         ),
     )
 
     args = ap.parse_args()
+    hf_token = _hf_token_from_env(args.hf_token)
 
     tok = Tokenizer.from_file(args.tokenizer)
     eos_id = tok.token_to_id("<|endoftext|>")
     if eos_id is None:
-        raise ValueError("Tokenizer is missing <|endoftext|> token.")
+        raise ValueError("Tokenizer missing <|endoftext|> token.")
     dtype = np.uint16 if tok.get_vocab_size() <= 65536 else np.uint32
 
     train_state = ShardState(
@@ -300,11 +288,9 @@ def main():
         dtype,
     )
 
-    hf_token = _hf_token_from_env(args.hf_token)
-
     print("Loading Phase 2 sources...")
 
-    # 1) Synthetic planning (local JSONL)
+    # 1) Synthetic planning
     syn_ds = load_dataset(
         "json",
         data_files=args.synthetic_jsonl,
@@ -348,18 +334,15 @@ def main():
             if isinstance(t, str) and t.strip():
                 yield t
 
-    # 4) Code (Stack-Edu) — MUST use configs
-    code_configs = [c.strip() for c in args.code_configs.split(",") if c.strip()]
-    if not code_configs:
-        raise ValueError(
-            "No --code_configs provided. For stack-edu, you must pass configs "
-            "like --code_configs Python,Cpp,Go."
-        )
+    # 4) Code (Stack-Edu) — load MULTIPLE configs (languages)
+    cfgs = [c.strip() for c in args.stack_edu_configs.split(",") if c.strip()]
+    if not cfgs:
+        raise ValueError("Empty --stack_edu_configs (stack-edu requires configs).")
 
     code_iters: list[Iterator[str]] = []
-    for cfg in code_configs:
+    for cfg in cfgs:
         ds = load_dataset_streaming(
-            args.code_dataset,
+            "HuggingFaceTB/stack-edu",
             config=cfg,
             split="train",
             token=hf_token,
@@ -376,17 +359,16 @@ def main():
 
         code_iters.append(_make_iter(ds))
 
-    def code_interleaved() -> Iterator[str]:
-        # Interleave code languages evenly
+    def code_mix() -> Iterator[str]:
         return probabilistic_interleave(
             sources=code_iters,
             probs=[1.0 / len(code_iters)] * len(code_iters),
             seed=args.seed + 999,
         )
 
-    # Mix: 5% Planning, 5% Tools, 50% Math, 40% Code
+    # Final mix: 5% planning, 5% tools, 50% math, 40% code
     text_generator = probabilistic_interleave(
-        sources=[syn_iter(), glaive_iter(), fm_iter(), code_interleaved()],
+        sources=[syn_iter(), glaive_iter(), fm_iter(), code_mix()],
         probs=[0.05, 0.05, 0.50, 0.40],
         seed=args.seed,
     )
@@ -407,10 +389,9 @@ def main():
     val_state.finalize()
 
     print(
-        f"Phase 2 complete. Wrote train={train_written:,} tok, "
-        f"val={val_written:,} tok"
+        f"✅ Phase 2 complete. train={train_written:,} tok, val={val_written:,} tok"
     )
-    print(f"Shards saved in: {args.out_dir}")
+    print(f"Shards at: {args.out_dir}")
 
 
 if __name__ == "__main__":
