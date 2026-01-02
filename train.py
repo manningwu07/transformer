@@ -7,6 +7,8 @@ import threading
 import time
 import traceback
 
+from fused_adafactor import FusedAdafactor
+
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.expanduser("~/.inductor_cache")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
 
@@ -15,7 +17,6 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from transformers import Adafactor
 
 from transformer import LLM
 from dataset import PackedBinDataset, get_dataloader
@@ -111,7 +112,7 @@ def main():
         print("✅ Model compiled (warmup will happen on first batch)")
 
     # === Optimizer / Scheduler ===
-    optimizer = Adafactor(
+    optimizer = FusedAdafactor(
         model.parameters(),
         lr=float(TrainCfg.lr_start),
         eps=(1e-30, 1e-3),
@@ -270,27 +271,45 @@ def main():
         )
 
     exiting = threading.Event()
+    def save_current_state(tag, is_crash=False):
+        """Helper to centralize saving logic"""
+        if not is_main_process(): return
+        
+        client_state = {
+            "opt_step": int(opt_step),
+            "micro_step": int(micro_step),
+            "epoch": int(epoch),
+            "micro_step_in_epoch": int(micro_step_in_epoch),
+            "best_val_loss": float(best_val_loss),
+            "rng": get_rng_state(),
+        }
+        # We unwrap DDP and Compile before saving
+        m_to_save = model.module if isinstance(model, DDP) else model
+        if hasattr(m_to_save, "_orig_mod"):
+            m_to_save = m_to_save._orig_mod
+            
+        ckpt.save(
+            tag=tag,
+            model=m_to_save,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            client_state=client_state,
+            is_crash=is_crash,
+        )
+
     def handle_sigint(sig, frame):
-        # Get the current process ID
-        import os
-        main_pid = os.getpgrp() 
-        
-        # Only the main process should save checkpoints
-        # Workers should just exit
-        if is_main_process() and torch.cuda.is_initialized():
-            # Prevent multiple triggers if you mash Ctrl+C
-            signal.signal(signal.SIGINT, signal.SIG_IGN)
-            print("\nSIGINT: saving interrupt checkpoint and exiting...")
+        if is_main_process():
+            # Stop the alarm so we don't trigger watchdog while saving
+            signal.alarm(0)
+            print(f"\nExiting... Saving step {opt_step} first. DO NOT CTRL+C AGAIN.")
+            # Unregister atexit so we don't double-cleanup
+            atexit.unregister(cleanup_gpu)
             try:
-                save_crash_and_exit()
-            except Exception as e:
-                print(f"Failed to save interrupt checkpoint: {e}")
-        
-        # Kill the process group to ensure workers die too
-        if is_distributed():
-            dist.destroy_process_group()
-        
-        os.killpg(os.getpgrp(), signal.SIGKILL)
+                save_current_state(f"interrupt_step_{opt_step}", is_crash=True)
+            finally:
+                cleanup_gpu()
+                # Kill process group AFTER saving is done
+                os.killpg(os.getpgrp(), signal.SIGKILL)
         sys.exit(0)
         
     def watchdog_handler(signum, frame):
@@ -301,7 +320,6 @@ def main():
 
     # Set alarm for 30 seconds per batch (adjust as needed)
     signal.signal(signal.SIGALRM, watchdog_handler)
-
     signal.signal(signal.SIGINT, handle_sigint)
     
     # Compiled autograd context manager
