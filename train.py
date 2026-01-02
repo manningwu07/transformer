@@ -118,11 +118,7 @@ def main():
         eps=(1e-30, 1e-3),
         clip_threshold=1.0,
         decay_rate=-0.8,
-        beta1=None,
-        weight_decay=0.01,
-        relative_step=False,
-        scale_parameter=False,
-        warmup_init=False,
+        weight_decay=0.01
     )
 
     scheduler = make_scheduler(
@@ -344,7 +340,7 @@ def main():
     model.train()
     while opt_step < args.total_opt_steps:
         try:
-            signal.alarm(90) # 90-second watchdog timer per batch (Should take only 30-40 seconds though)
+            # signal.alarm(90) # 90-second watchdog timer per batch (Should take only 30-40 seconds though)
             try:
                 x, y = next(train_iter)
             except StopIteration:
@@ -454,7 +450,7 @@ def main():
                             is_crash=False,
                         )
                     last_log_t = time.time()
-            signal.alarm(0) # Disable alarm on successful batch
+            # signal.alarm(0) # Disable alarm on successful batch
 
         except Exception as e:
             if is_main_process():
