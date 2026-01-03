@@ -294,20 +294,28 @@ def main():
             is_crash=is_crash,
         )
 
+    
     def handle_sigint(sig, frame):
+        # 1. Immediately ignore further SIGINTs so we don't loop
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        
         if is_main_process():
-            # Stop the alarm so we don't trigger watchdog while saving
+            # 2. Disable watchdog so it doesn't kill us mid-save
             signal.alarm(0)
-            print(f"\nExiting... Saving step {opt_step} first. DO NOT CTRL+C AGAIN.")
-            # Unregister atexit so we don't double-cleanup
-            atexit.unregister(cleanup_gpu)
+            print(f"\nExiting... Saving step {opt_step}. STAND BY.")
             try:
+                # Force a synchronous save
                 save_current_state(f"interrupt_step_{opt_step}", is_crash=True)
+                print("✅ Save successful.")
+            except Exception as e:
+                print(f"❌ Save failed: {e}")
             finally:
                 cleanup_gpu()
-                # Kill process group AFTER saving is done
-                os.killpg(os.getpgrp(), signal.SIGKILL)
-        sys.exit(0)
+                # 3. Use os._exit to bypass any other try/finally blocks that might hang
+                os._exit(0) 
+        else:
+            # Ranks > 0 just exit quietly
+            os._exit(0)
         
     def watchdog_handler(signum, frame):
         print("⚠️ Watchdog triggered - forcing checkpoint save")
@@ -432,24 +440,11 @@ def main():
                             f"📉 [VAL] Opt {opt_step} | Loss {val_loss:.4f} | PPL {val_ppl:.2f}"
                         )
 
+                    save_current_state(f"ckpt_step_{opt_step}", is_crash=False)
+
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        client_state = {
-                            "opt_step": int(opt_step),
-                            "micro_step": int(micro_step),
-                            "epoch": int(epoch),
-                            "micro_step_in_epoch": int(micro_step_in_epoch),
-                            "best_val_loss": float(best_val_loss),
-                            "rng": get_rng_state(),
-                        }
-                        ckpt.save(
-                            tag=f"best_step_{opt_step}",
-                            model=model,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            client_state=client_state,
-                            is_crash=False,
-                        )
+                        save_current_state(f"best_step_{opt_step}", is_crash=False)
                     last_log_t = time.time()
             # signal.alarm(0) # Disable alarm on successful batch
 
