@@ -149,7 +149,25 @@ def main():
             fullgraph=True,      # Allow graph breaks (safer with checkpointing)
             dynamic=False,        # Static shapes = faster compiled code
         )
-        print("✅ Model compiled (warmup will happen on first batch)")
+        # 2. INSERT WARMUP PHASE HERE
+        print("🧪 Starting Warmup Phase (Seeding Triton Kernels)...")
+        # Use BS=1 to ensure we have maximum VRAM headroom for autotuning
+        warmup_bs = 1 
+        dummy_x = torch.zeros((warmup_bs, TrainCfg.seq_len), dtype=torch.long, device=device)
+        dummy_y = torch.zeros((warmup_bs, TrainCfg.seq_len), dtype=torch.long, device=device)
+
+        # We must run BOTH forward and backward to compile the full autograd graph
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            # First pass: Forward + Loss
+            _, loss, _ = model(dummy_x, targets=dummy_y)
+            # Second pass: Backward (This compiles the gradient kernels)
+            loss.backward()
+        
+        # Cleanup warmup artifacts
+        optimizer.zero_grad(set_to_none=True)
+        torch.cuda.empty_cache() 
+        torch.cuda.synchronize()
+        print("✅ Warmup complete. Kernels cached. Ready for real data.")
         
     # === Dataset ===
     if is_main_process():
