@@ -1,79 +1,91 @@
-import torch
-import torch.nn.functional as F
+# CLI.py
 import os
-import argparse
+import torch
+import sys
+from tokenizers import Tokenizer
 from transformer import LLM
 from params import Config
-from tokenizers import Tokenizer
 
-# --- Configuration ---
+# --- CONFIGURATION ---
+# Change this to point to your latest/best checkpoint
+CHECKPOINT_PATH = "models/ckpt_step_4000.pt" 
+TOKENIZER_PATH = "data/json/tokenizer_32k.json"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-TOKENIZER_PATH = "data/tokenizer.json" # Path to your trained tokenizer
 
 def load_model(ckpt_path):
-    print(f"⏳ Loading model from {ckpt_path}...")
-    model = LLM() # Config is pulled automatically from params.py
+    print(f"📦 Loading model from {ckpt_path}...")
     
-    # Load weights
-    if os.path.exists(ckpt_path):
-        state_dict = torch.load(ckpt_path, map_location=DEVICE)
-        model.load_state_dict(state_dict)
-        print("✅ Model weights loaded successfully.")
-    else:
-        print("⚠️ Checkpoint not found! Initializing random model (Gibberish mode).")
+    # Initialize model with training config
+    # We disable float8 for inference to avoid torchao overhead in CLI
+    Config.use_float8 = False 
+    model = LLM(Config).to(DEVICE)
     
-    model.to(DEVICE).to(dtype=torch.bfloat16) # Use BF16 for inference
+    # Load checkpoint
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    
+    # CheckpointManager saves everything in a "model" key
+    state_dict = ckpt["model"]
+    
+    # Handle the 'compiled' prefix if it exists
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        name = k.replace("_orig_mod.", "") if k.startswith("_orig_mod.") else k
+        new_state_dict[name] = v
+        
+    model.load_state_dict(new_state_dict)
     model.eval()
     return model
 
-def generate(model, tokenizer, prompt, max_new_tokens=100, temperature=0.7, top_k=50):
-    encoded = tokenizer.encode(prompt)
-    idx = torch.tensor(encoded.ids, dtype=torch.long, device=DEVICE).unsqueeze(0)
-    
-    print(f"\n🤖 AI: ", end="", flush=True)
-    
-    # Use the generator from the class
-    for next_token in model.generate(
-        idx, 
-        max_new_tokens=max_new_tokens, 
-        temperature=temperature, 
-        top_k=top_k,
-        use_cache=True
-    ):
-        decoded_token = tokenizer.decode([next_token.item()])
-        print(decoded_token, end="", flush=True)
-    
-    print("\n")
-
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, default="models/latest.pt", help="Path to model checkpoint")
-    parser.add_argument("--temp", type=float, default=0.7, help="Sampling temperature")
-    args = parser.parse_args()
-
-    # Load Tokenizer
     if not os.path.exists(TOKENIZER_PATH):
-        print(f"❌ Tokenizer not found at {TOKENIZER_PATH}. Run tokenizer generation first.")
+        print(f"❌ Error: Tokenizer not found at {TOKENIZER_PATH}")
         return
+
     tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
-
-    # Load Model
-    model = load_model(args.ckpt)
-
-    print(f"✨ Ready! (Ctrl+C to exit)")
-    print("-" * 50)
+    model = load_model(CHECKPOINT_PATH)
+    
+    print("\n" + "="*50)
+    print("🚀 1B MLA MODEL - PHASE 1 INFERENCE")
+    print("Format: Base Completion (Acts like Autocomplete)")
+    print("Type 'exit' to quit.")
+    print("="*50 + "\n")
 
     while True:
-        try:
-            user_input = input("You: ")
-            if not user_input: continue
-            if user_input.lower() in ["exit", "quit"]: break
-            
-            generate(model, tokenizer, user_input, temperature=args.temp)
-            
-        except KeyboardInterrupt:
-            print("\nExiting...")
+        prompt = input("\nPrompt > ")
+        if prompt.lower() in ["exit", "quit"]:
             break
+            
+        if not prompt.strip():
+            continue
+
+        # Inference Params
+        max_new_tokens = 128
+        temp = 0.8
+        top_k = 40
+
+        # Encode
+        input_ids = torch.tensor([tokenizer.encode(prompt).ids], device=DEVICE)
+        
+        print("\nCompletion: ", end="", flush=True)
+
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            # The generate method is a generator (yields tokens)
+            for token_tensor in model.generate(
+                input_ids, 
+                max_new_tokens=max_new_tokens, 
+                temperature=temp, 
+                top_k=top_k,
+                use_cache=True
+            ):
+                token_id = token_tensor.item()
+                # Stop if model generates <|endoftext|> (ID typically 0 or in config)
+                if token_id == tokenizer.token_to_id("<|endoftext|>"):
+                    break
+                    
+                word = tokenizer.decode([token_id])
+                print(word, end="", flush=True)
+        
+        print("\n" + "-"*30)
 
 if __name__ == "__main__":
     main()

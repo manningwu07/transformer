@@ -240,8 +240,6 @@ def main():
         drop_last=True,
     )
 
-    # Compilation now handled inside LLM.__init__ via Config.compile_layers
-
     if is_distributed():
         model = DDP(model, device_ids=[get_local_rank()], output_device=get_local_rank())
 
