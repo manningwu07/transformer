@@ -57,7 +57,7 @@ def main():
         default="cosine",
         choices=["cosine", "linear"],
     )
-    parser.add_argument("--init_from", type=str, default="phase-one-model.pt", help="Load model weights only, reset optimizer/scheduler/steps")
+    parser.add_argument("--init_from", type=str, default=None, help="Load model weights only, reset optimizer/scheduler/steps")
 
     args = parser.parse_args()
 

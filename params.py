@@ -70,9 +70,9 @@ if MODE == "pretrain_5080":
         batch_size=2,
         seq_len=2048,
         grad_accum_steps=256,
-        lr_start=5e-4,
-        lr_end=5e-5,
-        warmup_steps=2000,
+        lr_start=3e-4,
+        lr_end=3e-5,
+        warmup_steps=50,
     )
 
 elif MODE == "longctx_5090":
