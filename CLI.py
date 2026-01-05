@@ -1,264 +1,413 @@
 # CLI.py
+import argparse
 import os
+import sys
 import time
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
 import torch
 from tokenizers import Tokenizer
-from transformer import LLM
+
 from params import Config
-
-# --- CONFIGURATION ---
-CHECKPOINT_PATH = "models/phase-one-model.pt"
-TOKENIZER_PATH = "data/json/tokenizer_32k.json"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+from transformer import LLM
 
 
-def load_model(ckpt_path):
-    print(f"📦 Loading model from {ckpt_path}...")
-    
+def _cuda_events_available() -> bool:
+    return torch.cuda.is_available() and torch.cuda.is_initialized()
+
+
+@dataclass
+class GenParams:
+    max_new_tokens: int = 256
+    temperature: float = 0.8
+    top_k: int = 40
+    top_p: float = 0.95
+    repetition_penalty: float = 1.12
+    repetition_window: int = 256
+    use_cache: bool = True
+
+
+def pretty_piece(text: str) -> str:
+    """
+    Your tokenizer appears to use GPT2/RoBERTa-style markers:
+      - 'Ġ' for "leading space"
+      - 'Ċ' for newline
+    Some SentencePiece tokenizers use '▁' for space.
+    """
+    if not text:
+        return text
+    return (
+        text.replace("Ġ", " ")
+        .replace("▁", " ")
+        .replace("Ċ", "\n")
+        .replace("\r\n", "\n")
+    )
+
+
+def load_model(ckpt_path: str, device: torch.device) -> LLM:
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    # Ensure inference doesn’t accidentally trigger train-time toggles
     Config.use_float8 = False
     Config.compile_mode = "none"
-    model = LLM(Config).to(DEVICE)
-    
-    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-    state_dict = ckpt.get("model", ckpt)  # Handle both formats
-    
-    # Strip compiled prefix if exists
-    new_state_dict = {}
+    Config.gradient_checkpointing = False
+
+    model = LLM(Config).to(device)
+
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    state_dict = ckpt.get("model", ckpt)
+
+    # Strip torch.compile prefix if present
+    fixed = {}
     for k, v in state_dict.items():
-        name = k.replace("_orig_mod.", "") if k.startswith("_orig_mod.") else k
-        new_state_dict[name] = v
-    
-    model.load_state_dict(new_state_dict)
+        if k.startswith("_orig_mod."):
+            k = k.replace("_orig_mod.", "", 1)
+        fixed[k] = v
+
+    model.load_state_dict(fixed, strict=True)
     model.eval()
     return model
 
 
 @torch.no_grad()
-def generate_with_metrics(
-    model,
-    tokenizer,
+def forward_with_kv_cache(
+    model: LLM,
+    idx: torch.Tensor,
+    kv_cache: Optional[List[Optional[dict]]],
+    use_cache: bool,
+) -> Tuple[torch.Tensor, Optional[List[Optional[dict]]]]:
+    """
+    IMPORTANT:
+    Your current LLM.forward() ignores kv_cache/use_cache and always calls
+    forward_no_cache() on each layer, so generation loses context and “cache”
+    doesn’t work. This function runs the blocks with KV caching properly.
+    """
+    x = model.tok_embeddings(idx)
+
+    new_caches: Optional[List[Optional[dict]]] = [] if use_cache else None
+    if kv_cache is None and use_cache:
+        kv_cache = [None] * len(model.layers)
+
+    for i, layer in enumerate(model.layers):
+        if use_cache:
+            x, layer_cache = layer(x, kv_cache=kv_cache[i], use_cache=True)
+            new_caches.append(layer_cache)
+        else:
+            x = layer.forward_no_cache(x)
+
+    x = model.norm(x)
+    logits = model.output(x)
+    return logits, new_caches
+
+
+def sample_next_token(
+    logits: torch.Tensor,
+    generated: List[int],
+    params: GenParams,
+) -> int:
+    # logits: [1, vocab]
+    logits = logits.float()
+
+    # repetition penalty on a window (cheap + helps loops)
+    if params.repetition_penalty != 1.0 and generated:
+        window = generated[-params.repetition_window :]
+        uniq = set(window)
+        if uniq:
+            ids = torch.tensor(list(uniq), device=logits.device, dtype=torch.long)
+            vals = logits[0, ids]
+            pos = vals > 0
+            vals[pos] = vals[pos] / params.repetition_penalty
+            vals[~pos] = vals[~pos] * params.repetition_penalty
+            logits[0, ids] = vals
+
+    # greedy if temperature <= 0
+    if params.temperature <= 0:
+        return int(torch.argmax(logits, dim=-1).item())
+
+    logits = logits / params.temperature
+
+    # top-k
+    if params.top_k is not None and params.top_k > 0:
+        k = min(params.top_k, logits.size(-1))
+        thresh = torch.topk(logits, k, dim=-1).values[:, -1:]
+        logits = torch.where(logits < thresh, torch.full_like(logits, -float("inf")), logits)
+
+    # top-p
+    if params.top_p is not None and params.top_p < 1.0:
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        sorted_probs = torch.softmax(sorted_logits, dim=-1)
+        cdf = torch.cumsum(sorted_probs, dim=-1)
+
+        cut = cdf > params.top_p
+        cut[:, 1:] = cut[:, :-1].clone()
+        cut[:, 0] = False
+
+        to_remove = cut.scatter(1, sorted_idx, cut)
+        logits = logits.masked_fill(to_remove, -float("inf"))
+
+    probs = torch.softmax(logits, dim=-1)
+    return int(torch.multinomial(probs, num_samples=1).item())
+
+
+def now_wall() -> float:
+    return time.perf_counter()
+
+
+def cuda_ms(start_evt, end_evt) -> float:
+    end_evt.record()
+    torch.cuda.synchronize()
+    return start_evt.elapsed_time(end_evt)
+
+
+@torch.no_grad()
+def generate_stream(
+    model: LLM,
+    tokenizer: Tokenizer,
     prompt: str,
-    max_new_tokens: int = 256,
-    temperature: float = 0.8,
-    top_k: int = 40,
-    top_p: float = 0.95,
-    repetition_penalty: float = 1.1,
-    use_cache: bool = True,
-):
-    """
-    Generate text with proper decoding, repetition penalty, and TPS logging.
-    """
+    params: GenParams,
+    device: torch.device,
+    bench: bool = False,
+) -> dict:
     eos_id = tokenizer.token_to_id("<|endoftext|>")
-    input_ids = tokenizer.encode(prompt).ids
-    input_tensor = torch.tensor([input_ids], device=DEVICE, dtype=torch.long)
-    
-    generated_ids = []
-    kv_cache = None
-    
-    # Track timing
-    start_time = time.perf_counter()
-    first_token_time = None
-    
-    for i in range(max_new_tokens):
-        # Prepare input
-        if use_cache and kv_cache is not None:
-            idx_input = torch.tensor([[generated_ids[-1]]], device=DEVICE, dtype=torch.long)
-        else:
-            all_ids = input_ids + generated_ids
-            idx_input = torch.tensor([all_ids[-Config.max_seq_len:]], device=DEVICE, dtype=torch.long)
-        
-        # Forward pass
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            logits, _, kv_cache = model(idx_input, use_cache=use_cache, kv_cache=kv_cache)
-        
-        logits = logits[:, -1, :].float()  # [1, vocab_size]
-        
-        # === Apply Repetition Penalty ===
-        if repetition_penalty != 1.0 and generated_ids:
-            # Penalize tokens that have already appeared
-            unique_tokens = set(generated_ids)
-            for token_id in unique_tokens:
-                if logits[0, token_id] > 0:
-                    logits[0, token_id] /= repetition_penalty
-                else:
-                    logits[0, token_id] *= repetition_penalty
-        
-        # === Temperature ===
-        if temperature > 0:
-            logits = logits / temperature
-        
-        # === Top-K Filtering ===
-        if top_k is not None and top_k > 0:
-            top_k_val = min(top_k, logits.size(-1))
-            indices_to_remove = logits < torch.topk(logits, top_k_val, dim=-1).values[:, -1:]
-            logits[indices_to_remove] = float('-inf')
-        
-        # === Top-P (Nucleus) Filtering ===
-        if top_p is not None and top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
-            
-            # Remove tokens with cumulative probability above the threshold
-            sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-            sorted_indices_to_remove[:, 0] = False
-            
-            indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
-            logits[indices_to_remove] = float('-inf')
-        
-        # === Sample ===
-        probs = torch.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1).item()
-        
-        # Record first token time (TTFT)
-        if first_token_time is None:
-            first_token_time = time.perf_counter()
-        
-        # === Check EOS ===
-        if next_token == eos_id:
+    if eos_id is None:
+        # If missing, disable EOS stopping
+        eos_id = -1
+
+    prompt_ids = tokenizer.encode(prompt).ids
+    if not prompt_ids:
+        return {
+            "num_new_tokens": 0,
+            "ttft_ms": 0.0,
+            "prefill_tps": 0.0,
+            "decode_tps": 0.0,
+            "wall_total_s": 0.0,
+            "gpu_total_s": None,
+        }
+
+    max_ctx = getattr(model, "max_seq_len", getattr(Config, "max_seq_len", 8192))
+    if len(prompt_ids) > max_ctx:
+        prompt_ids = prompt_ids[-max_ctx:]
+
+    # small speed knobs
+    torch.set_float32_matmul_precision("high")
+
+    # timing setup
+    wall_t0 = now_wall()
+    gpu_total_ms = 0.0 if _cuda_events_available() else None
+
+    # ---- Prefill (build cache on full prompt)
+    idx = torch.tensor([prompt_ids], device=device, dtype=torch.long)
+
+    if _cuda_events_available():
+        pre_s = torch.cuda.Event(enable_timing=True)
+        pre_e = torch.cuda.Event(enable_timing=True)
+        pre_s.record()
+
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits, kv_cache = forward_with_kv_cache(
+            model, idx=idx, kv_cache=None, use_cache=params.use_cache
+        )
+
+    if _cuda_events_available():
+        pre_ms = cuda_ms(pre_s, pre_e)
+        gpu_total_ms += pre_ms
+
+    # ---- Decode tokens
+    generated: List[int] = []
+    printed = 0
+
+    # reuse a 1x1 tensor to avoid per-step allocations
+    one = torch.empty((1, 1), device=device, dtype=torch.long)
+
+    wall_after_prefill = now_wall()
+    first_token_wall: Optional[float] = None
+
+    # initial logits from prefill last position
+    next_logits = logits[:, -1, :]
+
+    for _ in range(int(params.max_new_tokens)):
+        next_id = sample_next_token(next_logits, generated, params)
+
+        if first_token_wall is None:
+            first_token_wall = now_wall()
+
+        if next_id == eos_id:
             break
-        
-        generated_ids.append(next_token)
-        
-        # === Decode and stream (properly handles Ġ) ===
-        # Decode full sequence to get correct spacing
-        decoded_so_far = tokenizer.decode(generated_ids)
-        if len(generated_ids) > 1:
-            decoded_prev = tokenizer.decode(generated_ids[:-1])
-            new_text = decoded_so_far[len(decoded_prev):]
-        else:
-            new_text = decoded_so_far
-        
-        print(new_text, end="", flush=True)
-        
-        # === Early stop on repetition (safety) ===
-        if len(generated_ids) >= 20:
-            last_20 = generated_ids[-20:]
-            # Check if last 10 tokens repeat
-            if last_20[:10] == last_20[10:]:
-                print("\n[Stopped: repetition detected]", end="")
+
+        generated.append(next_id)
+
+        # stream-print
+        if not bench:
+            # decode one token and pretty it (fast + readable for Ġ/Ċ tokenizers)
+            piece = tokenizer.decode([next_id])
+            piece = pretty_piece(piece)
+            if piece:
+                sys.stdout.write(piece)
+                sys.stdout.flush()
+                printed += len(piece)
+
+        # forward one token with cache
+        one[0, 0] = next_id
+
+        if _cuda_events_available():
+            dec_s = torch.cuda.Event(enable_timing=True)
+            dec_e = torch.cuda.Event(enable_timing=True)
+            dec_s.record()
+
+        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits, kv_cache = forward_with_kv_cache(
+                model, idx=one, kv_cache=kv_cache, use_cache=params.use_cache
+            )
+
+        if _cuda_events_available():
+            dec_ms = cuda_ms(dec_s, dec_e)
+            gpu_total_ms += dec_ms
+
+        next_logits = logits[:, -1, :]
+
+        # simple repetition-loop detector
+        if len(generated) >= 32:
+            a = generated[-32:-16]
+            b = generated[-16:]
+            if a == b:
+                if not bench:
+                    sys.stdout.write("\n[stopped: repetition detected]\n")
+                    sys.stdout.flush()
                 break
-    
-    # === Timing Stats ===
-    end_time = time.perf_counter()
-    total_time = end_time - start_time
-    num_tokens = len(generated_ids)
-    
-    ttft = (first_token_time - start_time) * 1000 if first_token_time else 0
-    tps = num_tokens / total_time if total_time > 0 else 0
-    
-    return {
-        "generated_ids": generated_ids,
-        "num_tokens": num_tokens,
-        "total_time_s": total_time,
-        "ttft_ms": ttft,
-        "tokens_per_second": tps,
+
+    wall_t1 = now_wall()
+
+    # metrics
+    num_new = len(generated)
+    wall_total = wall_t1 - wall_t0
+    wall_prefill = wall_after_prefill - wall_t0
+    wall_decode = wall_t1 - wall_after_prefill
+
+    ttft_ms = 0.0
+    if first_token_wall is not None:
+        ttft_ms = (first_token_wall - wall_t0) * 1000.0
+
+    prefill_tps = len(prompt_ids) / max(wall_prefill, 1e-9)
+    decode_tps = num_new / max(wall_decode, 1e-9)
+
+    out = {
+        "num_prompt_tokens": len(prompt_ids),
+        "num_new_tokens": num_new,
+        "ttft_ms": ttft_ms,
+        "prefill_tps_wall": prefill_tps,
+        "decode_tps_wall": decode_tps,
+        "wall_total_s": wall_total,
     }
+
+    if gpu_total_ms is not None:
+        out["gpu_total_s"] = gpu_total_ms / 1000.0
+        out["decode_tps_gpu"] = num_new / max((gpu_total_ms / 1000.0) - (wall_prefill), 1e-9)
+
+    return out
 
 
 def main():
-    if not os.path.exists(TOKENIZER_PATH):
-        print(f"❌ Error: Tokenizer not found at {TOKENIZER_PATH}")
-        return
-    
-    if not os.path.exists(CHECKPOINT_PATH):
-        print(f"❌ Error: Checkpoint not found at {CHECKPOINT_PATH}")
-        return
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ckpt", type=str, default="models/phase-one-model.pt")
+    ap.add_argument("--tokenizer", type=str, default="data/json/tokenizer_32k.json")
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
-    tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
-    model = load_model(CHECKPOINT_PATH)
-    
-    print("\n" + "=" * 60)
-    print("🚀 1B MLA MODEL - PHASE 1 INFERENCE")
-    print("=" * 60)
-    print("Commands:")
-    print("  /temp <value>   - Set temperature (default: 0.8)")
-    print("  /topk <value>   - Set top_k (default: 40)")
-    print("  /topp <value>   - Set top_p (default: 0.95)")
-    print("  /rep <value>    - Set repetition penalty (default: 1.1)")
-    print("  /max <value>    - Set max tokens (default: 256)")
-    print("  /reset          - Reset to defaults")
-    print("  exit            - Quit")
-    print("=" * 60 + "\n")
+    ap.add_argument("--bench", action="store_true", help="Don’t stream text; just measure speed")
+    ap.add_argument("--max_new", type=int, default=256)
+    ap.add_argument("--temp", type=float, default=0.8)
+    ap.add_argument("--topk", type=int, default=40)
+    ap.add_argument("--topp", type=float, default=0.95)
+    ap.add_argument("--rep", type=float, default=1.12)
 
-    # Default params
-    params = {
-        "temperature": 0.8,
-        "top_k": 40,
-        "top_p": 0.95,
-        "repetition_penalty": 1.1,
-        "max_new_tokens": 256,
-    }
+    args = ap.parse_args()
+
+    if not os.path.exists(args.tokenizer):
+        raise FileNotFoundError(f"Tokenizer not found: {args.tokenizer}")
+
+    device = torch.device(args.device)
+    tokenizer = Tokenizer.from_file(args.tokenizer)
+
+    print(f"Loading model: {args.ckpt}")
+    model = load_model(args.ckpt, device=device)
+
+    print("\n=== 1B MLA MODEL - CLI INFERENCE ===")
+    print("Commands: /temp x | /topk k | /topp p | /rep r | /max n | /bench 0/1 | exit\n")
+
+    params = GenParams(
+        max_new_tokens=int(args.max_new),
+        temperature=float(args.temp),
+        top_k=int(args.topk),
+        top_p=float(args.topp),
+        repetition_penalty=float(args.rep),
+        use_cache=True,
+    )
+    bench = bool(args.bench)
 
     while True:
         try:
-            prompt = input("\nPrompt > ").strip()
+            prompt = input("Prompt > ").strip()
         except (EOFError, KeyboardInterrupt):
-            print("\nExiting...")
-            break
-        
+            print("\nExiting.")
+            return
+
         if not prompt:
             continue
-        
-        # Handle commands
-        if prompt.lower() in ["exit", "quit", "/exit", "/quit"]:
-            break
-        
+        if prompt.lower() in {"exit", "quit"}:
+            return
+
+        # runtime commands
         if prompt.startswith("/"):
             parts = prompt.split()
             cmd = parts[0].lower()
-            
-            if cmd == "/temp" and len(parts) > 1:
-                params["temperature"] = float(parts[1])
-                print(f"✓ Temperature set to {params['temperature']}")
-            elif cmd == "/topk" and len(parts) > 1:
-                params["top_k"] = int(parts[1])
-                print(f"✓ Top-K set to {params['top_k']}")
-            elif cmd == "/topp" and len(parts) > 1:
-                params["top_p"] = float(parts[1])
-                print(f"✓ Top-P set to {params['top_p']}")
-            elif cmd == "/rep" and len(parts) > 1:
-                params["repetition_penalty"] = float(parts[1])
-                print(f"✓ Repetition penalty set to {params['repetition_penalty']}")
-            elif cmd == "/max" and len(parts) > 1:
-                params["max_new_tokens"] = int(parts[1])
-                print(f"✓ Max tokens set to {params['max_new_tokens']}")
-            elif cmd == "/reset":
-                params = {
-                    "temperature": 0.8,
-                    "top_k": 40,
-                    "top_p": 0.95,
-                    "repetition_penalty": 1.1,
-                    "max_new_tokens": 256,
-                }
-                print("✓ Reset to defaults")
-            elif cmd == "/params":
-                print(f"Current params: {params}")
-            else:
-                print(f"Unknown command: {cmd}")
+
+            try:
+                if cmd == "/temp" and len(parts) == 2:
+                    params.temperature = float(parts[1])
+                elif cmd == "/topk" and len(parts) == 2:
+                    params.top_k = int(parts[1])
+                elif cmd == "/topp" and len(parts) == 2:
+                    params.top_p = float(parts[1])
+                elif cmd == "/rep" and len(parts) == 2:
+                    params.repetition_penalty = float(parts[1])
+                elif cmd == "/max" and len(parts) == 2:
+                    params.max_new_tokens = int(parts[1])
+                elif cmd == "/bench" and len(parts) == 2:
+                    bench = bool(int(parts[1]))
+                else:
+                    print("Unknown command.")
+                    continue
+            except Exception as e:
+                print(f"Bad command: {e}")
+                continue
+
+            print(
+                f"Params: temp={params.temperature} topk={params.top_k} "
+                f"topp={params.top_p} rep={params.repetition_penalty} "
+                f"max_new={params.max_new_tokens} bench={int(bench)}"
+            )
             continue
-        
-        print("\nCompletion: ", end="", flush=True)
-        
-        metrics = generate_with_metrics(
-            model,
-            tokenizer,
-            prompt,
-            max_new_tokens=params["max_new_tokens"],
-            temperature=params["temperature"],
-            top_k=params["top_k"],
-            top_p=params["top_p"],
-            repetition_penalty=params["repetition_penalty"],
-            use_cache=True,
+
+        print("Completion: ", end="" if not bench else "\n", flush=True)
+        stats = generate_stream(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=prompt,
+            params=params,
+            device=device,
+            bench=bench,
         )
-        
-        print()
-        print("-" * 40)
-        print(f"📊 Tokens: {metrics['num_tokens']} | "
-              f"TTFT: {metrics['ttft_ms']:.1f}ms | "
-              f"TPS: {metrics['tokens_per_second']:.1f} tok/s | "
-              f"Total: {metrics['total_time_s']:.2f}s")
-        print("-" * 40)
+        if not bench:
+            print()
+
+        print(
+            f"[tokens prompt={stats['num_prompt_tokens']} new={stats['num_new_tokens']}] "
+            f"TTFT={stats['ttft_ms']:.1f}ms | "
+            f"prefill={stats['prefill_tps_wall']:.1f} tok/s | "
+            f"decode={stats['decode_tps_wall']:.1f} tok/s | "
+            f"wall={stats['wall_total_s']:.2f}s"
+        )
 
 
 if __name__ == "__main__":

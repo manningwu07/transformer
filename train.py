@@ -43,12 +43,20 @@ def main():
 
     parser.add_argument("--seed", type=int, default=getattr(Config, "seed", 1337))
 
-    parser.add_argument("--total_opt_steps", type=int, default=200_000)
+    parser.add_argument("--total_opt_steps", type=int, default=10_000)
     parser.add_argument("--log_every_opt", type=int, default=25)
-    parser.add_argument("--val_every_opt", type=int, default=1000)
+    parser.add_argument("--val_every_opt", type=int, default=100)
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=4)
+    
+    parser.add_argument("--phase1_dir", type=str, default="data/shards/phase1/train")
+    parser.add_argument("--phase2_dir", type=str, default="data/shards/phase2/train")
+    parser.add_argument("--phase3_dir", type=str, default="data/shards/phase3")
+    
+    parser.add_argument("--phase1_pct", type=float, default=0)
+    parser.add_argument("--phase2_pct", type=float, default=0)
+    parser.add_argument("--phase3_pct", type=float, default=0)
 
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(

@@ -114,10 +114,7 @@ def load_dataset_streaming(
         args = (name,)
 
     if token:
-        try:
-            ds = load_dataset(*args, token=token, **kwargs)
-        except TypeError:
-            ds = load_dataset(*args, use_auth_token=token, **kwargs)
+        ds = load_dataset(*args, token=token, **kwargs)
     else:
         ds = load_dataset(*args, **kwargs)
 
@@ -600,7 +597,7 @@ def main():
         sft_probs.append(0.25)
 
     if args.use_apps:
-        apps = load_dataset_streaming("codeparrot/apps", split="train", token=hf_token)
+        apps = load_dataset_streaming("codeparrot/apps", config="all", split="train", token=hf_token, revision="refs/convert/parquet")
 
         def apps_iter() -> Iterator[str]:
             for ex in apps:
