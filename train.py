@@ -36,8 +36,8 @@ atexit.register(cleanup_gpu)
 def main():
         
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_dir", type=str, default="data/shards/phase1/train")
-    parser.add_argument("--val_dir", type=str, default="data/shards/phase1/val")
+    parser.add_argument("--train_dir", type=str, default="data/shards/phase2-warmup/train")
+    parser.add_argument("--val_dir", type=str, default="data/shards/phase2-warmup/val")
     parser.add_argument("--save_dir", type=str, default="models")
     parser.add_argument("--resume", type=str, default=None)
 
@@ -49,14 +49,6 @@ def main():
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--prefetch_factor", type=int, default=4)
-    
-    parser.add_argument("--phase1_dir", type=str, default="data/shards/phase1/train")
-    parser.add_argument("--phase2_dir", type=str, default="data/shards/phase2/train")
-    parser.add_argument("--phase3_dir", type=str, default="data/shards/phase3")
-    
-    parser.add_argument("--phase1_pct", type=float, default=0)
-    parser.add_argument("--phase2_pct", type=float, default=0)
-    parser.add_argument("--phase3_pct", type=float, default=0)
 
     parser.add_argument("--compile", action="store_true")
     parser.add_argument(
@@ -65,7 +57,7 @@ def main():
         default="cosine",
         choices=["cosine", "linear"],
     )
-    parser.add_argument("--init_from", type=str, default=None, help="Load model weights only, reset optimizer/scheduler/steps")
+    parser.add_argument("--init_from", type=str, default="phase-one-model.pt", help="Load model weights only, reset optimizer/scheduler/steps")
 
     args = parser.parse_args()
 

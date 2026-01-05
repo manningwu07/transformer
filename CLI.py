@@ -311,7 +311,7 @@ def generate_stream(
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", type=str, default="models/phase-one-model.pt")
-    ap.add_argument("--tokenizer", type=str, default="data/json/tokenizer_32k.json")
+    ap.add_argument("--tokenizer", type=str, default="data/json/tokenizer.json")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
 
     ap.add_argument("--bench", action="store_true", help="Don’t stream text; just measure speed")
