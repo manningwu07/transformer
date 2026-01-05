@@ -65,6 +65,7 @@ def main():
         default="cosine",
         choices=["cosine", "linear"],
     )
+    parser.add_argument("--init_from", type=str, default=None, help="Load model weights only, reset optimizer/scheduler/steps")
 
     args = parser.parse_args()
 
@@ -129,23 +130,41 @@ def main():
     micro_step_in_epoch = 0
     best_val_loss = float("inf")
 
-    state = ckpt.load(
-        args.resume,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-    )
-    if state is not None:
-        opt_step = int(state.get("opt_step", 0))
-        micro_step = int(state.get("micro_step", 0))
-        epoch = int(state.get("epoch", 0))
-        micro_step_in_epoch = int(state.get("micro_step_in_epoch", 0))
-        best_val_loss = float(state.get("best_val_loss", best_val_loss))
-        set_rng_state(state.get("rng", None))
-
+    if args.init_from is not None:
+        # Load ONLY model weights; do NOT load optimizer/scheduler/client_state.
+        _ = ckpt.load(
+            args.init_from,
+            model=model,
+            optimizer=None,
+            scheduler=None,
+        )
+        # Reset run state explicitly.
+        opt_step = 0
+        micro_step = 0
+        epoch = 0
+        micro_step_in_epoch = 0
+        best_val_loss = float("inf")
+        # Fresh RNG for the new phase (recommended)
+        seed_everything(args.seed)
+        if is_main_process():
+            print(f"🧪 init_from={args.init_from} (model-only). Optimizer/scheduler reset.")
+    else:
+        state = ckpt.load(
+            args.resume,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
+        if state is not None:
+            opt_step = int(state.get("opt_step", 0))
+            micro_step = int(state.get("micro_step", 0))
+            epoch = int(state.get("epoch", 0))
+            micro_step_in_epoch = int(state.get("micro_step_in_epoch", 0))
+            best_val_loss = float(state.get("best_val_loss", best_val_loss))
+            set_rng_state(state.get("rng", None))
     # Whole-model compile (AFTER .to(device), BEFORE DDP)
     if getattr(model, "_needs_whole_model_compile", False):
-        print("⚡ Compiling entire model (this may take 2-5 minutes on first forward   backward)...")
+        print("⚡ Compiling entire model (this may take 2-5 minutes on first forward + backward)...")
         
         # Suppress excessive recompilation from dynamic shapes
         torch._dynamo.config.suppress_errors = False
