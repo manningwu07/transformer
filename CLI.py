@@ -8,7 +8,7 @@ from params import Config
 
 # --- CONFIGURATION ---
 # Change this to point to your latest/best checkpoint
-CHECKPOINT_PATH = "models/ckpt_step_4000.pt" 
+CHECKPOINT_PATH = "models/model" 
 TOKENIZER_PATH = "data/json/tokenizer_32k.json"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

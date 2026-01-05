@@ -10,6 +10,87 @@ import numpy as np
 from datasets import load_dataset
 from tokenizers import Tokenizer
 from tqdm import tqdm
+import time
+import queue
+import threading
+import hashlib
+
+class PrefetchIter:
+    """
+    Pull from a (possibly-stalling) iterator in a background thread.
+    Main thread never blocks on HF streaming.
+    """
+
+    def __init__(self, name: str, it: Iterator[str], max_buffer: int = 64):
+        self.name = name
+        self._it = it
+        self._q: queue.Queue[Optional[str]] = queue.Queue(maxsize=max_buffer)
+        self._done = threading.Event()
+        self._err: Optional[BaseException] = None
+
+        t = threading.Thread(target=self._worker, daemon=True)
+        t.start()
+
+    def _worker(self) -> None:
+        try:
+            for item in self._it:
+                self._q.put(item)
+            self._q.put(None)
+        except BaseException as e:
+            self._err = e
+            try:
+                self._q.put(None)
+            except Exception:
+                pass
+        finally:
+            self._done.set()
+
+    def try_get(self) -> Optional[str]:
+        if self._err is not None:
+            e = self._err
+            self._err = None
+            raise e
+        try:
+            return self._q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def alive(self) -> bool:
+        return (not self._done.is_set()) or (not self._q.empty())
+
+
+def interleave_nonblocking(
+    sources: List[PrefetchIter],
+    probs: List[float],
+    seed: int,
+    idle_sleep_sec: float = 0.01,
+) -> Iterator[str]:
+    assert len(sources) == len(probs)
+    rng = random.Random(seed)
+
+    while any(s.alive() for s in sources):
+        available: list[int] = []
+        weights: list[float] = []
+        for i, s in enumerate(sources):
+            # only choose sources that currently have buffered items
+            if s._q.empty():
+                continue
+            if probs[i] <= 0.0:
+                continue
+            available.append(i)
+            weights.append(probs[i])
+
+        if not available:
+            time.sleep(idle_sleep_sec)
+            continue
+
+        idx = rng.choices(available, weights=weights, k=1)[0]
+        item = sources[idx].try_get()
+        if item is None:
+            continue
+        item = (item or "").strip()
+        if item:
+            yield item
 
 
 def load_dataset_streaming(
@@ -23,6 +104,10 @@ def load_dataset_streaming(
     Forces python format to avoid Arrow schema inference hangs.
     """
     kwargs = {"split": split, "streaming": True}
+      # If we have a token, also export it so HF Hub resolver uses authenticated
+    # requests (avoids "unauthenticated requests" warning + rate limits).
+    if token and not os.getenv("HF_TOKEN"):
+        os.environ["HF_TOKEN"] = token
     if config is not None:
         args = (name, config)
     else:
@@ -211,11 +296,13 @@ def encode_text_stream_to_bin(
     out: BinShardWriter,
     target_tokens: int,
     encode_batch_size: int,
+    flush_interval_sec: float,
     desc: str,
 ) -> int:
     pbar = tqdm(total=target_tokens, unit="tok", desc=desc)
     written = 0
     batch: List[str] = []
+    last_flush_t = time.time()
 
     def flush(batch_texts: List[str]) -> None:
         nonlocal written
@@ -237,9 +324,11 @@ def encode_text_stream_to_bin(
         if not t:
             continue
         batch.append(t)
-        if len(batch) >= encode_batch_size:
+        now = time.time()
+        if len(batch) >= encode_batch_size or (now - last_flush_t) >= flush_interval_sec:
             flush(batch)
             batch = []
+            last_flush_t = now
             if written >= target_tokens:
                 break
 
@@ -299,10 +388,12 @@ def main():
     ap.add_argument("--hf_token", type=str, default=None)
     ap.add_argument("--seed", type=int, default=1337)
 
-    ap.add_argument("--encode_batch_size", type=int, default=512)
+    ap.add_argument("--encode_batch_size", type=int, default=16)
+    ap.add_argument("--flush_interval_sec", type=float, default=2.0)
+    ap.add_argument("--prefetch_buffer", type=int, default=64)
     ap.add_argument("--bin_shard_size", type=int, default=50_000_000)
 
-    ap.add_argument("--target_tokens_longctx", type=int, default=25_000_000_000)
+    ap.add_argument("--target_tokens_longctx", type=int, default=2_500_000_000)
     ap.add_argument("--target_tokens_sft", type=int, default=2_000_000_000)
     ap.add_argument("--target_dpo_pairs", type=int, default=2_000_000)
     ap.add_argument("--dpo_shard_examples", type=int, default=20_000)
@@ -444,7 +535,20 @@ def main():
     if not long_sources:
         raise ValueError("No longctx sources selected. Use --use_smollm_corpus at minimum.")
 
-    long_text = probabilistic_interleave(long_sources, long_probs, seed=args.seed)
+    # Nonblocking interleave (prevents HF stalls from freezing the entire job)
+    long_total = sum(long_probs)
+    long_probs = [p / max(1e-12, long_total) for p in long_probs]
+    long_prefetch = [
+        PrefetchIter(name=f"longctx_{i}", it=it, max_buffer=args.prefetch_buffer)
+        for i, it in enumerate(long_sources)
+    ]
+    long_text = interleave_nonblocking(
+        sources=long_prefetch,
+        probs=long_probs,
+        seed=args.seed,
+        idle_sleep_sec=0.01,
+    )
+    
     wrote_long = encode_text_stream_to_bin(
         text_iter=long_text,
         tok=tok,
@@ -452,6 +556,7 @@ def main():
         out=long_out,
         target_tokens=args.target_tokens_longctx,
         encode_batch_size=args.encode_batch_size,
+        flush_interval_sec=args.flush_interval_sec,
         desc="Phase3 LongCtx",
     )
     long_out.finalize()
@@ -536,7 +641,16 @@ def main():
     tot = sum(sft_probs)
     sft_probs = [p / tot for p in sft_probs]
 
-    sft_text = probabilistic_interleave(sft_sources, sft_probs, seed=args.seed + 1)
+    sft_prefetch = [
+        PrefetchIter(name=f"sft_{i}", it=it, max_buffer=args.prefetch_buffer)
+        for i, it in enumerate(sft_sources)
+    ]
+    sft_text = interleave_nonblocking(
+        sources=sft_prefetch,
+        probs=sft_probs,
+        seed=args.seed + 1,
+        idle_sleep_sec=0.01,
+    )
     wrote_sft = encode_text_stream_to_bin(
         text_iter=sft_text,
         tok=tok,
@@ -572,7 +686,8 @@ def main():
 
         user = f"{inst}\n\nInput:\n{inp}" if inp else inst
 
-        seed_val = (hash(inst + "\n" + chosen_text) & 0xFFFFFFFF)
+        h = hashlib.md5((inst + "\n" + chosen_text).encode("utf-8")).hexdigest()
+        seed_val = int(h[:8], 16)
         rejected_text = degrade_answer(chosen_text, seed=seed_val)
 
         prompt = f"<|user|>\n{user}\n<|assistant|>\n"
