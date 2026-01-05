@@ -391,11 +391,11 @@ def main():
     ap.add_argument("--encode_batch_size", type=int, default=16)
     ap.add_argument("--flush_interval_sec", type=float, default=2.0)
     ap.add_argument("--prefetch_buffer", type=int, default=64)
-    ap.add_argument("--bin_shard_size", type=int, default=50_000_000)
+    ap.add_argument("--bin_shard_size", type=int, default=100_000_000)
 
-    ap.add_argument("--target_tokens_longctx", type=int, default=2_500_000_000)
-    ap.add_argument("--target_tokens_sft", type=int, default=2_000_000_000)
-    ap.add_argument("--target_dpo_pairs", type=int, default=2_000_000)
+    ap.add_argument("--target_tokens_longctx", type=int, default=4_000_000_000)
+    ap.add_argument("--target_tokens_sft", type=int, default=1_000_000_000)
+    ap.add_argument("--target_dpo_pairs", type=int, default=500_000)
     ap.add_argument("--dpo_shard_examples", type=int, default=20_000)
 
     ap.add_argument(
