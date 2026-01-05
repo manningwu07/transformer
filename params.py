@@ -67,7 +67,7 @@ class TrainingArgs:
 if MODE == "pretrain_5080":
     Config = ModelArgs()
     TrainCfg = TrainingArgs(
-        batch_size=1,
+        batch_size=2,
         seq_len=2048,
         grad_accum_steps=256,
         lr_start=5e-4,
