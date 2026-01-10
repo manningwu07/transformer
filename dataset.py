@@ -1,9 +1,9 @@
 import os
 import glob
-import random
 import numpy as np
+import numpy.typing as npt
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler, RandomSampler
+from torch.utils.data import Dataset, DataLoader, Sampler
 import bisect
 import itertools
 import math
@@ -26,7 +26,7 @@ class PackedBinDataset(Dataset):
         self.dtype = dtype
 
         pat = pattern or f"*{split}*.bin"
-        self.bin_files = sorted(glob.glob(os.path.join(shard_dir, pat)))
+        self.bin_files = sorted(glob.glob(os.path.join(shard_dir, "**", pat), recursive=True))
         if not self.bin_files:
             raise FileNotFoundError(f"No shards found in {shard_dir}")
 
@@ -47,7 +47,8 @@ class PackedBinDataset(Dataset):
 
     def _slice_global(self, start: int, length: int) -> np.ndarray:
         end = start + length
-        out = []
+        out = np.empty((length,), dtype=self.dtype)
+        out_pos = 0
         cur = start
         while cur < end:
             shard_idx = bisect.bisect_right(self.cum_tokens, cur) - 1
@@ -55,145 +56,15 @@ class PackedBinDataset(Dataset):
             local = cur - shard_start
             shard = self.mmaps[shard_idx]
             take = min(end - cur, shard.shape[0] - local)
-            out.append(np.asarray(shard[local : local + take]))
+            out[out_pos : out_pos + take] = shard[local : local + take]
+            out_pos += take
             cur += take
-        return out[0] if len(out) == 1 else np.concatenate(out, axis=0)
+        return out
 
     def __getitem__(self, idx: int):
         start = idx * self.block
         tokens = self._slice_global(start, self.block)
         return torch.from_numpy(tokens[:-1].copy()), torch.from_numpy(tokens[1:].copy())
-
-class WeightedPhaseDataset(Dataset):
-    """
-    Mixes multiple PackedBinDatasets by fixed probabilities.
-
-    - Deterministic per (idx, seed, rank) so it plays nice with resuming.
-    - Length is the max length of the component datasets (so samplers work).
-    - Sampling is "with replacement" via modulo / randint.
-    """
-
-    def __init__(
-        self,
-        phases: list[tuple[str, Dataset]],
-        weights: list[float],
-        seed: int = 1337,
-    ):
-        if len(phases) == 0:
-            raise ValueError("WeightedPhaseDataset: no phases provided")
-        if len(phases) != len(weights):
-            raise ValueError("WeightedPhaseDataset: phases and weights mismatch")
-
-        wsum = float(sum(weights))
-        if wsum <= 0:
-            raise ValueError("WeightedPhaseDataset: weights sum must be > 0")
-
-        self.phases = phases
-        self.names = [n for (n, _) in phases]
-        self.datasets = [d for (_, d) in phases]
-        self.weights = [float(w) / wsum for w in weights]
-        self.seed = int(seed)
-        self.rank = int(get_rank())
-
-        # Precompute CDF for sampling
-        cdf = []
-        acc = 0.0
-        for w in self.weights:
-            acc += w
-            cdf.append(acc)
-        cdf[-1] = 1.0
-        self.cdf = cdf
-
-        self._len = max(len(d) for d in self.datasets)
-
-    def __len__(self) -> int:
-        return self._len
-
-    def _pick_phase(self, idx: int) -> int:
-        # Mix in rank so each process does not perfectly mirror the same phase picks
-        rng = random.Random(self.seed + 1_000_000 * self.rank + idx)
-        r = rng.random()
-        for i, p in enumerate(self.cdf):
-            if r < p:
-                return i
-        return len(self.cdf) - 1
-
-    def __getitem__(self, idx: int):
-        pi = self._pick_phase(idx)
-        ds = self.datasets[pi]
-
-        # Map idx into that dataset deterministically.
-        # Using modulo avoids extra RNG calls and is resume-friendly.
-        j = idx % len(ds)
-        return ds[j]
-
-
-def _validate_pct_sum(pcts: list[tuple[str, float]]) -> list[tuple[str, float]]:
-    pcts = [(k, float(v)) for (k, v) in pcts if float(v) > 0.0]
-    if not pcts:
-        raise ValueError("No phases enabled (all percentages are 0).")
-    s = sum(v for _, v in pcts)
-    # Be strict: user asked "make sure adds up to 100 percent"
-    if abs(s - 100.0) > 1e-6:
-        raise ValueError(f"Phase percentages must sum to 100. Got {s}.")
-    return pcts
-
-
-def build_phase_mix_dataset_from_args(
-    args,
-    split: str,
-    seq_len: int,
-    dtype: np.dtype,
-    seed: int,
-    pattern: str | None = None,
-) -> Dataset:
-    """
-    Expects args to have:
-      - args.phase1_dir / args.phase2_dir / args.phase3_dir (optional)
-      - args.phase1_pct / args.phase2_pct / args.phase3_pct (floats/ints)
-
-    Returns:
-      - PackedBinDataset if only one phase enabled
-      - WeightedPhaseDataset if multiple phases enabled
-    """
-
-    pcts = _validate_pct_sum(
-        [
-            ("phase1", getattr(args, "phase1_pct", 0.0)),
-            ("phase2", getattr(args, "phase2_pct", 0.0)),
-            ("phase3", getattr(args, "phase3_pct", 0.0)),
-        ]
-    )
-
-    phase_to_dir = {
-        "phase1": getattr(args, "phase1_dir", None),
-        "phase2": getattr(args, "phase2_dir", None),
-        "phase3": getattr(args, "phase3_dir", None),
-    }
-
-    phases: list[tuple[str, Dataset]] = []
-    weights: list[float] = []
-    for name, pct in pcts:
-        shard_dir = phase_to_dir.get(name, None)
-        if not shard_dir:
-            raise ValueError(
-                f"{name}_pct={pct} but {name}_dir is not set. "
-                f"Provide --{name}_dir."
-            )
-        ds = PackedBinDataset(
-            shard_dir=shard_dir,
-            split=split,
-            seq_len=seq_len,
-            dtype=dtype,
-            pattern=pattern,
-        )
-        phases.append((name, ds))
-        weights.append(pct)
-
-    if len(phases) == 1:
-        return phases[0][1]
-
-    return WeightedPhaseDataset(phases=phases, weights=weights, seed=seed)
 
 class StreamingRandomSampler(Sampler[int]):
     """

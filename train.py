@@ -164,8 +164,8 @@ def main():
         
         model = torch.compile(
             model,
-            mode="max-autotune-no-cudagraphs",       # or "reduce-overhead" for CUDA graphs (needs static shapes)
-            fullgraph=True,      # Allow graph breaks (safer with checkpointing)
+            mode="max-autotune-no-cudagraphs",
+            fullgraph=True,      # No graph breaks
             dynamic=False,        # Static shapes = faster compiled code
         )
         # 2. INSERT WARMUP PHASE HERE
@@ -213,14 +213,12 @@ def main():
             shuffle=True,
             seed=args.seed,
             drop_last=True,
-            worker_init_fn=worker_init_fn
         )
         val_sampler = DistributedSampler(
             val_ds,
             shuffle=False,
             seed=args.seed,
             drop_last=False,
-            worker_init_fn=worker_init_fn
         )
         shuffle = False
     else:
@@ -424,6 +422,7 @@ def main():
             is_boundary = (micro_step > 0 and micro_step % int(TrainCfg.grad_accum_steps) == 0)
             if is_boundary:
                 total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                norm_val = total_norm.item() if torch.is_tensor(total_norm) else total_norm
                 raw_loss = float(loss.detach().float().item())
                 loss_window.append(raw_loss)
                 if len(loss_window) > 100: loss_window.pop(0)                
@@ -458,13 +457,14 @@ def main():
                     print(
                         f"Opt {opt_step} | Micro {micro_step} | "
                         f"Loss {raw_loss:.4f} (avg {avg:.4f}) | "
-                        f"LR {lr:.2e} | {tps:.0f} tok/s"
+                        f"LR {lr:.2e} | Norm {norm_val:.4f} | {tps:.0f} tok/s"
                     )
                     
-                    torch.cuda.reset_peak_memory_stats()
                     # run one full optimizer step (all micro steps)
                     print("max allocated GB", torch.cuda.max_memory_allocated() / 1e9)
                     print("max reserved  GB", torch.cuda.max_memory_reserved() / 1e9)
+                    
+                    torch.cuda.reset_peak_memory_stats()
                     
                     last_log_t = end_compute_t
 

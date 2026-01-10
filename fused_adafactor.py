@@ -104,7 +104,7 @@ def _adafactor_2d_update_kernel(
     lr,
     eps2,
     weight_decay,
-    r_mean_inv,
+    r_mean_inv_ptr,
     M,
     N,
     BLOCK_M: tl.constexpr,
@@ -119,6 +119,8 @@ def _adafactor_2d_update_kernel(
 
     mask_m = offs_m < M
     mask_n = offs_n < N
+    
+    r_mean_inv = tl.load(r_mean_inv_ptr)
 
     r = tl.load(r_ptr + offs_m, mask=mask_m, other=0.0)
     c = tl.load(c_ptr + offs_n, mask=mask_n, other=0.0)
@@ -176,8 +178,9 @@ class FusedAdafactor(Optimizer):
     def _get_rho(self, step: int, decay_rate: float) -> float:
         return min(0.999, 1.0 - math.pow(step + 1, decay_rate))
 
-    def _rms(self, tensor: torch.Tensor) -> float:
-        return tensor.norm(2).item() / math.sqrt(tensor.numel())
+    def _rms(self, tensor: torch.Tensor) -> torch.Tensor:
+        # returns 0-dim tensor on device (no CPU sync)
+        return torch.linalg.vector_norm(tensor) / math.sqrt(tensor.numel())
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -234,10 +237,8 @@ class FusedAdafactor(Optimizer):
         n = p.numel()
 
         grad_rms = self._rms(grad)
-        if grad_rms > 0:
-            scale = min(1.0, clip_threshold / grad_rms)
-            if scale < 1.0:
-                grad = grad * scale
+        scale = (clip_threshold / (grad_rms + 1e-12)).clamp(max=1.0)
+        grad = grad * scale
 
         p_data = p.data.float().contiguous()
 
@@ -279,15 +280,11 @@ class FusedAdafactor(Optimizer):
             BLOCK_M=BLOCK_M,
         )
 
-        r_mean = r_flat.mean().item()
-        r_mean_inv = 1.0 / (r_mean + 1e-30)
-
+        # no CPU sync: keep these as device scalars
+        r_mean_inv = 1.0 / (r_flat.mean(dtype=torch.float32) + 1e-30)
         grad_rms = self._rms(g_2d)
-        effective_lr = lr
-        if grad_rms > 0:
-            scale = min(1.0, clip_threshold / grad_rms)
-            if scale < 1.0:
-                effective_lr = lr * scale
+        scale = (clip_threshold / (grad_rms + 1e-12)).clamp(max=1.0)
+        g_2d = g_2d * scale
 
         # --- Fused weight update ---
         BLOCK_M = 32
@@ -299,7 +296,7 @@ class FusedAdafactor(Optimizer):
 
         _adafactor_2d_update_kernel[grid](
             p_2d, g_2d, r_flat, c_flat,
-            effective_lr, eps2, weight_decay, r_mean_inv,
+            lr, eps2, weight_decay, r_mean_inv,
             M, N,
             BLOCK_M=BLOCK_M,
             BLOCK_N=BLOCK_N,
