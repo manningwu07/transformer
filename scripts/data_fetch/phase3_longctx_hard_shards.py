@@ -164,6 +164,8 @@ def load_dataset_streaming(
     token: Optional[str],
     revision: Optional[str] = None,
 ):
+    if split == "val":
+       split = "train"
     kwargs = {"split": split, "streaming": True}
     if revision is not None:
         kwargs["revision"] = revision
@@ -288,10 +290,11 @@ def harddeps_synth_iter(
 # Real sources
 # ----------------------------
 def arxiv_summarization_iter(hf_token: Optional[str], split: str) -> Iterator[str]:
+    hf_split = "validation" if split == "val" else split
     ds = load_dataset_streaming(
         "ccdv/arxiv-summarization",
         config=None,
-        split=split,
+        split=hf_split,
         token=hf_token,
     )
     for ex in ds:
