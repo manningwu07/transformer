@@ -8,6 +8,7 @@ import random
 import re
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Iterator, Optional, List, Dict, Any, Tuple
 
@@ -16,10 +17,9 @@ from datasets import load_dataset
 from tokenizers import Tokenizer
 from tqdm import tqdm
 
+warnings.filterwarnings("ignore", category=UserWarning, module="datasets")
 
-# ----------------------------
-# Fast writer (no giant Python lists)
-# ----------------------------
+
 @dataclass
 class BinShardWriterFast:
     out_dir: str
@@ -66,9 +66,6 @@ class BinShardWriterFast:
             self._pos = 0
 
 
-# ----------------------------
-# Prefetch to avoid HF stalls
-# ----------------------------
 class PrefetchIter:
     def __init__(self, name: str, it: Iterator[str], max_buffer: int = 64):
         self.name = name
@@ -140,9 +137,6 @@ def interleave_nonblocking(
             yield item
 
 
-# ----------------------------
-# HF loading (defensive)
-# ----------------------------
 def _hf_token_from_env(explicit: Optional[str]) -> Optional[str]:
     if explicit:
         return explicit
@@ -181,9 +175,6 @@ def load_dataset_streaming(
     return ds.with_format("python")
 
 
-# ----------------------------
-# Formatting
-# ----------------------------
 def format_chatml_turn(role: str, content: str) -> str:
     role = role.strip().lower()
     if role not in {"system", "user", "assistant"}:
@@ -298,19 +289,12 @@ def format_glaive_v2(ex: dict) -> str:
     return text.strip() + "\n"
 
 
-# ----------------------------
-# Deterministic split assignment by hash
-# ----------------------------
 def assign_split(text: str, val_percent: float) -> str:
-    """Returns 'val' or 'train' deterministically."""
     h = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
     x = int.from_bytes(h, "little") % 10_000
     return "val" if x < int(val_percent * 100) else "train"
 
 
-# ----------------------------
-# Sources -> ChatML strings (no filtering, just yield all)
-# ----------------------------
 def iter_generic_chat(
     dataset: str,
     config: Optional[str],
@@ -338,9 +322,6 @@ def iter_glaive(hf_token: Optional[str]) -> Iterator[str]:
             yield s
 
 
-# ----------------------------
-# Single-pass encoding to BOTH train and val
-# ----------------------------
 def encode_stream_to_both_splits(
     text_iter: Iterator[str],
     tok: Tokenizer,
@@ -407,7 +388,6 @@ def encode_stream_to_both_splits(
         return total
 
     for t in text_iter:
-        # Early exit if both targets met
         if train_written >= target_train_tokens and val_written >= target_val_tokens:
             break
 
@@ -415,30 +395,30 @@ def encode_stream_to_both_splits(
         if not t or not keep(t):
             continue
 
-        split = assign_split(t, val_percent)
-
-        if split == "val":
-            if val_written < target_val_tokens:
+        # KEY FIX: Saturate on overflow - once one bucket is full, send everything to the other
+        if train_written < target_train_tokens and val_written < target_val_tokens:
+            split = assign_split(t, val_percent)
+            if split == "val":
                 val_batch.append(t)
-        else:
-            if train_written < target_train_tokens:
+            else:
                 train_batch.append(t)
+        elif val_written < target_val_tokens:
+            val_batch.append(t)
+        elif train_written < target_train_tokens:
+            train_batch.append(t)
 
-        # Flush train batch
         if len(train_batch) >= encode_batch_size:
             added = flush_batch(train_batch, is_val=False)
             train_written += added
             pbar_train.update(added)
             train_batch = []
 
-        # Flush val batch
         if len(val_batch) >= encode_batch_size:
             added = flush_batch(val_batch, is_val=True)
             val_written += added
             pbar_val.update(added)
             val_batch = []
 
-    # Final flush
     if train_batch and train_written < target_train_tokens:
         added = flush_batch(train_batch, is_val=False)
         train_written += added

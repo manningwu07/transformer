@@ -6,6 +6,7 @@ import torch
 import numpy as np
 from typing import Any
 import torch.distributed as dist
+from typing import Dict, Tuple
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from params import TrainCfg
@@ -46,6 +47,27 @@ def set_rng_state(state):
     torch.set_rng_state(state["torch_cpu"])
     torch.cuda.set_rng_state_all(state["torch_cuda"])
     
+@torch.no_grad()
+def validate_multi(
+    model,
+    device,
+    loaders: Dict[str, object],
+    max_val_steps: int = 100,
+) -> Dict[str, Tuple[float, float]]:
+    """
+    Run validation separately for multiple loaders.
+    Returns: {name: (avg_loss, ppl)}
+    """
+    out: Dict[str, Tuple[float, float]] = {}
+    for name, loader in loaders.items():
+        loss, ppl = validate(
+            model=model,
+            device=device,
+            val_loader=loader,
+            max_val_steps=max_val_steps,
+        )
+        out[name] = (loss, ppl)
+    return out
 
 @torch.no_grad()
 def validate(model, device, val_loader, max_val_steps: int = 100):

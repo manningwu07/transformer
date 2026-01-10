@@ -34,10 +34,42 @@ def cleanup_gpu():
 atexit.register(cleanup_gpu)
 
 def main():
-        
+    
+    def discover_val_buckets(val_dir: str):
+        """
+        If val_dir has subfolders (e.g. val/finemath, val/stackedu, val/anchor),
+        return those as buckets. Otherwise return {"val": val_dir}.
+        """
+        if not os.path.isdir(val_dir):
+            return {"val": val_dir}
+
+        # If there are .bin files directly inside val_dir, treat as single bucket.
+        direct_bins = glob.glob(os.path.join(val_dir, "*.bin"))
+        if direct_bins:
+            return {"val": val_dir}
+
+        # Otherwise, treat each immediate subdir containing .bin (recursively) as a bucket.
+        buckets = {}
+        for name in sorted(os.listdir(val_dir)):
+            p = os.path.join(val_dir, name)
+            if not os.path.isdir(p):
+                continue
+            has_bins = bool(glob.glob(os.path.join(p, "**", "*.bin"), recursive=True))
+            if has_bins:
+                buckets[name] = p
+
+        return buckets if buckets else {"val": val_dir}
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_dir", type=str, default="data/shards/phase2-warmup/train")
     parser.add_argument("--val_dir", type=str, default="data/shards/phase2-warmup/val")
+    parser.add_argument(
+        "--val_metric",
+        type=str,
+        default="avg",
+        choices=["avg", "finemath", "stackedu", "anchor", "val"],
+        help="Which validation bucket determines best checkpoint.",
+    )
     parser.add_argument("--save_dir", type=str, default="models")
     parser.add_argument("--resume", type=str, default=None)
 
@@ -199,13 +231,33 @@ def main():
         dtype=np.uint16,
         pattern="*train-*.bin",
     )
-    val_ds = PackedBinDataset(
-        args.val_dir,
-        split="val",
-        seq_len=TrainCfg.seq_len,
-        dtype=np.uint16,
-        pattern="*val-*.bin",
-    )
+    # ---- Build val loaders per bucket ----
+    val_buckets = discover_val_buckets(args.val_dir)
+    if is_main_process():
+        print(f"🔎 Val buckets: {list(val_buckets.keys())}")
+
+    val_loaders = {}
+    for name, vdir in val_buckets.items():
+        vds = PackedBinDataset(
+            vdir,
+            split="val",
+            seq_len=TrainCfg.seq_len,
+            dtype=np.uint16,
+            # More robust: accept any bin names in bucket dirs.
+            pattern="*.bin",
+        )
+        vloader = get_dataloader(
+            vds,
+            sampler=None,
+            batch_size=TrainCfg.batch_size,
+            num_workers=max(0, args.num_workers // 2),
+            prefetch_factor=args.prefetch_factor,
+            shuffle=False,
+            seed=args.seed,
+            offset=0,
+            drop_last=True,
+        )
+        val_loaders[name] = vloader
 
     if is_distributed():
         train_sampler = DistributedSampler(
@@ -214,16 +266,9 @@ def main():
             seed=args.seed,
             drop_last=True,
         )
-        val_sampler = DistributedSampler(
-            val_ds,
-            shuffle=False,
-            seed=args.seed,
-            drop_last=False,
-        )
         shuffle = False
     else:
         train_sampler = None
-        val_sampler = None
         shuffle = True
 
     rank = get_rank()
@@ -243,17 +288,6 @@ def main():
         shuffle,
         args.seed,
         offset=micro_step_in_epoch,
-        drop_last=True,
-    )
-    val_loader = get_dataloader(
-        val_ds,
-        val_sampler,
-        TrainCfg.batch_size,
-        max(0, args.num_workers // 2),
-        args.prefetch_factor,
-        False,
-        args.seed,
-        offset=0,
         drop_last=True,
     )
 
@@ -469,16 +503,47 @@ def main():
                     last_log_t = end_compute_t
 
                 if opt_step % args.val_every_opt == 0:
-                    val_loss, val_ppl = validate(eager_model_for_val, device, val_loader)
+                    results = validate_multi(
+                        eager_model_for_val,
+                        device,
+                        val_loaders,
+                        max_val_steps=100,
+                    )
+
+                    # Print each bucket, plus an average.
                     if is_main_process():
+                        keys = sorted(results.keys())
+                        avg_loss = sum(results[k][0] for k in keys) / max(1, len(keys))
+                        avg_ppl = math.exp(avg_loss)
+                        parts = []
+                        for k in keys:
+                            loss_k, ppl_k = results[k]
+                            parts.append(f"{k}: {loss_k:.4f} (ppl {ppl_k:.2f})")
                         print(
-                            f"📉 [VAL] Opt {opt_step} | Loss {val_loss:.4f} | PPL {val_ppl:.2f}"
+                            f"📉 [VAL] Opt {opt_step} | "
+                            + " | ".join(parts)
+                            + f" | avg: {avg_loss:.4f} (ppl {avg_ppl:.2f})"
                         )
 
                     save_current_state(f"ckpt_step_{opt_step}", is_crash=False)
 
-                    if val_loss < best_val_loss:
-                        best_val_loss = val_loss
+                    # Choose which bucket controls best checkpoint.
+                    metric = args.val_metric
+                    if metric == "avg":
+                        score = (
+                            sum(v[0] for v in results.values()) / max(1, len(results))
+                        )
+                    else:
+                        # if metric bucket missing, fall back to avg
+                        score = results.get(metric, (float("inf"), 0.0))[0]
+                        if not math.isfinite(score):
+                            score = (
+                                sum(v[0] for v in results.values())
+                                / max(1, len(results))
+                            )
+
+                    if score < best_val_loss:
+                        best_val_loss = float(score)
                         save_current_state(f"best_step_{opt_step}", is_crash=False)
                     last_log_t = time.time()
             # signal.alarm(0) # Disable alarm on successful batch
