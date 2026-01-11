@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
+"""
+interleave_bins_v3.py - Strict multi-source shard interleaving with DPO support.
+
+Changes from v2:
+1. STRICT: RuntimeError if any --source is missing train/ or val/ subdirs
+2. RECURSIVE: glob(..., recursive=True) for nested val buckets
+3. DPO: Auto-copy dpo/*.npz from sources to output
+"""
 import argparse
 import glob
 import os
 import random
+import shutil
 from dataclasses import dataclass
 from typing import Iterator, List, Tuple
 
@@ -55,13 +64,22 @@ class ShardWriterFast:
             self._pos = 0
 
 
-def iter_shard_tokens(
+def iter_shard_tokens_recursive(
     shard_dir: str,
-    pattern: str,
     dtype: np.dtype,
     chunk_size: int,
 ) -> Iterator[np.ndarray]:
-    files = sorted(glob.glob(os.path.join(shard_dir, pattern)))
+    """
+    Recursively find all .bin files under shard_dir and yield chunks.
+    Handles nested structures like val/stackedu/*.bin, val/finemath/*.bin
+    """
+    # Recursive glob for all .bin files
+    pattern = os.path.join(shard_dir, "**", "*.bin")
+    files = sorted(glob.glob(pattern, recursive=True))
+    
+    if not files:
+        raise RuntimeError(f"No .bin files found in {shard_dir} (recursive search)")
+    
     for f in files:
         mm = np.memmap(f, dtype=dtype, mode="r")
         n = int(mm.shape[0])
@@ -115,7 +133,7 @@ def interleave_sources(
 def parse_sources(items: List[str]) -> List[Tuple[str, str, float]]:
     """
     Each --source: "name=/path/to/shards:weight"
-    Expects /path/to/shards/{train,val}/*.bin
+    Expects /path/to/shards/{train,val}/*.bin (recursive)
     """
     out = []
     for s in items:
@@ -129,6 +147,79 @@ def parse_sources(items: List[str]) -> List[Tuple[str, str, float]]:
     return out
 
 
+def validate_sources_strict(
+    sources: List[Tuple[str, str, float]],
+    require_train: bool = True,
+    require_val: bool = True,
+) -> None:
+    """
+    STRICT: Raise RuntimeError if any source is missing required splits.
+    """
+    for name, base, w in sources:
+        if not os.path.isdir(base):
+            raise RuntimeError(f"Source '{name}' base path does not exist: {base}")
+        
+        if require_train:
+            train_dir = os.path.join(base, "train")
+            if not os.path.isdir(train_dir):
+                raise RuntimeError(
+                    f"Source '{name}' missing train/ subdirectory: {train_dir}\n"
+                    f"Use --skip_missing_train to allow skipping (not recommended)"
+                )
+            # Check for actual .bin files
+            bins = glob.glob(os.path.join(train_dir, "**", "*.bin"), recursive=True)
+            if not bins:
+                raise RuntimeError(
+                    f"Source '{name}' train/ has no .bin files: {train_dir}"
+                )
+        
+        if require_val:
+            val_dir = os.path.join(base, "val")
+            if not os.path.isdir(val_dir):
+                raise RuntimeError(
+                    f"Source '{name}' missing val/ subdirectory: {val_dir}\n"
+                    f"Use --skip_missing_val to allow skipping (not recommended)"
+                )
+            # Check for actual .bin files (recursive for nested buckets)
+            bins = glob.glob(os.path.join(val_dir, "**", "*.bin"), recursive=True)
+            if not bins:
+                raise RuntimeError(
+                    f"Source '{name}' val/ has no .bin files (recursive): {val_dir}"
+                )
+
+
+def copy_dpo_shards(
+    sources: List[Tuple[str, str, float]],
+    out_dir: str,
+) -> int:
+    """
+    Copy all dpo/*.npz files from sources to out_dir/dpo/
+    Returns total files copied.
+    """
+    dpo_out = os.path.join(out_dir, "dpo")
+    copied = 0
+    
+    for name, base, _ in sources:
+        dpo_dir = os.path.join(base, "dpo")
+        if not os.path.isdir(dpo_dir):
+            continue
+        
+        npz_files = glob.glob(os.path.join(dpo_dir, "*.npz"))
+        if not npz_files:
+            continue
+        
+        os.makedirs(dpo_out, exist_ok=True)
+        for f in npz_files:
+            # Prefix with source name to avoid collisions
+            dst_name = f"{name}_{os.path.basename(f)}"
+            dst = os.path.join(dpo_out, dst_name)
+            if not os.path.exists(dst):
+                shutil.copy2(f, dst)
+                copied += 1
+    
+    return copied
+
+
 def build_split(
     split: str,
     sources: List[Tuple[str, str, float]],
@@ -138,19 +229,33 @@ def build_split(
     target_tokens: int,
     seed: int,
     chunk_size: int,
+    strict: bool = True,
 ):
+    """Build train or val split from multiple sources."""
     iters: List[Iterator[np.ndarray]] = []
     weights: List[float] = []
     names: List[str] = []
 
     for name, base, w in sources:
         sd = os.path.join(base, split)
+        
         if not os.path.isdir(sd):
+            if strict:
+                raise RuntimeError(f"STRICT: Missing split dir for '{name}': {sd}")
             print(f"⚠️ missing split dir, skipping: {sd}")
             continue
-        iters.append(iter_shard_tokens(sd, "*.bin", dtype, chunk_size))
-        weights.append(w)
-        names.append(name)
+        
+        # Use recursive iterator
+        try:
+            it = iter_shard_tokens_recursive(sd, dtype, chunk_size)
+            iters.append(it)
+            weights.append(w)
+            names.append(name)
+        except RuntimeError as e:
+            if strict:
+                raise
+            print(f"⚠️ {e}")
+            continue
 
     if not iters:
         raise RuntimeError(f"No valid sources for split={split}.")
@@ -178,10 +283,13 @@ def build_split(
     writer.finalize()
     pbar.close()
     print(f"✅ {split}: wrote {writer.total_written:,} tokens ({writer.shard_idx} shards)")
+    return writer.total_written
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description="Strict multi-source shard interleaving with DPO support"
+    )
     ap.add_argument("--out_dir", type=str, required=True)
     ap.add_argument("--dtype", type=str, default="uint16", choices=["uint16", "uint32"])
     ap.add_argument("--shard_size", type=int, default=100_000_000)
@@ -197,13 +305,40 @@ def main():
         default=[],
         help='Repeatable. Format: name=/abs/or/rel/path:weight',
     )
+    
+    # Strict mode flags (default: strict)
+    ap.add_argument(
+        "--skip_missing_train",
+        action="store_true",
+        help="Allow skipping sources with missing train/ (NOT RECOMMENDED)",
+    )
+    ap.add_argument(
+        "--skip_missing_val", 
+        action="store_true",
+        help="Allow skipping sources with missing val/ (NOT RECOMMENDED)",
+    )
+    ap.add_argument(
+        "--no_dpo",
+        action="store_true",
+        help="Skip copying DPO shards",
+    )
 
     args = ap.parse_args()
     dtype = np.uint16 if args.dtype == "uint16" else np.uint32
     sources = parse_sources(args.source)
 
+    # STRICT VALIDATION (before any work)
+    print("🔍 Validating sources (STRICT mode)...")
+    validate_sources_strict(
+        sources,
+        require_train=not args.skip_missing_train,
+        require_val=not args.skip_missing_val,
+    )
+    print("✅ All sources validated.\n")
+
     os.makedirs(args.out_dir, exist_ok=True)
 
+    # Build train split
     build_split(
         split="train",
         sources=sources,
@@ -213,7 +348,10 @@ def main():
         target_tokens=args.target_train_tokens,
         seed=args.seed,
         chunk_size=args.chunk_size,
+        strict=not args.skip_missing_train,
     )
+    
+    # Build val split
     build_split(
         split="val",
         sources=sources,
@@ -223,7 +361,17 @@ def main():
         target_tokens=args.target_val_tokens,
         seed=args.seed + 999,
         chunk_size=args.chunk_size,
+        strict=not args.skip_missing_val,
     )
+    
+    # Copy DPO shards
+    if not args.no_dpo:
+        print("\n📋 Copying DPO shards...")
+        n_dpo = copy_dpo_shards(sources, args.out_dir)
+        if n_dpo > 0:
+            print(f"✅ Copied {n_dpo} DPO files to {args.out_dir}/dpo/")
+        else:
+            print("ℹ️ No DPO shards found in sources.")
 
 
 if __name__ == "__main__":

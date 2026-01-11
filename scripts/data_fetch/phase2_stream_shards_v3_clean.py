@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""
-Phase 2 Sharder v3 (CLEAN train/val)
-
-Key properties:
-- Single-pass stream per dataset (we always stream HF split="train")
-- Deterministic hash split per example text -> disjoint train vs val
-- Train is a weighted mix (finemath/stackedu/anchor)
-- Val is written into per-bucket dirs (finemath/stackedu/anchor)
-- Saturating targets: if val is full, route to train; if train is full, route to val
-
-Outputs:
-  out_dir/train/phase2-train-mixed-*.bin
-  out_dir/val/finemath/phase2-val-finemath-*.bin
-  out_dir/val/stackedu/phase2-val-stackedu-*.bin
-  out_dir/val/anchor/phase2-val-anchor-*.bin   (if enabled)
-"""
-
 import argparse
 import hashlib
 import os
@@ -24,7 +7,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Iterator, Optional, List, Tuple, Dict
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 from datasets import load_dataset
@@ -85,7 +68,12 @@ class BinShardWriterFast:
 # Prefetch (HF streaming can stall)
 # ----------------------------
 class PrefetchIter:
-    def __init__(self, name: str, it: Iterator[Tuple[str, str]], max_buffer: int = 64):
+    def __init__(
+        self,
+        name: str,
+        it: Iterator[Tuple[str, str]],
+        max_buffer: int = 64,
+    ):
         self.name = name
         self._it = it
         self._q: queue.Queue[Optional[Tuple[str, str]]] = queue.Queue(maxsize=max_buffer)
@@ -155,7 +143,7 @@ def interleave_nonblocking(
 
 
 # ----------------------------
-# HF loading
+# HF loading + utils
 # ----------------------------
 def _hf_token_from_env(explicit: Optional[str]) -> Optional[str]:
     if explicit:
@@ -172,7 +160,6 @@ def load_dataset_streaming(
     config: Optional[str],
     token: Optional[str],
 ):
-    # Always stream "train" once; we do hash split ourselves
     kwargs = {"split": "train", "streaming": True}
     args = (name, config) if config is not None else (name,)
 
@@ -190,31 +177,10 @@ def load_dataset_streaming(
     return ds.with_format("python")
 
 
-# ----------------------------
-# Split + dedup helpers
-# ----------------------------
 def assign_split(text: str, val_percent: float) -> str:
     h = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
     x = int.from_bytes(h, "little") % 10_000
     return "val" if x < int(val_percent * 100) else "train"
-
-
-class RollingDedup:
-    def __init__(self, capacity: int):
-        self.capacity = int(capacity)
-        self._seen: set[str] = set()
-        self._n = 0
-
-    def keep(self, text: str) -> bool:
-        h = hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
-        if h in self._seen:
-            return False
-        self._seen.add(h)
-        self._n += 1
-        if self._n >= self.capacity:
-            self._seen = set()
-            self._n = 0
-        return True
 
 
 def _safe_str(x: Any) -> str:
@@ -222,7 +188,7 @@ def _safe_str(x: Any) -> str:
 
 
 # ----------------------------
-# Source iterators (yield (bucket, text))
+# Sources -> (bucket, text)
 # ----------------------------
 def finemath_texts(hf_token: Optional[str], config: str) -> Iterator[Tuple[str, str]]:
     ds = load_dataset_streaming("HuggingFaceTB/finemath", config=config, token=hf_token)
@@ -232,17 +198,23 @@ def finemath_texts(hf_token: Optional[str], config: str) -> Iterator[Tuple[str, 
             yield "finemath", t
 
 
-def stackedu_texts(hf_token: Optional[str], config: str) -> Iterator[Tuple[str, str]]:
-    ds = load_dataset_streaming("HuggingFaceTB/stack-edu", config=config, token=hf_token)
-    keys = ["content", "text", "code"]
+def stackedu_texts_techxgenus(
+    hf_token: Optional[str],
+    langs: set[str],
+    max_chars: int,
+) -> Iterator[Tuple[str, str]]:
+    # This is the dataset you said worked reliably for you.
+    ds = load_dataset_streaming("TechxGenus/stack-edu", config=None, token=hf_token)
     for ex in ds:
-        t = ""
-        for k in keys:
-            t = _safe_str(ex.get(k))
-            if t:
-                break
-        if t:
-            yield "stackedu", t
+        lang = _safe_str(ex.get("language")).lower()
+        if langs and lang not in langs:
+            continue
+        t = _safe_str(ex.get("text"))
+        if not t:
+            continue
+        if max_chars > 0 and len(t) > max_chars:
+            t = t[:max_chars]
+        yield "stackedu", t
 
 
 def anchor_texts(hf_token: Optional[str], name: str, config: str) -> Iterator[Tuple[str, str]]:
@@ -254,13 +226,35 @@ def anchor_texts(hf_token: Optional[str], name: str, config: str) -> Iterator[Tu
 
 
 # ----------------------------
-# Main sharding loop (single mixed stream -> train + per-bucket val)
+# Encoding helpers
+# ----------------------------
+def flush_text_batch(
+    tok: Tokenizer,
+    eos_id: int,
+    texts: List[str],
+) -> List[List[int]]:
+    if not texts:
+        return []
+    encs = tok.encode_batch(texts)
+    out: List[List[int]] = []
+    for enc in encs:
+        ids = enc.ids
+        if not ids:
+            continue
+        if ids[-1] != eos_id:
+            ids.append(eos_id)
+        out.append(ids)
+    return out
+
+
+# ----------------------------
+# Main: mixed train + per-bucket val, single run
 # ----------------------------
 def main():
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--tokenizer", type=str, default="data/json/tokenizer_32k.json")
-    ap.add_argument("--out_dir", type=str, default="data/shards/phase2_v3_clean")
+    ap.add_argument("--out_dir", type=str, default="data/shards/phase2_v3_clean_techx")
     ap.add_argument("--hf_token", type=str, default=None)
 
     ap.add_argument("--seed", type=int, default=1337)
@@ -268,32 +262,31 @@ def main():
 
     ap.add_argument("--bin_shard_size", type=int, default=100_000_000)
     ap.add_argument("--target_train_tokens", type=int, default=4_500_000_000)
-    ap.add_argument(
-        "--target_val_tokens_per_bucket",
-        type=int,
-        default=50_000_000,
-        help="Each enabled bucket gets this many val tokens.",
-    )
+    ap.add_argument("--target_val_tokens_per_bucket", type=int, default=50_000_000)
 
     ap.add_argument("--prefetch_buffer", type=int, default=64)
     ap.add_argument("--encode_batch_size", type=int, default=512)
 
-    ap.add_argument("--dedup_capacity", type=int, default=300_000)
-
     # sources
     ap.add_argument("--finemath_config", type=str, default="finemath-4plus")
-    ap.add_argument("--stack_edu_configs", type=str, default="TypeScript,Go,Cpp,Rust")
+
+    ap.add_argument(
+        "--stack_langs",
+        type=str,
+        default="cpp,typescript,go,rust",
+        help="Comma-separated lowercase language names (TechxGenus uses language field).",
+    )
+    ap.add_argument("--stack_max_chars", type=int, default=200_000)
 
     ap.add_argument("--enable_anchor", action="store_true")
     ap.add_argument("--anchor_name", type=str, default="HuggingFaceTB/smollm-corpus")
     ap.add_argument("--anchor_config", type=str, default="fineweb-edu-dedup")
 
-    # weights for TRAIN mixing
     ap.add_argument(
         "--train_probs",
         type=str,
-        default="0.60,0.40",
-        help="If no anchor: finemath,stackedu. If anchor: finemath,stackedu,anchor.",
+        default="0.60,0.30,0.10",
+        help="finemath,stackedu,anchor (if anchor disabled, still pass 2 values).",
     )
 
     args = ap.parse_args()
@@ -306,16 +299,19 @@ def main():
 
     dtype = np.uint16 if tok.get_vocab_size() <= 65536 else np.uint32
 
-    stack_cfgs = [c.strip() for c in args.stack_edu_configs.split(",") if c.strip()]
-    if any(c.lower() == "python" for c in stack_cfgs):
-        raise ValueError("Do not include Python in --stack_edu_configs for Phase2.")
-
+    langs = {x.strip().lower() for x in args.stack_langs.split(",") if x.strip()}
     probs = [float(x) for x in args.train_probs.split(",") if x.strip()]
-    want = 3 if args.enable_anchor else 2
-    if len(probs) != want:
-        raise ValueError(f"--train_probs must have {want} values.")
+
+    if args.enable_anchor:
+        if len(probs) != 3:
+            raise ValueError("With --enable_anchor, --train_probs must have 3 values.")
+    else:
+        if len(probs) != 2:
+            raise ValueError("Without anchor, --train_probs must have 2 values.")
+        probs = [probs[0], probs[1], 0.0]
+
     s = sum(probs)
-    probs = [p / s for p in probs]
+    probs = [p / max(1e-12, s) for p in probs]
 
     # Writers
     train_out = BinShardWriterFast(
@@ -348,30 +344,28 @@ def main():
 
     # Counters
     train_written = 0
-    val_written: Dict[str, int] = {k: 0 for k in val_writers.keys()}
+    val_written = {k: 0 for k in val_writers.keys()}
     val_target = int(args.target_val_tokens_per_bucket)
 
     def all_val_done() -> bool:
         return all(val_written[k] >= val_target for k in val_writers.keys())
 
-    dedup = RollingDedup(args.dedup_capacity)
+    pbar_train = tqdm(total=args.target_train_tokens, unit="tok", desc="phase2 (train)")
+    pbar_val = {
+        k: tqdm(total=val_target, unit="tok", desc=f"phase2 (val:{k})")
+        for k in val_writers.keys()
+    }
 
-    # Build sources for mixing
+    # Sources
     sources: List[Iterator[Tuple[str, str]]] = []
     weights: List[float] = []
 
-    # FineMath is one source
     sources.append(finemath_texts(hf_token, args.finemath_config))
     weights.append(probs[0])
 
-    # Stack-Edu configs: split stack weight across configs
-    stack_weight = probs[1]
-    per_cfg = stack_weight / max(1, len(stack_cfgs))
-    for cfg in stack_cfgs:
-        sources.append(stackedu_texts(hf_token, cfg))
-        weights.append(per_cfg)
+    sources.append(stackedu_texts_techxgenus(hf_token, langs, args.stack_max_chars))
+    weights.append(probs[1])
 
-    # Anchor optional (one source)
     if args.enable_anchor:
         sources.append(anchor_texts(hf_token, args.anchor_name, args.anchor_config))
         weights.append(probs[2])
@@ -386,86 +380,65 @@ def main():
     ]
     mixed = interleave_nonblocking(prefetch, probs=weights, seed=args.seed)
 
-    pbar_train = tqdm(total=args.target_train_tokens, unit="tok", desc="phase2 (train)")
-    pbar_val = {
-        k: tqdm(total=val_target, unit="tok", desc=f"phase2 (val:{k})")
-        for k in val_writers.keys()
-    }
-
     train_batch: List[str] = []
     val_batch: Dict[str, List[str]] = {k: [] for k in val_writers.keys()}
 
-    def flush_text_batch(texts: List[str]) -> List[List[int]]:
-        encs = tok.encode_batch(texts)
-        out_ids = []
-        for enc in encs:
-            ids = enc.ids
-            if ids and ids[-1] != eos_id:
-                ids.append(eos_id)
-            if ids:
-                out_ids.append(ids)
-        return out_ids
-
-    def push_ids_to_train(ids: List[int]) -> None:
+    def push_train(ids: List[int]) -> None:
         nonlocal train_written
         train_out.push_ids(ids)
         train_written += len(ids)
         pbar_train.update(len(ids))
 
-    def push_ids_to_val(bucket: str, ids: List[int]) -> None:
+    def push_val(bucket: str, ids: List[int]) -> None:
         val_writers[bucket].push_ids(ids)
         val_written[bucket] += len(ids)
         pbar_val[bucket].update(len(ids))
 
+    # Loop until both train + all val buckets are satisfied
     while train_written < args.target_train_tokens or not all_val_done():
         bucket, text = next(mixed)
 
-        if not dedup.keep(text):
-            continue
-
-        # Saturating routing:
-        # - If train full: everything goes to val buckets until each is full
-        # - If a val bucket is full: its "val-assigned" items go to train
-        if train_written >= args.target_train_tokens and not all_val_done():
-            # force val fill
-            if bucket in val_writers and val_written[bucket] < val_target:
-                val_batch[bucket].append(text)
-            else:
-                # bucket doesn't have val writer or it's full; drop (do not keep reading forever)
-                continue
-        else:
-            # normal hash split (but if val bucket full, route to train)
+        # decide split (hash) unless one side is saturated
+        if train_written < args.target_train_tokens and not all_val_done():
             split = assign_split(text, args.val_percent)
             if split == "val" and bucket in val_writers and val_written[bucket] < val_target:
                 val_batch[bucket].append(text)
             else:
                 train_batch.append(text)
+        elif train_written < args.target_train_tokens:
+            # val done, force train
+            train_batch.append(text)
+        else:
+            # train done, force val fill for the bucket if still needed; else drop
+            if bucket in val_writers and val_written[bucket] < val_target:
+                val_batch[bucket].append(text)
+            else:
+                continue
 
-        # Flush on batch size
         if len(train_batch) >= args.encode_batch_size:
-            for ids in flush_text_batch(train_batch):
+            for ids in flush_text_batch(tok, eos_id, train_batch):
                 if train_written < args.target_train_tokens:
-                    push_ids_to_train(ids)
+                    push_train(ids)
             train_batch = []
 
         for b in list(val_batch.keys()):
             if len(val_batch[b]) >= args.encode_batch_size:
-                for ids in flush_text_batch(val_batch[b]):
+                for ids in flush_text_batch(tok, eos_id, val_batch[b]):
                     if val_written[b] < val_target:
-                        push_ids_to_val(b, ids)
+                        push_val(b, ids)
                 val_batch[b] = []
 
     # Final flush
     if train_batch and train_written < args.target_train_tokens:
-        for ids in flush_text_batch(train_batch):
+        for ids in flush_text_batch(tok, eos_id, train_batch):
             if train_written < args.target_train_tokens:
-                push_ids_to_train(ids)
+                push_train(ids)
 
     for b, batch in val_batch.items():
         if batch and val_written[b] < val_target:
-            for ids in flush_text_batch(batch):
+            for ids in flush_text_batch(tok, eos_id, batch):
                 if val_written[b] < val_target:
-                    push_ids_to_val(b, ids)
+                    push_val(b, ids)
 
     train_out.finalize()
     for w in val_writers.values():
@@ -475,7 +448,7 @@ def main():
     for p in pbar_val.values():
         p.close()
 
-    print("✅ Phase2 v3 clean complete:")
+    print("✅ Phase2 v3 clean (TechxGenus stack-edu) complete:")
     print(f"  train tokens: {train_written:,}")
     for k in sorted(val_written.keys()):
         print(f"  val {k}: {val_written[k]:,}")
