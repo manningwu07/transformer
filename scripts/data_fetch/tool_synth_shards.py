@@ -1,27 +1,13 @@
 #!/usr/bin/env python3
-# Goes between phase 1 and phase 2 to build tool-synth-prep shards.
-"""
-Build Tool-Prep shards: (tool calls + synthetic planning + phase1 replay).
-
-Goal:
-- Clear signal for tool calling + planning formatting
-- Still replay some phase1 tokens to prevent forgetting
-
-Mix (by tokens, approx via fixed chunking):
-  tool (glaive) : synth : phase1 = 40 : 40 : 20
-
-Output:
-  out_dir/{train,val}/*.bin
-"""
-
 import argparse
 import glob
+import hashlib
 import json
 import os
 import random
 import re
 from dataclasses import dataclass
-from typing import Iterator, Optional, List
+from typing import Iterator, Optional, List, Tuple
 
 import numpy as np
 from datasets import load_dataset
@@ -29,7 +15,80 @@ from tokenizers import Tokenizer
 from tqdm import tqdm
 
 
-# -------------------- Formatting --------------------
+# ----------------------------
+# Fast writer (numpy buffer)
+# ----------------------------
+@dataclass
+class BinShardWriterFast:
+    out_dir: str
+    prefix: str
+    shard_size: int
+    dtype: np.dtype
+    shard_idx: int = 0
+    total_written: int = 0
+
+    def __post_init__(self):
+        os.makedirs(self.out_dir, exist_ok=True)
+        self._buf = np.empty((self.shard_size,), dtype=self.dtype)
+        self._pos = 0
+
+    def _path(self) -> str:
+        return os.path.join(self.out_dir, f"{self.prefix}-{self.shard_idx:05d}.bin")
+
+    def _flush_full(self) -> None:
+        assert self._pos == self.shard_size
+        self._buf.tofile(self._path())
+        self.total_written += int(self._pos)
+        self.shard_idx += 1
+        self._pos = 0
+
+    def push_arr(self, arr: np.ndarray) -> None:
+        if arr.size == 0:
+            return
+        if arr.dtype != self.dtype:
+            arr = arr.astype(self.dtype, copy=False)
+        i = 0
+        while i < arr.size:
+            space = self.shard_size - self._pos
+            take = min(space, arr.size - i)
+            self._buf[self._pos : self._pos + take] = arr[i : i + take]
+            self._pos += take
+            i += take
+            if self._pos == self.shard_size:
+                self._flush_full()
+
+    def push_ids(self, ids: List[int]) -> None:
+        if not ids:
+            return
+        self.push_arr(np.asarray(ids, dtype=self.dtype))
+
+    def finalize(self) -> None:
+        if self._pos > 0:
+            self._buf[: self._pos].tofile(self._path())
+            self.total_written += int(self._pos)
+            self.shard_idx += 1
+            self._pos = 0
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
+def _hf_token_from_env(explicit: Optional[str]) -> Optional[str]:
+    if explicit:
+        return explicit
+    return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN") or os.getenv("HF_HUB_TOKEN")
+
+
+def assign_split_bytes(b: bytes, val_percent: float) -> str:
+    h = hashlib.blake2b(b, digest_size=8).digest()
+    x = int.from_bytes(h, "little") % 10_000
+    return "val" if x < int(val_percent * 100) else "train"
+
+
+def assign_split_text(s: str, val_percent: float) -> str:
+    return assign_split_bytes(s.encode("utf-8"), val_percent)
+
+
 def format_jsonl_chat(instruction: str, inp: str, out: str) -> str:
     instruction = instruction or ""
     inp = inp or ""
@@ -39,6 +98,13 @@ def format_jsonl_chat(instruction: str, inp: str, out: str) -> str:
 
 
 def format_glaive_v2(ex: dict) -> str:
+    """
+    Keeps the call/response weaving. Glaive v2 includes:
+      - tool call JSON
+      - FUNCTION RESPONSE
+      - assistant follow-up
+    This is the strongest supervised signal you have for "tool weaving".
+    """
     text = (ex.get("chat", "") or "").strip()
     if not text:
         return ""
@@ -81,75 +147,23 @@ def format_glaive_v2(ex: dict) -> str:
     return text.strip() + "\n"
 
 
-def _hf_token_from_env(explicit: Optional[str]) -> Optional[str]:
-    if explicit:
-        return explicit
-    return os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-
-
-# -------------------- Sharding --------------------
-@dataclass
-class ShardWriter:
-    out_dir: str
-    prefix: str
-    shard_size: int
-    dtype: np.dtype
-    shard_idx: int = 0
-    total_written: int = 0
-    buf: List[int] = None
-
-    def __post_init__(self):
-        self.buf = []
-        os.makedirs(self.out_dir, exist_ok=True)
-
-    def _path(self) -> str:
-        return os.path.join(self.out_dir, f"{self.prefix}-{self.shard_idx:05d}.bin")
-
-    def push(self, tokens: np.ndarray) -> None:
-        if tokens.size == 0:
-            return
-        self.buf.extend(tokens.tolist())
-        self._flush()
-
-    def _flush(self) -> None:
-        while len(self.buf) >= self.shard_size:
-            chunk = self.buf[: self.shard_size]
-            arr = np.asarray(chunk, dtype=self.dtype)
-            arr.tofile(self._path())
-            self.total_written += int(arr.size)
-            self.shard_idx += 1
-            self.buf = self.buf[self.shard_size :]
-
-    def finalize(self) -> None:
-        if self.buf:
-            arr = np.asarray(self.buf, dtype=self.dtype)
-            arr.tofile(self._path())
-            self.total_written += int(arr.size)
-            self.shard_idx += 1
-            self.buf = []
-
-
-# -------------------- Token Sources --------------------
-def iter_phase1_tokens(
-    shard_dir: str,
-    pattern: str,
-    dtype: np.dtype,
-    chunk_size: int,
-) -> Iterator[np.ndarray]:
-    files = sorted(glob.glob(os.path.join(shard_dir, pattern)))
+# ----------------------------
+# Sources
+# ----------------------------
+def iter_phase1_token_chunks(phase1_dir: str, pattern: str, dtype: np.dtype, chunk_size: int) -> Iterator[np.ndarray]:
+    files = sorted(glob.glob(os.path.join(phase1_dir, pattern)))
     if not files:
-        raise FileNotFoundError(f"No phase1 shards matching {pattern} in {shard_dir}")
-
+        raise FileNotFoundError(f"No phase1 shards matching {pattern} in {phase1_dir}")
     for f in files:
         mm = np.memmap(f, dtype=dtype, mode="r")
-        for start in range(0, len(mm), chunk_size):
+        n = int(mm.shape[0])
+        for start in range(0, n, chunk_size):
             yield np.asarray(mm[start : start + chunk_size])
 
 
 def iter_synthetic_texts(jsonl_path: str) -> Iterator[str]:
     if not os.path.exists(jsonl_path):
         raise FileNotFoundError(f"synthetic_jsonl not found: {jsonl_path}")
-
     while True:
         with open(jsonl_path, "r") as f:
             for line in f:
@@ -160,10 +174,10 @@ def iter_synthetic_texts(jsonl_path: str) -> Iterator[str]:
                     ex = json.loads(line)
                 except Exception:
                     continue
-                inst = ex.get("instruction", "") or ""
-                inp = ex.get("input", "") or ""
-                out = ex.get("output", "") or ""
-                if inst.strip() and out.strip():
+                inst = (ex.get("instruction", "") or "").strip()
+                inp = (ex.get("input", "") or "").strip()
+                out = (ex.get("output", "") or "").strip()
+                if inst and out:
                     yield format_jsonl_chat(inst, inp, out)
 
 
@@ -173,206 +187,53 @@ def iter_glaive_texts(hf_token: Optional[str]) -> Iterator[str]:
         split="train",
         streaming=True,
         token=hf_token,
-    )
+    ).with_format("python")
     for ex in ds:
-        formatted = format_glaive_v2(ex)
-        if formatted:
-            yield formatted
+        s = format_glaive_v2(ex)
+        if s:
+            yield s
 
 
-class EncodedChunkStream:
-    """
-    Turns an iterator of texts into fixed-size token chunks.
-    This makes interleaving probabilities approximately token-proportional.
-    """
-
-    def __init__(
-        self,
-        text_iter: Iterator[str],
-        tokenizer: Tokenizer,
-        eos_id: int,
-        chunk_size: int,
-        encode_batch_size: int,
-    ):
-        self.text_iter = text_iter
-        self.tok = tokenizer
-        self.eos_id = int(eos_id)
-        self.chunk_size = int(chunk_size)
-        self.encode_batch_size = int(encode_batch_size)
-        self.buf: List[int] = []
-
-    def __iter__(self) -> "EncodedChunkStream":
-        return self
-
-    def __next__(self) -> np.ndarray:
-        while len(self.buf) < self.chunk_size:
-            batch: List[str] = []
-            try:
-                for _ in range(self.encode_batch_size):
-                    t = next(self.text_iter)
-                    t = (t or "").strip()
-                    if t:
-                        batch.append(t)
-            except StopIteration:
-                pass
-
-            if not batch and len(self.buf) == 0:
-                raise StopIteration
-
-            if batch:
-                encs = self.tok.encode_batch(batch)
-                for enc in encs:
-                    ids = enc.ids
-                    if not ids:
-                        continue
-                    if ids[-1] != self.eos_id:
-                        ids.append(self.eos_id)
-                    self.buf.extend(ids)
-
-            if not batch and len(self.buf) > 0:
-                break
-
-        if len(self.buf) == 0:
-            raise StopIteration
-
-        out = self.buf[: self.chunk_size]
-        self.buf = self.buf[self.chunk_size :]
-        return np.asarray(out, dtype=np.int64)
+def encode_text_to_ids(tok: Tokenizer, eos_id: int, text: str) -> List[int]:
+    ids = tok.encode(text).ids
+    if ids and ids[-1] != eos_id:
+        ids.append(eos_id)
+    return ids
 
 
-def interleave_token_streams(
-    sources: List[Iterator[np.ndarray]],
-    weights: List[float],
-    seed: int,
-) -> Iterator[np.ndarray]:
-    rng = random.Random(seed)
-    active = [True] * len(sources)
-    w = [float(x) for x in weights]
-
-    while any(active):
-        total = sum(w[i] for i in range(len(w)) if active[i] and w[i] > 0)
-        if total <= 0:
-            break
-
-        probs = [w[i] / total if active[i] else 0.0 for i in range(len(w))]
-        idx = rng.choices(range(len(sources)), weights=probs, k=1)[0]
-
-        if not active[idx]:
-            continue
-
-        try:
-            yield next(sources[idx])
-        except StopIteration:
-            active[idx] = False
-            w[idx] = 0.0
-
-
-def build_split(
-    *,
-    split: str,
-    out_dir: str,
-    tokenizer: Tokenizer,
-    eos_id: int,
-    dtype: np.dtype,
-    shard_size: int,
-    target_tokens: int,
-    seed: int,
-    phase1_dir: str,
-    phase1_pattern: str,
-    phase1_dtype: np.dtype,
-    synthetic_jsonl: str,
-    hf_token: Optional[str],
-    weights: List[float],
-    chunk_size: int,
-    encode_batch_size: int,
-) -> None:
-    writer = ShardWriter(
-        out_dir=os.path.join(out_dir, split),
-        prefix=f"toolprep-{split}",
-        shard_size=shard_size,
-        dtype=dtype,
-    )
-
-    # 1) Phase1 (already tokenized)
-    phase1_stream = iter_phase1_tokens(
-        shard_dir=phase1_dir,
-        pattern=phase1_pattern,
-        dtype=phase1_dtype,
-        chunk_size=chunk_size,
-    )
-
-    # 2) Synthetic (looping)
-    synth_stream = EncodedChunkStream(
-        text_iter=iter_synthetic_texts(synthetic_jsonl),
-        tokenizer=tokenizer,
-        eos_id=eos_id,
-        chunk_size=chunk_size,
-        encode_batch_size=encode_batch_size,
-    )
-
-    # 3) Tool calling (Glaive)
-    tool_stream = EncodedChunkStream(
-        text_iter=iter_glaive_texts(hf_token),
-        tokenizer=tokenizer,
-        eos_id=eos_id,
-        chunk_size=chunk_size,
-        encode_batch_size=encode_batch_size,
-    )
-
-    streams = [tool_stream, synth_stream, phase1_stream]
-
-    pbar = tqdm(total=target_tokens, unit="tok", desc=f"toolprep:{split}")
-    for chunk in interleave_token_streams(streams, weights, seed=seed):
-        writer.push(chunk.astype(dtype, copy=False))
-        pbar.update(int(chunk.size))
-        if writer.total_written >= target_tokens:
-            break
-
-    writer.finalize()
-    pbar.close()
-    print(
-        f"✅ {split}: wrote {writer.total_written:,} tokens "
-        f"({writer.shard_idx} shards) -> {os.path.join(out_dir, split)}"
-    )
-
-
+# ----------------------------
+# Main write loop (single pass, both splits)
+# ----------------------------
 def main():
     ap = argparse.ArgumentParser()
+
     ap.add_argument("--tokenizer", type=str, default="data/json/tokenizer_32k.json")
-    ap.add_argument("--out_dir", type=str, default="data/shards/toolprep")
+    ap.add_argument("--out_dir", type=str, default="data/shards/toolprep_clean")
+    ap.add_argument("--hf_token", type=str, default=None)
 
     ap.add_argument("--phase1_dir", type=str, required=True)
     ap.add_argument("--phase1_pattern", type=str, default="*train*.bin")
-    ap.add_argument(
-        "--phase1_dtype",
-        type=str,
-        default="u16",
-        choices=["u16", "u32"],
-        help="dtype of phase1 shards",
-    )
+    ap.add_argument("--phase1_dtype", type=str, default="u16", choices=["u16", "u32"])
 
-    ap.add_argument(
-        "--synthetic_jsonl",
-        type=str,
-        default="data/raw/synthetic_reasoning_master.jsonl",
-    )
-    ap.add_argument("--hf_token", type=str, default=None)
+    ap.add_argument("--synthetic_jsonl", type=str, default="data/raw/synthetic_reasoning_master.jsonl")
+
+    ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--val_percent", type=float, default=2.0)
 
     ap.add_argument("--target_train_tokens", type=int, default=450_000_000)
     ap.add_argument("--target_val_tokens", type=int, default=50_000_000)
-    ap.add_argument("--shard_size", type=int, default=100_000_000)
-    ap.add_argument("--seed", type=int, default=1337)
+    ap.add_argument("--bin_shard_size", type=int, default=100_000_000)
 
-    ap.add_argument(
-        "--weights",
-        type=str,
-        default="0.40,0.40,0.20",
-        help="tool,synth,phase1",
-    )
     ap.add_argument("--chunk_size", type=int, default=65_536)
     ap.add_argument("--encode_batch_size", type=int, default=256)
 
+    ap.add_argument("--w_tool", type=float, default=0.45)
+    ap.add_argument("--w_synth", type=float, default=0.45)
+    ap.add_argument("--w_phase1", type=float, default=0.10)
+
     args = ap.parse_args()
+
+    hf_token = _hf_token_from_env(args.hf_token)
 
     tok = Tokenizer.from_file(args.tokenizer)
     eos_id = tok.token_to_id("<|endoftext|>")
@@ -382,56 +243,164 @@ def main():
     dtype = np.uint16 if tok.get_vocab_size() <= 65536 else np.uint32
     phase1_dtype = np.uint16 if args.phase1_dtype == "u16" else np.uint32
 
-    weights = [float(x) for x in args.weights.split(",")]
-    if len(weights) != 3:
-        raise ValueError("--weights must have 3 values: tool,synth,phase1")
+    # Normalize weights
+    weights = [args.w_tool, args.w_synth, args.w_phase1]
     s = sum(weights)
     if s <= 0:
         raise ValueError("weights sum must be > 0")
     weights = [w / s for w in weights]
 
-    hf_token = _hf_token_from_env(args.hf_token)
-
-    print(f"Mix weights (tool,synth,phase1): {weights}")
-    print(f"Out: {args.out_dir}")
-
-    build_split(
-        split="train",
-        out_dir=args.out_dir,
-        tokenizer=tok,
-        eos_id=eos_id,
+    train_out = BinShardWriterFast(
+        out_dir=os.path.join(args.out_dir, "train"),
+        prefix="toolprep-train",
+        shard_size=args.bin_shard_size,
         dtype=dtype,
-        shard_size=args.shard_size,
-        target_tokens=args.target_train_tokens,
-        seed=args.seed,
-        phase1_dir=args.phase1_dir,
-        phase1_pattern=args.phase1_pattern,
-        phase1_dtype=phase1_dtype,
-        synthetic_jsonl=args.synthetic_jsonl,
-        hf_token=hf_token,
-        weights=weights,
-        chunk_size=args.chunk_size,
-        encode_batch_size=args.encode_batch_size,
+    )
+    val_out = BinShardWriterFast(
+        out_dir=os.path.join(args.out_dir, "val"),
+        prefix="toolprep-val",
+        shard_size=args.bin_shard_size,
+        dtype=dtype,
     )
 
-    build_split(
-        split="val",
-        out_dir=args.out_dir,
-        tokenizer=tok,
-        eos_id=eos_id,
-        dtype=dtype,
-        shard_size=args.shard_size,
-        target_tokens=args.target_val_tokens,
-        seed=args.seed + 999,
-        phase1_dir=args.phase1_dir,
-        phase1_pattern=args.phase1_pattern,
-        phase1_dtype=phase1_dtype,
-        synthetic_jsonl=args.synthetic_jsonl,
-        hf_token=hf_token,
-        weights=weights,
-        chunk_size=args.chunk_size,
-        encode_batch_size=args.encode_batch_size,
+    phase1_chunks = iter_phase1_token_chunks(
+        args.phase1_dir, args.phase1_pattern, phase1_dtype, args.chunk_size
     )
+    synth_texts = iter_synthetic_texts(args.synthetic_jsonl)
+    tool_texts = iter_glaive_texts(hf_token)
+
+    rng = random.Random(args.seed)
+
+    train_written = 0
+    val_written = 0
+
+    pbar_train = tqdm(total=args.target_train_tokens, unit="tok", desc="toolprep (train)")
+    pbar_val = tqdm(total=args.target_val_tokens, unit="tok", desc="toolprep (val)")
+
+    synth_batch: List[str] = []
+    tool_batch: List[str] = []
+
+    def flush_text_batch(batch: List[str]) -> List[List[int]]:
+        if not batch:
+            return []
+        encs = tok.encode_batch(batch)
+        out_ids = []
+        for enc in encs:
+            ids = enc.ids
+            if ids and ids[-1] != eos_id:
+                ids.append(eos_id)
+            if ids:
+                out_ids.append(ids)
+        return out_ids
+
+    while train_written < args.target_train_tokens or val_written < args.target_val_tokens:
+        # choose a source that can still produce data
+        choice = rng.choices([0, 1, 2], weights=weights, k=1)[0]
+
+        if choice == 2:
+            # phase1 chunk is already tokenized
+            try:
+                chunk = next(phase1_chunks)
+            except StopIteration:
+                weights[2] = 0.0
+                continue
+
+            b = chunk.tobytes()
+            split = assign_split_bytes(b, args.val_percent)
+
+            if split == "val" and val_written < args.target_val_tokens:
+                val_out.push_arr(chunk.astype(dtype, copy=False))
+                val_written += int(chunk.size)
+                pbar_val.update(int(chunk.size))
+            elif split == "train" and train_written < args.target_train_tokens:
+                train_out.push_arr(chunk.astype(dtype, copy=False))
+                train_written += int(chunk.size)
+                pbar_train.update(int(chunk.size))
+            else:
+                # saturating: if preferred split is full, route to other if possible
+                if val_written < args.target_val_tokens:
+                    val_out.push_arr(chunk.astype(dtype, copy=False))
+                    val_written += int(chunk.size)
+                    pbar_val.update(int(chunk.size))
+                elif train_written < args.target_train_tokens:
+                    train_out.push_arr(chunk.astype(dtype, copy=False))
+                    train_written += int(chunk.size)
+                    pbar_train.update(int(chunk.size))
+            continue
+
+        if choice == 1:
+            # synthetic text
+            t = next(synth_texts).strip()
+            if not t:
+                continue
+            synth_batch.append(t)
+            if len(synth_batch) < args.encode_batch_size:
+                continue
+            items = flush_text_batch(synth_batch)
+            synth_batch = []
+        else:
+            # tool text
+            t = next(tool_texts).strip()
+            if not t:
+                continue
+            tool_batch.append(t)
+            if len(tool_batch) < args.encode_batch_size:
+                continue
+            items = flush_text_batch(tool_batch)
+            tool_batch = []
+
+        for ids in items:
+            if train_written >= args.target_train_tokens and val_written >= args.target_val_tokens:
+                break
+
+            text_for_hash = tok.decode(ids[: min(len(ids), 2048)])
+            split = assign_split_text(text_for_hash, args.val_percent)
+
+            if split == "val" and val_written < args.target_val_tokens:
+                val_out.push_ids(ids)
+                val_written += len(ids)
+                pbar_val.update(len(ids))
+            elif split == "train" and train_written < args.target_train_tokens:
+                train_out.push_ids(ids)
+                train_written += len(ids)
+                pbar_train.update(len(ids))
+            else:
+                # saturating routing
+                if val_written < args.target_val_tokens:
+                    val_out.push_ids(ids)
+                    val_written += len(ids)
+                    pbar_val.update(len(ids))
+                elif train_written < args.target_train_tokens:
+                    train_out.push_ids(ids)
+                    train_written += len(ids)
+                    pbar_train.update(len(ids))
+
+    # flush any remaining text batches
+    for batch, is_tool in [(tool_batch, True), (synth_batch, False)]:
+        items = flush_text_batch(batch)
+        for ids in items:
+            if train_written >= args.target_train_tokens and val_written >= args.target_val_tokens:
+                break
+            text_for_hash = tok.decode(ids[: min(len(ids), 2048)])
+            split = assign_split_text(text_for_hash, args.val_percent)
+            if split == "val" and val_written < args.target_val_tokens:
+                val_out.push_ids(ids)
+                val_written += len(ids)
+                pbar_val.update(len(ids))
+            elif train_written < args.target_train_tokens:
+                train_out.push_ids(ids)
+                train_written += len(ids)
+                pbar_train.update(len(ids))
+
+    train_out.finalize()
+    val_out.finalize()
+    pbar_train.close()
+    pbar_val.close()
+
+    print("✅ toolprep_clean complete:")
+    print(f"  train tokens: {train_written:,}")
+    print(f"  val tokens:   {val_written:,}")
+    print(f"  out_dir:      {args.out_dir}")
 
 
 if __name__ == "__main__":

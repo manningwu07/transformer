@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
 import queue
@@ -7,7 +8,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Iterator, Optional, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 from datasets import load_dataset
@@ -16,7 +17,7 @@ from tqdm import tqdm
 
 
 # ----------------------------
-# Fast shard writer (no Python list)
+# Fast writer (numpy buffer)
 # ----------------------------
 @dataclass
 class BinShardWriterFast:
@@ -46,11 +47,6 @@ class BinShardWriterFast:
         if not ids:
             return
         arr = np.asarray(ids, dtype=self.dtype)
-        self.push_arr(arr)
-
-    def push_arr(self, arr: np.ndarray) -> None:
-        if arr.size == 0:
-            return
         i = 0
         while i < arr.size:
             space = self.shard_size - self._pos
@@ -70,16 +66,15 @@ class BinShardWriterFast:
 
 
 # ----------------------------
-# Nonblocking prefetch iterator (HF streaming can stall)
+# Prefetch (HF streaming can stall)
 # ----------------------------
 class PrefetchIter:
-    def __init__(self, name: str, it: Iterator[str], max_buffer: int = 32):
+    def __init__(self, name: str, it: Iterator[str], max_buffer: int = 64):
         self.name = name
         self._it = it
         self._q: queue.Queue[Optional[str]] = queue.Queue(maxsize=max_buffer)
         self._done = threading.Event()
         self._err: Optional[BaseException] = None
-
         t = threading.Thread(target=self._worker, daemon=True)
         t.start()
 
@@ -117,9 +112,7 @@ def interleave_nonblocking(
     seed: int,
     idle_sleep_sec: float = 0.01,
 ) -> Iterator[str]:
-    assert len(sources) == len(probs)
     rng = random.Random(seed)
-
     while any(s.alive() for s in sources):
         available: list[int] = []
         weights: list[float] = []
@@ -130,11 +123,9 @@ def interleave_nonblocking(
                 continue
             available.append(i)
             weights.append(probs[i])
-
         if not available:
             time.sleep(idle_sleep_sec)
             continue
-
         idx = rng.choices(available, weights=weights, k=1)[0]
         item = sources[idx].try_get()
         if item is None:
@@ -145,7 +136,7 @@ def interleave_nonblocking(
 
 
 # ----------------------------
-# HF loading (defensive across versions)
+# HF loader
 # ----------------------------
 def _hf_token_from_env(explicit: Optional[str]) -> Optional[str]:
     if explicit:
@@ -164,18 +155,15 @@ def load_dataset_streaming(
     token: Optional[str],
     revision: Optional[str] = None,
 ):
-    if split == "val":
-       split = "train"
+    # IMPORTANT: do not map val->train here. Use hash split.
     kwargs = {"split": split, "streaming": True}
     if revision is not None:
         kwargs["revision"] = revision
 
     args = (name, config) if config is not None else (name,)
-
     if token and not os.getenv("HF_TOKEN"):
         os.environ["HF_TOKEN"] = token
 
-    # datasets has historically accepted token=... or use_auth_token=...
     if token:
         try:
             ds = load_dataset(*args, token=token, **kwargs)
@@ -188,29 +176,31 @@ def load_dataset_streaming(
 
 
 # ----------------------------
-# Formatting + synthetic hard-dependency episodes
+# Split + formatting
 # ----------------------------
+def assign_split(text: str, val_percent: float) -> str:
+    h = hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
+    x = int.from_bytes(h, "little") % 10_000
+    return "val" if x < int(val_percent * 100) else "train"
+
+
 def format_chatml(user: str, assistant: str) -> str:
     return f"<|user|>\n{user}\n<|assistant|>\n{assistant}\n"
 
 
-def _safe_strip(s) -> str:
-    return (s or "").strip() if isinstance(s, str) else ""
+def _safe_strip(x: Any) -> str:
+    return (x or "").strip() if isinstance(x, str) else ""
 
 
+# ----------------------------
+# Synthetic hard-dependency episodes
+# ----------------------------
 def make_kv_retrieval_episode(
     tok: Tokenizer,
     rng: random.Random,
-    *,
     min_tokens: int,
     max_tokens: int,
 ) -> str:
-    """
-    Generates a long "needle / dependency" episode:
-      - huge key/value log with chained references
-      - question at the end depends on early keys
-    This is deliberately position-sensitive training data for 8k+.
-    """
     header = (
         "You are given a long log of variable assignments.\n"
         "Rules:\n"
@@ -219,13 +209,12 @@ def make_kv_retrieval_episode(
         "LOG BEGIN\n"
     )
     footer_tpl = "\nLOG END\n\nQuestion: What is {query_key}?\nAnswer with just the integer."
-    # Build progressively until token length hits target.
+
     target = rng.randint(min_tokens, max_tokens)
     n_vars = 0
     values: dict[str, int] = {}
     lines: list[str] = []
 
-    # Seed a few base vars early (so query depends on early positions)
     for _ in range(64):
         k = f"VAR_{n_vars:06d}"
         v = rng.randint(-10_000_000, 10_000_000)
@@ -233,11 +222,9 @@ def make_kv_retrieval_episode(
         lines.append(f"{k} = {v}")
         n_vars += 1
 
-    # Choose an eventual query that depends on early vars (chain later)
     query_key = f"VAR_{rng.randint(0, 32):06d}"
-    # Now extend log with long chains that reference earlier keys.
+
     while True:
-        # Create a mix of direct and referenced assignments.
         if rng.random() < 0.65:
             src = f"VAR_{rng.randint(0, n_vars - 1):06d}"
             dst = f"VAR_{n_vars:06d}"
@@ -252,22 +239,17 @@ def make_kv_retrieval_episode(
             lines.append(f"{dst} = {v}")
             n_vars += 1
 
-        # Make the query key drift later in the log via reassignment chains.
         if rng.random() < 0.35:
-            # redefine query_key based on something old
             src = f"VAR_{rng.randint(0, min(n_vars - 1, 128)):06d}"
             delta = rng.randint(-9999, 9999)
             values[query_key] = values[src] + delta
             lines.append(f"{query_key} = {src} + {delta}")
 
-        # Check token length occasionally.
         if len(lines) % 128 == 0:
             body = "\n".join(lines)
-            text = header + body + footer_tpl.format(query_key=query_key)
-            n_tok = len(tok.encode(text).ids)
-            if n_tok >= target:
-                answer = str(values[query_key])
-                return format_chatml(text, answer)
+            user = header + body + footer_tpl.format(query_key=query_key)
+            if len(tok.encode(user).ids) >= target:
+                return format_chatml(user, str(values[query_key]))
 
 
 def harddeps_synth_iter(
@@ -278,43 +260,36 @@ def harddeps_synth_iter(
 ) -> Iterator[str]:
     rng = random.Random(seed)
     while True:
-        yield make_kv_retrieval_episode(
-            tok,
-            rng,
-            min_tokens=min_tokens,
-            max_tokens=max_tokens,
-        )
+        yield make_kv_retrieval_episode(tok, rng, min_tokens, max_tokens)
 
 
 # ----------------------------
-# Real sources
+# Real sources (streaming train only; split by hash)
 # ----------------------------
-def arxiv_summarization_iter(hf_token: Optional[str], split: str) -> Iterator[str]:
-    hf_split = "validation" if split == "val" else split
+def arxiv_iter(hf_token: Optional[str]) -> Iterator[str]:
     ds = load_dataset_streaming(
         "ccdv/arxiv-summarization",
         config=None,
-        split=hf_split,
+        split="train",
         token=hf_token,
     )
     for ex in ds:
-        article = _safe_strip(ex.get("article", ""))
-        abstract = _safe_strip(ex.get("abstract", ""))
-        if not article or not abstract:
-            continue
-        user = (
-            "Summarize the following paper into a concise abstract.\n\n"
-            f"<paper>\n{article}\n</paper>\n"
-        )
-        yield format_chatml(user, abstract)
+        article = _safe_strip(ex.get("article"))
+        abstract = _safe_strip(ex.get("abstract"))
+        if article and abstract:
+            user = (
+                "Summarize the following paper into a concise abstract.\n\n"
+                f"<paper>\n{article}\n</paper>\n"
+            )
+            yield format_chatml(user, abstract)
 
 
-def stack_edu_iter(hf_token: Optional[str], split: str, configs: List[str]) -> Iterator[str]:
+def stack_edu_iter(hf_token: Optional[str], configs: List[str]) -> Iterator[str]:
     for cfg in configs:
         ds = load_dataset_streaming(
             "HuggingFaceTB/stack-edu",
             config=cfg,
-            split=split,
+            split="train",
             token=hf_token,
         )
         for ex in ds:
@@ -324,206 +299,161 @@ def stack_edu_iter(hf_token: Optional[str], split: str, configs: List[str]) -> I
                 yield t
 
 
-def finemath_iter(hf_token: Optional[str], split: str) -> Iterator[str]:
+def finemath_iter(hf_token: Optional[str], config: str) -> Iterator[str]:
     ds = load_dataset_streaming(
         "HuggingFaceTB/finemath",
-        config="finemath-3plus",
-        split=split,
+        config=config,
+        split="train",
         token=hf_token,
     )
     for ex in ds:
-        t = _safe_strip(ex.get("text", ""))
+        t = _safe_strip(ex.get("text"))
         if t:
             yield t
 
 
 # ----------------------------
-# Encoding loop
+# Encode to both splits (single pass + saturating targets)
 # ----------------------------
-def encode_text_stream_to_bin(
+def encode_stream_to_both_splits(
     text_iter: Iterator[str],
     tok: Tokenizer,
     eos_id: int,
-    out: BinShardWriterFast,
-    target_tokens: int,
+    train_out: BinShardWriterFast,
+    val_out: BinShardWriterFast,
+    target_train_tokens: int,
+    target_val_tokens: int,
+    val_percent: float,
     encode_batch_size: int,
-    flush_interval_sec: float,
     min_item_tokens: int,
+    max_item_tokens: int,
+    dedup_capacity: int,
     desc: str,
-) -> int:
-    pbar = tqdm(total=target_tokens, unit="tok", desc=desc)
-    written = 0
-    batch: List[str] = []
-    last_flush_t = time.time()
+) -> Tuple[int, int]:
+    pbar_train = tqdm(total=target_train_tokens, unit="tok", desc=f"{desc} (train)")
+    pbar_val = tqdm(total=target_val_tokens, unit="tok", desc=f"{desc} (val)")
 
-    def flush(batch_texts: List[str]) -> None:
-        nonlocal written
-        encs = tok.encode_batch(batch_texts)
+    train_written = 0
+    val_written = 0
+    train_batch: List[str] = []
+    val_batch: List[str] = []
+
+    seen: set[str] = set()
+    seen_added = 0
+
+    def keep(text: str) -> bool:
+        nonlocal seen, seen_added
+        h = hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+        if h in seen:
+            return False
+        seen.add(h)
+        seen_added += 1
+        if seen_added >= dedup_capacity:
+            seen = set()
+            seen_added = 0
+        return True
+
+    def process_ids(ids: List[int], is_val: bool) -> int:
+        if not ids:
+            return 0
+        if ids[-1] != eos_id:
+            ids.append(eos_id)
+        if min_item_tokens > 0 and len(ids) < min_item_tokens:
+            return 0
+        if max_item_tokens > 0 and len(ids) > max_item_tokens:
+            ids = ids[:max_item_tokens]
+            ids[-1] = eos_id
+        if is_val:
+            val_out.push_ids(ids)
+        else:
+            train_out.push_ids(ids)
+        return len(ids)
+
+    def flush(batch: List[str], is_val: bool) -> int:
+        if not batch:
+            return 0
+        encs = tok.encode_batch(batch)
+        total = 0
         for enc in encs:
-            ids = enc.ids
-            if not ids:
-                continue
-            if ids[-1] != eos_id:
-                ids.append(eos_id)
-            if min_item_tokens > 0 and len(ids) < min_item_tokens:
-                continue
-            out.push_ids(ids)
-            written += len(ids)
-            pbar.update(len(ids))
-            if written >= target_tokens:
-                return
+            total += process_ids(enc.ids, is_val)
+        return total
 
     for t in text_iter:
+        if train_written >= target_train_tokens and val_written >= target_val_tokens:
+            break
         t = (t or "").strip()
-        if not t:
+        if not t or not keep(t):
             continue
-        batch.append(t)
-        now = time.time()
-        if len(batch) >= encode_batch_size or (now - last_flush_t) >= flush_interval_sec:
-            flush(batch)
-            batch = []
-            last_flush_t = now
-            if written >= target_tokens:
-                break
 
-    if batch and written < target_tokens:
-        flush(batch)
+        if train_written < target_train_tokens and val_written < target_val_tokens:
+            split = assign_split(t, val_percent)
+            (val_batch if split == "val" else train_batch).append(t)
+        elif val_written < target_val_tokens:
+            val_batch.append(t)
+        elif train_written < target_train_tokens:
+            train_batch.append(t)
 
-    pbar.close()
-    return written
+        if len(train_batch) >= encode_batch_size:
+            added = flush(train_batch, is_val=False)
+            train_written += added
+            pbar_train.update(added)
+            train_batch = []
 
+        if len(val_batch) >= encode_batch_size:
+            added = flush(val_batch, is_val=True)
+            val_written += added
+            pbar_val.update(added)
+            val_batch = []
 
-def build_split(
-    *,
-    split: str,
-    tok: Tokenizer,
-    eos_id: int,
-    out_dir: str,
-    shard_size: int,
-    dtype: np.dtype,
-    target_tokens: int,
-    seed: int,
-    hf_token: Optional[str],
-    prefetch_buffer: int,
-    encode_batch_size: int,
-    flush_interval_sec: float,
-    min_item_tokens: int,
-    # source toggles
-    use_synth_harddeps: bool,
-    use_arxiv: bool,
-    use_stack_edu: bool,
-    use_finemath: bool,
-    stack_edu_configs: List[str],
-    # weights
-    w_synth: float,
-    w_arxiv: float,
-    w_stack: float,
-    w_finemath: float,
-    synth_min_tokens: int,
-    synth_max_tokens: int,
-) -> int:
-    out = BinShardWriterFast(
-        out_dir=os.path.join(out_dir, split),
-        prefix=f"phase3-longctx-hard-{split}",
-        shard_size=shard_size,
-        dtype=dtype,
-    )
+    if train_batch and train_written < target_train_tokens:
+        added = flush(train_batch, is_val=False)
+        train_written += added
+        pbar_train.update(added)
 
-    text_sources: list[Iterator[str]] = []
-    probs: list[float] = []
+    if val_batch and val_written < target_val_tokens:
+        added = flush(val_batch, is_val=True)
+        val_written += added
+        pbar_val.update(added)
 
-    if use_synth_harddeps:
-        text_sources.append(
-            harddeps_synth_iter(
-                tok,
-                seed=seed + 123,
-                min_tokens=synth_min_tokens,
-                max_tokens=synth_max_tokens,
-            )
-        )
-        probs.append(w_synth)
-
-    if use_arxiv:
-        text_sources.append(arxiv_summarization_iter(hf_token, split=split))
-        probs.append(w_arxiv)
-
-    if use_stack_edu:
-        text_sources.append(stack_edu_iter(hf_token, split=split, configs=stack_edu_configs))
-        probs.append(w_stack)
-
-    if use_finemath:
-        text_sources.append(finemath_iter(hf_token, split=split))
-        probs.append(w_finemath)
-
-    if not text_sources:
-        raise ValueError("No sources enabled.")
-
-    total = sum(probs)
-    probs = [p / max(1e-12, total) for p in probs]
-
-    prefetch = [
-        PrefetchIter(name=f"{split}_{i}", it=it, max_buffer=prefetch_buffer)
-        for i, it in enumerate(text_sources)
-    ]
-    mixed = interleave_nonblocking(prefetch, probs=probs, seed=seed)
-
-    wrote = encode_text_stream_to_bin(
-        text_iter=mixed,
-        tok=tok,
-        eos_id=eos_id,
-        out=out,
-        target_tokens=target_tokens,
-        encode_batch_size=encode_batch_size,
-        flush_interval_sec=flush_interval_sec,
-        min_item_tokens=min_item_tokens,
-        desc=f"Phase3 LongCtx HardDeps ({split})",
-    )
-    out.finalize()
-    return wrote
+    pbar_train.close()
+    pbar_val.close()
+    return train_written, val_written
 
 
 def main():
     ap = argparse.ArgumentParser()
 
     ap.add_argument("--tokenizer", type=str, default="data/json/tokenizer_32k.json")
-    ap.add_argument("--out_dir", type=str, default="data/shards/phase3_longctx_hard")
+    ap.add_argument("--out_dir", type=str, default="data/shards/longctx_hard_clean")
     ap.add_argument("--hf_token", type=str, default=None)
 
     ap.add_argument("--seed", type=int, default=1337)
-    ap.add_argument("--prefetch_buffer", type=int, default=32)
-    ap.add_argument("--encode_batch_size", type=int, default=6)
-    ap.add_argument("--flush_interval_sec", type=float, default=2.0)
+    ap.add_argument("--val_percent", type=float, default=2.0)
+
+    ap.add_argument("--prefetch_buffer", type=int, default=64)
+    ap.add_argument("--encode_batch_size", type=int, default=8)
 
     ap.add_argument("--bin_shard_size", type=int, default=100_000_000)
     ap.add_argument("--target_train_tokens", type=int, default=350_000_000)
     ap.add_argument("--target_val_tokens", type=int, default=25_000_000)
 
-    ap.add_argument(
-        "--min_item_tokens",
-        type=int,
-        default=2048,
-        help="Drop items shorter than this (forces long-context exposure).",
-    )
+    ap.add_argument("--min_item_tokens", type=int, default=2048)
+    ap.add_argument("--max_item_tokens", type=int, default=0, help="0 = no truncation")
+    ap.add_argument("--dedup_capacity", type=int, default=300_000)
 
-    # sources
     ap.add_argument("--use_synth_harddeps", action="store_true")
     ap.add_argument("--use_arxiv", action="store_true")
     ap.add_argument("--use_stack_edu", action="store_true")
     ap.add_argument("--use_finemath", action="store_true")
 
-    ap.add_argument(
-        "--stack_edu_configs",
-        type=str,
-        default="Python,Cpp,Go,JavaScript,Rust",
-    )
+    ap.add_argument("--finemath_config", type=str, default="finemath-3plus")
+    ap.add_argument("--stack_edu_configs", type=str, default="Cpp,Go,JavaScript,Rust,TypeScript")
 
-    # weights
     ap.add_argument("--w_synth", type=float, default=0.40)
     ap.add_argument("--w_arxiv", type=float, default=0.30)
     ap.add_argument("--w_stack", type=float, default=0.20)
     ap.add_argument("--w_finemath", type=float, default=0.10)
 
-    # synth episode sizing (token-count in a single sample)
     ap.add_argument("--synth_min_tokens", type=int, default=6500)
     ap.add_argument("--synth_max_tokens", type=int, default=9000)
 
@@ -533,85 +463,83 @@ def main():
     tok = Tokenizer.from_file(args.tokenizer)
     eos_id = tok.token_to_id("<|endoftext|>")
     if eos_id is None:
-        raise ValueError("Tokenizer is missing <|endoftext|> token.")
-    dtype = np.uint16 if tok.get_vocab_size() <= 65536 else np.uint32
+        raise ValueError("Tokenizer missing <|endoftext|>")
 
+    dtype = np.uint16 if tok.get_vocab_size() <= 65536 else np.uint32
     stack_cfgs = [c.strip() for c in args.stack_edu_configs.split(",") if c.strip()]
 
-    # Sensible defaults if you forget flags: enable the “hard” sources
-    use_synth = bool(args.use_synth_harddeps or True)
-    use_arxiv = bool(args.use_arxiv or True)
-    use_stack = bool(args.use_stack_edu or True)
-    use_finemath = bool(args.use_finemath or True)
+    # If user did not specify any --use_* flags, enable all by default.
+    if not (args.use_synth_harddeps or args.use_arxiv or args.use_stack_edu or args.use_finemath):
+        use_synth = use_arxiv = use_stack = use_finemath = True
+    else:
+        use_synth = args.use_synth_harddeps
+        use_arxiv = args.use_arxiv
+        use_stack = args.use_stack_edu
+        use_finemath = args.use_finemath
 
-    print("Phase3 LongCtx HardDeps:")
-    print(f"  out_dir: {args.out_dir}")
-    print(f"  dtype:   {dtype}")
-    print(
-        "  sources:",
-        f"synth={int(use_synth)} arxiv={int(use_arxiv)} "
-        f"stack={int(use_stack)} finemath={int(use_finemath)}",
-    )
-    print(
-        "  weights:",
-        f"synth={args.w_synth} arxiv={args.w_arxiv} "
-        f"stack={args.w_stack} finemath={args.w_finemath}",
-    )
+    sources: List[Iterator[str]] = []
+    probs: List[float] = []
 
-    wrote_train = build_split(
-        split="train",
-        tok=tok,
-        eos_id=eos_id,
-        out_dir=args.out_dir,
+    if use_synth:
+        sources.append(
+            harddeps_synth_iter(tok, seed=args.seed + 123, min_tokens=args.synth_min_tokens, max_tokens=args.synth_max_tokens)
+        )
+        probs.append(args.w_synth)
+    if use_arxiv:
+        sources.append(arxiv_iter(hf_token))
+        probs.append(args.w_arxiv)
+    if use_stack:
+        sources.append(stack_edu_iter(hf_token, stack_cfgs))
+        probs.append(args.w_stack)
+    if use_finemath:
+        sources.append(finemath_iter(hf_token, args.finemath_config))
+        probs.append(args.w_finemath)
+
+    if not sources:
+        raise ValueError("No sources enabled.")
+
+    total = sum(probs)
+    probs = [p / max(1e-12, total) for p in probs]
+
+    prefetch = [
+        PrefetchIter(name=f"src_{i}", it=it, max_buffer=args.prefetch_buffer)
+        for i, it in enumerate(sources)
+    ]
+    mixed = interleave_nonblocking(prefetch, probs=probs, seed=args.seed)
+
+    train_out = BinShardWriterFast(
+        out_dir=os.path.join(args.out_dir, "train"),
+        prefix="longctx-hard-train",
         shard_size=args.bin_shard_size,
         dtype=dtype,
-        target_tokens=args.target_train_tokens,
-        seed=args.seed,
-        hf_token=hf_token,
-        prefetch_buffer=args.prefetch_buffer,
+    )
+    val_out = BinShardWriterFast(
+        out_dir=os.path.join(args.out_dir, "val"),
+        prefix="longctx-hard-val",
+        shard_size=args.bin_shard_size,
+        dtype=dtype,
+    )
+
+    wrote_train, wrote_val = encode_stream_to_both_splits(
+        text_iter=mixed,
+        tok=tok,
+        eos_id=eos_id,
+        train_out=train_out,
+        val_out=val_out,
+        target_train_tokens=args.target_train_tokens,
+        target_val_tokens=args.target_val_tokens,
+        val_percent=args.val_percent,
         encode_batch_size=args.encode_batch_size,
-        flush_interval_sec=args.flush_interval_sec,
         min_item_tokens=args.min_item_tokens,
-        use_synth_harddeps=use_synth,
-        use_arxiv=use_arxiv,
-        use_stack_edu=use_stack,
-        use_finemath=use_finemath,
-        stack_edu_configs=stack_cfgs,
-        w_synth=args.w_synth,
-        w_arxiv=args.w_arxiv,
-        w_stack=args.w_stack,
-        w_finemath=args.w_finemath,
-        synth_min_tokens=args.synth_min_tokens,
-        synth_max_tokens=args.synth_max_tokens,
-    )
-    wrote_val = build_split(
-        split="val",
-        tok=tok,
-        eos_id=eos_id,
-        out_dir=args.out_dir,
-        shard_size=args.bin_shard_size,
-        dtype=dtype,
-        target_tokens=args.target_val_tokens,
-        seed=args.seed + 999,
-        hf_token=hf_token,
-        prefetch_buffer=args.prefetch_buffer,
-        encode_batch_size=max(1, args.encode_batch_size // 2),
-        flush_interval_sec=args.flush_interval_sec,
-        min_item_tokens=args.min_item_tokens,
-        use_synth_harddeps=use_synth,
-        use_arxiv=use_arxiv,
-        use_stack_edu=use_stack,
-        use_finemath=use_finemath,
-        stack_edu_configs=stack_cfgs,
-        w_synth=args.w_synth,
-        w_arxiv=args.w_arxiv,
-        w_stack=args.w_stack,
-        w_finemath=args.w_finemath,
-        synth_min_tokens=args.synth_min_tokens,
-        synth_max_tokens=args.synth_max_tokens,
+        max_item_tokens=args.max_item_tokens,
+        dedup_capacity=args.dedup_capacity,
+        desc="LongCtx Hard (clean)",
     )
 
-    print("✅ Phase3 LongCtx HardDeps complete:")
+    train_out.finalize()
+    val_out.finalize()
+
+    print("✅ longctx_hard_clean complete:")
     print(f"  train tokens: {wrote_train:,}")
     print(f"  val tokens:   {wrote_val:,}")
     print(f"  out_dir:      {args.out_dir}")

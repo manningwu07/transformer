@@ -1,4 +1,7 @@
 # CLI.py
+
+# Make sure to increase mem block alloc to decrease num of allocs during generation:
+# export PYTORCH_ALLOC_CONF="expandable_segments:True,garbage_collection_threshold:0.9"
 import argparse
 import os
 import sys
@@ -13,10 +16,6 @@ from params import Config
 from transformer import LLM
 
 
-def _cuda_events_available() -> bool:
-    return torch.cuda.is_available() and torch.cuda.is_initialized()
-
-
 @dataclass
 class GenParams:
     max_new_tokens: int = 256
@@ -29,12 +28,6 @@ class GenParams:
 
 
 def pretty_piece(text: str) -> str:
-    """
-    Your tokenizer appears to use GPT2/RoBERTa-style markers:
-      - 'Ġ' for "leading space"
-      - 'Ċ' for newline
-    Some SentencePiece tokenizers use '▁' for space.
-    """
     if not text:
         return text
     return (
@@ -45,13 +38,11 @@ def pretty_piece(text: str) -> str:
     )
 
 
-def load_model(ckpt_path: str, device: torch.device) -> LLM:
+def load_model(ckpt_path: str, device: torch.device, compile_model: bool = True) -> LLM:
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    # Ensure inference doesn’t accidentally trigger train-time toggles
     Config.use_float8 = False
-    Config.compile_mode = "none"
     Config.gradient_checkpointing = False
 
     model = LLM(Config).to(device)
@@ -59,7 +50,6 @@ def load_model(ckpt_path: str, device: torch.device) -> LLM:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("model", ckpt)
 
-    # Strip torch.compile prefix if present
     fixed = {}
     for k, v in state_dict.items():
         if k.startswith("_orig_mod."):
@@ -68,7 +58,58 @@ def load_model(ckpt_path: str, device: torch.device) -> LLM:
 
     model.load_state_dict(fixed, strict=True)
     model.eval()
+
+    if compile_model and torch.cuda.is_available():
+        print("Compiling model with torch.compile (reduce-overhead)...")
+        model = torch.compile(model, mode="reduce-overhead", fullgraph=False)
+
     return model
+
+
+class StaticKVCache:
+    """Pre-allocated KV cache to avoid per-token allocations."""
+
+    def __init__(
+        self,
+        num_layers: int,
+        max_seq_len: int,
+        num_heads: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
+    ):
+        self.num_layers = num_layers
+        self.max_seq_len = max_seq_len
+        self.pos = 0
+
+        # Shape: [layers, 2, 1, max_seq, heads, head_dim]
+        self.cache = torch.zeros(
+            (num_layers, 2, 1, max_seq_len, num_heads, head_dim),
+            device=device,
+            dtype=dtype,
+        )
+
+    def reset(self):
+        self.pos = 0
+
+    def update(self, layer_idx: int, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        k, v: [batch, seq_len, heads, head_dim]
+        Returns full k, v up to current position.
+        """
+        seq_len = k.size(1)
+        end_pos = self.pos + seq_len
+
+        self.cache[layer_idx, 0, :, self.pos:end_pos] = k
+        self.cache[layer_idx, 1, :, self.pos:end_pos] = v
+
+        return (
+            self.cache[layer_idx, 0, :, :end_pos],
+            self.cache[layer_idx, 1, :, :end_pos],
+        )
+
+    def advance(self, seq_len: int):
+        self.pos += seq_len
 
 
 @torch.no_grad()
@@ -78,12 +119,6 @@ def forward_with_kv_cache(
     kv_cache: Optional[List[Optional[dict]]],
     use_cache: bool,
 ) -> Tuple[torch.Tensor, Optional[List[Optional[dict]]]]:
-    """
-    IMPORTANT:
-    Your current LLM.forward() ignores kv_cache/use_cache and always calls
-    forward_no_cache() on each layer, so generation loses context and “cache”
-    doesn’t work. This function runs the blocks with KV caching properly.
-    """
     x = model.tok_embeddings(idx)
 
     new_caches: Optional[List[Optional[dict]]] = [] if use_cache else None
@@ -102,63 +137,114 @@ def forward_with_kv_cache(
     return logits, new_caches
 
 
-def sample_next_token(
-    logits: torch.Tensor,
-    generated: List[int],
-    params: GenParams,
-) -> int:
-    # logits: [1, vocab]
-    logits = logits.float()
+class TokenSampler:
+    """Vectorized sampler with pre-allocated tensors."""
 
-    # repetition penalty on a window (cheap + helps loops)
-    if params.repetition_penalty != 1.0 and generated:
-        window = generated[-params.repetition_window :]
-        uniq = set(window)
-        if uniq:
-            ids = torch.tensor(list(uniq), device=logits.device, dtype=torch.long)
-            vals = logits[0, ids]
-            pos = vals > 0
-            vals[pos] = vals[pos] / params.repetition_penalty
-            vals[~pos] = vals[~pos] * params.repetition_penalty
-            logits[0, ids] = vals
+    def __init__(self, vocab_size: int, device: torch.device):
+        self.vocab_size = vocab_size
+        self.device = device
+        # Pre-allocate penalty buffer
+        self.penalty_buf = torch.ones(vocab_size, device=device, dtype=torch.float32)
+        # Pre-allocate generated tokens buffer
+        self.generated = torch.zeros(8192, device=device, dtype=torch.long)
+        self.gen_len = 0
 
-    # greedy if temperature <= 0
-    if params.temperature <= 0:
-        return int(torch.argmax(logits, dim=-1).item())
+    def reset(self):
+        self.gen_len = 0
 
-    logits = logits / params.temperature
+    def add_token(self, token_id: int):
+        if self.gen_len < self.generated.size(0):
+            self.generated[self.gen_len] = token_id
+            self.gen_len += 1
 
-    # top-k
-    if params.top_k is not None and params.top_k > 0:
-        k = min(params.top_k, logits.size(-1))
-        thresh = torch.topk(logits, k, dim=-1).values[:, -1:]
-        logits = torch.where(logits < thresh, torch.full_like(logits, -float("inf")), logits)
+    def sample(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+        top_k: int,
+        top_p: float,
+        rep_penalty: float,
+        rep_window: int,
+    ) -> int:
+        logits = logits.float()
 
-    # top-p
-    if params.top_p is not None and params.top_p < 1.0:
-        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
-        sorted_probs = torch.softmax(sorted_logits, dim=-1)
-        cdf = torch.cumsum(sorted_probs, dim=-1)
+        # Vectorized repetition penalty
+        if rep_penalty != 1.0 and self.gen_len > 0:
+            window_start = max(0, self.gen_len - rep_window)
+            window = self.generated[window_start : self.gen_len]
+            unique_ids = torch.unique(window)
 
-        cut = cdf > params.top_p
-        cut[:, 1:] = cut[:, :-1].clone()
-        cut[:, 0] = False
+            self.penalty_buf.fill_(1.0)
+            self.penalty_buf[unique_ids] = rep_penalty
 
-        to_remove = cut.scatter(1, sorted_idx, cut)
-        logits = logits.masked_fill(to_remove, -float("inf"))
+            positive = logits[0] > 0
+            logits[0] = torch.where(
+                positive,
+                logits[0] / self.penalty_buf,
+                logits[0] * self.penalty_buf,
+            )
 
-    probs = torch.softmax(logits, dim=-1)
-    return int(torch.multinomial(probs, num_samples=1).item())
+        # Greedy
+        if temperature <= 0:
+            return int(torch.argmax(logits, dim=-1).item())
+
+        logits = logits / temperature
+
+        # Top-k
+        if top_k > 0:
+            k = min(top_k, logits.size(-1))
+            topk_vals, _ = torch.topk(logits, k, dim=-1)
+            thresh = topk_vals[:, -1:]
+            logits = torch.where(
+                logits < thresh,
+                torch.tensor(-float("inf"), device=logits.device),
+                logits,
+            )
+
+        # Top-p
+        if top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cdf = torch.cumsum(sorted_probs, dim=-1)
+
+            cut = cdf > top_p
+            cut[:, 1:] = cut[:, :-1].clone()
+            cut[:, 0] = False
+
+            to_remove = cut.scatter(1, sorted_idx, cut)
+            logits = logits.masked_fill(to_remove, -float("inf"))
+
+        probs = torch.softmax(logits, dim=-1)
+        return int(torch.multinomial(probs, num_samples=1).item())
 
 
-def now_wall() -> float:
-    return time.perf_counter()
+class OutputBuffer:
+    """Buffers output to reduce SSH flush overhead."""
 
+    def __init__(self, flush_interval: int = 4, flush_time_ms: float = 50.0):
+        self.buffer: List[str] = []
+        self.flush_interval = flush_interval
+        self.flush_time_ms = flush_time_ms
+        self.last_flush = time.perf_counter()
+        self.token_count = 0
 
-def cuda_ms(start_evt, end_evt) -> float:
-    end_evt.record()
-    torch.cuda.synchronize()
-    return start_evt.elapsed_time(end_evt)
+    def write(self, text: str):
+        self.buffer.append(text)
+        self.token_count += 1
+
+        now = time.perf_counter()
+        elapsed_ms = (now - self.last_flush) * 1000
+
+        if self.token_count >= self.flush_interval or elapsed_ms >= self.flush_time_ms:
+            self.flush()
+
+    def flush(self):
+        if self.buffer:
+            sys.stdout.write("".join(self.buffer))
+            sys.stdout.flush()
+            self.buffer.clear()
+            self.token_count = 0
+            self.last_flush = time.perf_counter()
 
 
 @torch.no_grad()
@@ -168,11 +254,11 @@ def generate_stream(
     prompt: str,
     params: GenParams,
     device: torch.device,
+    sampler: TokenSampler,
     bench: bool = False,
 ) -> dict:
     eos_id = tokenizer.token_to_id("<|endoftext|>")
     if eos_id is None:
-        # If missing, disable EOS stopping
         eos_id = -1
 
     prompt_ids = tokenizer.encode(prompt).ids
@@ -183,104 +269,102 @@ def generate_stream(
             "prefill_tps": 0.0,
             "decode_tps": 0.0,
             "wall_total_s": 0.0,
-            "gpu_total_s": None,
         }
 
     max_ctx = getattr(model, "max_seq_len", getattr(Config, "max_seq_len", 8192))
     if len(prompt_ids) > max_ctx:
         prompt_ids = prompt_ids[-max_ctx:]
 
-    # small speed knobs
     torch.set_float32_matmul_precision("high")
 
-    # timing setup
-    wall_t0 = now_wall()
-    gpu_total_ms = 0.0 if _cuda_events_available() else None
+    # Reset sampler state
+    sampler.reset()
 
-    # ---- Prefill (build cache on full prompt)
+    wall_t0 = time.perf_counter()
+
+    # Prefill
     idx = torch.tensor([prompt_ids], device=device, dtype=torch.long)
-
-    if _cuda_events_available():
-        pre_s = torch.cuda.Event(enable_timing=True)
-        pre_e = torch.cuda.Event(enable_timing=True)
-        pre_s.record()
 
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         logits, kv_cache = forward_with_kv_cache(
             model, idx=idx, kv_cache=None, use_cache=params.use_cache
         )
 
-    if _cuda_events_available():
-        pre_ms = cuda_ms(pre_s, pre_e)
-        gpu_total_ms += pre_ms
+    wall_after_prefill = time.perf_counter()
 
-    # ---- Decode tokens
-    generated: List[int] = []
-    printed = 0
-
-    # reuse a 1x1 tensor to avoid per-step allocations
+    # Decode
+    output_buf = OutputBuffer(flush_interval=4, flush_time_ms=50.0)
     one = torch.empty((1, 1), device=device, dtype=torch.long)
-
-    wall_after_prefill = now_wall()
-    first_token_wall: Optional[float] = None
-
-    # initial logits from prefill last position
     next_logits = logits[:, -1, :]
 
+    first_token_wall: Optional[float] = None
+    num_generated = 0
+
+    # Buffer for multi-token decoding
+    decode_buffer: List[int] = []
+
     for _ in range(int(params.max_new_tokens)):
-        next_id = sample_next_token(next_logits, generated, params)
+        next_id = sampler.sample(
+            next_logits,
+            params.temperature,
+            params.top_k,
+            params.top_p,
+            params.repetition_penalty,
+            params.repetition_window,
+        )
 
         if first_token_wall is None:
-            first_token_wall = now_wall()
+            first_token_wall = time.perf_counter()
 
         if next_id == eos_id:
             break
 
-        generated.append(next_id)
+        sampler.add_token(next_id)
+        num_generated += 1
 
-        # stream-print
+        # Buffered decoding for better multi-byte handling
         if not bench:
-            # decode one token and pretty it (fast + readable for Ġ/Ċ tokenizers)
-            piece = tokenizer.decode([next_id])
-            piece = pretty_piece(piece)
-            if piece:
-                sys.stdout.write(piece)
-                sys.stdout.flush()
-                printed += len(piece)
+            decode_buffer.append(next_id)
+            if len(decode_buffer) >= 3 or next_id in (198, 628):  # newline tokens
+                piece = tokenizer.decode(decode_buffer)
+                piece = pretty_piece(piece)
+                if piece:
+                    output_buf.write(piece)
+                decode_buffer.clear()
 
-        # forward one token with cache
         one[0, 0] = next_id
-
-        if _cuda_events_available():
-            dec_s = torch.cuda.Event(enable_timing=True)
-            dec_e = torch.cuda.Event(enable_timing=True)
-            dec_s.record()
 
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             logits, kv_cache = forward_with_kv_cache(
                 model, idx=one, kv_cache=kv_cache, use_cache=params.use_cache
             )
 
-        if _cuda_events_available():
-            dec_ms = cuda_ms(dec_s, dec_e)
-            gpu_total_ms += dec_ms
-
         next_logits = logits[:, -1, :]
 
-        # simple repetition-loop detector
-        if len(generated) >= 32:
-            a = generated[-32:-16]
-            b = generated[-16:]
-            if a == b:
+        # Repetition loop detection (on GPU tensor now)
+        if num_generated >= 32:
+            recent = sampler.generated[num_generated - 32 : num_generated]
+            if torch.equal(recent[:16], recent[16:]):
                 if not bench:
-                    sys.stdout.write("\n[stopped: repetition detected]\n")
-                    sys.stdout.flush()
+                    output_buf.write("\n[stopped: repetition detected]\n")
                 break
 
-    wall_t1 = now_wall()
+    # Flush remaining decode buffer
+    if not bench and decode_buffer:
+        piece = tokenizer.decode(decode_buffer)
+        piece = pretty_piece(piece)
+        if piece:
+            output_buf.write(piece)
+    
+    if not bench:
+        output_buf.flush()
 
-    # metrics
-    num_new = len(generated)
+    wall_t1 = time.perf_counter()
+
+    # Only sync for final timing
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
     wall_total = wall_t1 - wall_t0
     wall_prefill = wall_after_prefill - wall_t0
     wall_decode = wall_t1 - wall_after_prefill
@@ -290,22 +374,16 @@ def generate_stream(
         ttft_ms = (first_token_wall - wall_t0) * 1000.0
 
     prefill_tps = len(prompt_ids) / max(wall_prefill, 1e-9)
-    decode_tps = num_new / max(wall_decode, 1e-9)
+    decode_tps = num_generated / max(wall_decode, 1e-9)
 
-    out = {
+    return {
         "num_prompt_tokens": len(prompt_ids),
-        "num_new_tokens": num_new,
+        "num_new_tokens": num_generated,
         "ttft_ms": ttft_ms,
         "prefill_tps_wall": prefill_tps,
         "decode_tps_wall": decode_tps,
         "wall_total_s": wall_total,
     }
-
-    if gpu_total_ms is not None:
-        out["gpu_total_s"] = gpu_total_ms / 1000.0
-        out["decode_tps_gpu"] = num_new / max((gpu_total_ms / 1000.0) - (wall_prefill), 1e-9)
-
-    return out
 
 
 def main():
@@ -313,8 +391,9 @@ def main():
     ap.add_argument("--ckpt", type=str, default="models/phase-one-model.pt")
     ap.add_argument("--tokenizer", type=str, default="data/json/tokenizer.json")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--no-compile", action="store_true", help="Disable torch.compile")
 
-    ap.add_argument("--bench", action="store_true", help="Don’t stream text; just measure speed")
+    ap.add_argument("--bench", action="store_true", help="Don't stream text; just measure speed")
     ap.add_argument("--max_new", type=int, default=256)
     ap.add_argument("--temp", type=float, default=0.8)
     ap.add_argument("--topk", type=int, default=40)
@@ -330,10 +409,28 @@ def main():
     tokenizer = Tokenizer.from_file(args.tokenizer)
 
     print(f"Loading model: {args.ckpt}")
-    model = load_model(args.ckpt, device=device)
+    model = load_model(args.ckpt, device=device, compile_model=not args.no_compile)
 
-    print("\n=== 1B MLA MODEL - CLI INFERENCE ===")
+    # Get vocab size for sampler
+    vocab_size = tokenizer.get_vocab_size()
+    sampler = TokenSampler(vocab_size, device)
+
+    print("\n=== 1B MLA MODEL - CLI INFERENCE (OPTIMIZED) ===")
     print("Commands: /temp x | /topk k | /topp p | /rep r | /max n | /bench 0/1 | exit\n")
+
+    # Warmup pass (important for torch.compile)
+    if not args.no_compile and torch.cuda.is_available():
+        print("Warming up compiled model...")
+        _ = generate_stream(
+            model=model,
+            tokenizer=tokenizer,
+            prompt="Hello",
+            params=GenParams(max_new_tokens=8),
+            device=device,
+            sampler=sampler,
+            bench=True,
+        )
+        print("Warmup complete.\n")
 
     params = GenParams(
         max_new_tokens=int(args.max_new),
@@ -357,7 +454,6 @@ def main():
         if prompt.lower() in {"exit", "quit"}:
             return
 
-        # runtime commands
         if prompt.startswith("/"):
             parts = prompt.split()
             cmd = parts[0].lower()
@@ -396,6 +492,7 @@ def main():
             prompt=prompt,
             params=params,
             device=device,
+            sampler=sampler,
             bench=bench,
         )
         if not bench:
