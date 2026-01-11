@@ -33,6 +33,13 @@ def cleanup_gpu():
 
 atexit.register(cleanup_gpu)
 
+@torch.compiler.disable
+def safe_step(optimizer, scheduler):
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    scheduler.step()
+
+
 def main():
     
     def discover_val_buckets(val_dir: str):
@@ -61,8 +68,8 @@ def main():
         return buckets if buckets else {"val": val_dir}
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_dir", type=str, default="data/shards/phase2-warmup/train")
-    parser.add_argument("--val_dir", type=str, default="data/shards/phase2-warmup/val")
+    parser.add_argument("--train_dir", type=str, default="data/shards/phase2-final/train")
+    parser.add_argument("--val_dir", type=str, default="data/shards/phase2-final/val")
     parser.add_argument(
         "--val_metric",
         type=str,
@@ -308,26 +315,6 @@ def main():
 
     eager_model_for_val = get_eager_model(model)
 
-    def save_crash_and_exit():
-        client_state = {
-            "opt_step": int(opt_step),
-            "micro_step": int(micro_step),
-            "epoch": int(epoch),
-            "micro_step_in_epoch": int(micro_step_in_epoch),
-            "best_val_loss": float(best_val_loss),
-            "rng": get_rng_state(),
-        }
-        ckpt.save(
-            tag=f"interrupt_step_{opt_step}",
-            model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            client_state=client_state,
-            is_crash=True,
-        )
-        os.sync()
-
-    exiting = threading.Event()
     def save_current_state(tag, is_crash=False):
         """Helper to centralize saving logic"""
         if not is_main_process(): return
@@ -376,15 +363,7 @@ def main():
         else:
             # Ranks > 0 just exit quietly
             os._exit(0)
-        
-    def watchdog_handler(signum, frame):
-        print("⚠️ Watchdog triggered - forcing checkpoint save")
-        save_crash_and_exit()
-        os.killpg(os.getpgrp(), signal.SIGKILL)
-        sys.exit(1)
-
-    # Set alarm for 30 seconds per batch (adjust as needed)
-    signal.signal(signal.SIGALRM, watchdog_handler)
+    
     signal.signal(signal.SIGINT, handle_sigint)
     
     # Compiled autograd context manager
@@ -464,24 +443,31 @@ def main():
             is_boundary = (micro_step > 0 and micro_step % int(TrainCfg.grad_accum_steps) == 0)
             if is_boundary:
                 total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                norm_val = total_norm.item() if torch.is_tensor(total_norm) else total_norm
-                raw_loss = float(loss.detach().float().item())
-                loss_window.append(raw_loss)
+                loss_window.append(loss.detach())  # tensor on GPU
+                total_norm_t = total_norm.detach()
                 if len(loss_window) > 100: loss_window.pop(0)                
     
-                if not torch.isfinite(total_norm):
+                if torch.isfinite(total_norm):
+                    safe_step(optimizer, scheduler)
+                else:
                     print(f"⚠️ Skip step {opt_step}: Gradient norm is {total_norm.item()}")
                     optimizer.zero_grad(set_to_none=True)
                     continue
-                
-                optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                scheduler.step()
+
+                opt_step += 1
 
                 opt_step += 1
 
                 # 3. Log (Only on Boundary)
                 if opt_step % args.log_every_opt == 0 and is_main_process():
+                    # Sync ONCE for logging (this will pull all needed scalars)
+                    raw_loss = float(loss.detach().float().item())
+                    norm_val = float(total_norm_t.float().item())
+
+                    # If you want avg loss, compute it on GPU then item() once:
+                    lw = torch.stack([t.float() for t in loss_window[-100:]])
+                    avg = float(lw.mean().item())
+                    
                     end_compute_t = time.time()
                     dt = end_compute_t - last_log_t
                     
