@@ -24,7 +24,7 @@ def run_bench():
     print(f"🚀 Benchmarking Adafactor at scale: {M}x{N}")
 
     def get_data():
-        p = torch.randn((M, N), device=device, dtype=torch.bfloat16, requires_grad=True)
+        p = torch.randn((M, N), device=device, dtype=torch.bfloat16)
         g = torch.randn((M, N), device=device, dtype=torch.bfloat16)
         return p, g
 
@@ -69,11 +69,13 @@ def run_bench():
     # --- THE PARITY CHECK ---
     print("\n🧐 Verifying Numerical Parity (BF16)...")
     p_ref, g_ref = get_data()
-    p_new, _ = p_ref.clone(), g_ref.clone()
-    p_new.grad = g_ref
+    
+    p_new = p_ref.detach().clone().requires_grad_(True)
+    g_new = g_ref.clone()
+    p_new.grad = g_new
     p_ref.grad = g_ref
-
-    opt_ref = torch.optim.Adafactor([p_ref], lr=1e-3, relative_step=False)
+    
+    opt_ref = torch.optim.Adafactor([p_ref], lr=1e-3)
     opt_new = FusedAdafactor2Pass([p_new], lr=1e-3)
 
     opt_ref.step()
