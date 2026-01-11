@@ -197,7 +197,7 @@ def main():
         model = torch.compile(
             model,
             mode="max-autotune-no-cudagraphs",
-            fullgraph=True,      # No graph breaks
+            fullgraph=False,      # No graph breaks
             dynamic=False,        # Static shapes = faster compiled code
         )
         # 2. INSERT WARMUP PHASE HERE
