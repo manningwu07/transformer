@@ -1,7 +1,7 @@
 import torch
 import time
 import numpy as np
-from fused_adafactor import FusedAdafactor as LegacyAdafactor
+from bench.fused_adafactor import FusedAdafactor as LegacyAdafactor
 from fused_adafactor_2pass import FusedAdafactor2Pass
 
 # Mocking the torch.compile setup

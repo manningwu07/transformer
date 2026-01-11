@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 
-from fused_adafactor import FusedAdafactor
+from fused_adafactor_2pass import FusedAdafactor2Pass
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.expanduser("~/.inductor_cache")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
@@ -61,8 +61,8 @@ def main():
         return buckets if buckets else {"val": val_dir}
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_dir", type=str, default="data/shards/phase2-warmup/train")
-    parser.add_argument("--val_dir", type=str, default="data/shards/phase2-warmup/val")
+    parser.add_argument("--train_dir", type=str, default="data/shards/phase2-final/train")
+    parser.add_argument("--val_dir", type=str, default="data/shards/phase2-final/val")
     parser.add_argument(
         "--val_metric",
         type=str,
@@ -129,7 +129,7 @@ def main():
     model = LLM(Config).to(device)
 
     # === Optimizer / Scheduler ===
-    optimizer = FusedAdafactor(
+    optimizer = FusedAdafactor2Pass(
         model.parameters(),
         lr=float(TrainCfg.lr_start),
         eps=(1e-30, 1e-3),
