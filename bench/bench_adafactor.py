@@ -1,7 +1,7 @@
 import torch
 import time
 import numpy as np
-from bench.fused_adafactor import FusedAdafactor as LegacyAdafactor
+from fused_adafactor import FusedAdafactor as LegacyAdafactor
 from fused_adafactor_2pass import FusedAdafactor2Pass
 
 # Mocking the torch.compile setup
@@ -31,7 +31,7 @@ def run_bench():
     results = {}
 
     configs = [
-        ("Torch Eager (Native)", lambda p: torch.optim.Adafactor([p], lr=1e-3, relative_step=False)),
+        ("Torch Eager (Native)", lambda p: torch.optim.Adafactor([p], lr=1e-3)),
         ("Legacy Triton (3-Pass)", lambda p: LegacyAdafactor([p], lr=1e-3)),
         ("New Triton (2-Pass)", lambda p: FusedAdafactor2Pass([p], lr=1e-3)),
     ]

@@ -393,10 +393,11 @@ def main():
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ],
-        schedule=torch.profiler.schedule(wait=1, warmup=1, active=2, repeat=1),
+        # wait 2 steps, warmup 2 steps, active 4 steps
+        schedule=torch.profiler.schedule(wait=2, warmup=2, active=4, repeat=1),
         on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/profiler_results'),
         record_shapes=True,
-        profile_memory=True,  # Shows exactly which tensors are hogging VRAM
+        profile_memory=True,
         with_stack=True
     )
 
@@ -537,9 +538,8 @@ def main():
                             )
 
                     # 2. Advance Profiler
-                    prof.step()
                     last_log_t = time.time()
-
+            prof.step()
         except Exception as e:
             if is_main_process():
                 print(f"Crash: {e}")
