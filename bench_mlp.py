@@ -17,8 +17,8 @@ class BenchCfg:
     T: int = 2048
     d_model: int = 1792
     hidden: int = 4608
-    iters: int = 50
-    warmup: int = 10
+    iters: int = 100
+    warmup: int = 20
     device: str = "cuda"
     dtype: torch.dtype = torch.bfloat16
     compile_mode: str = "max-autotune-no-cudagraphs"  # or "default"
@@ -43,6 +43,7 @@ def clone_weights_ref_to_fused(ref: RefSwiGLU, fused: FusedSwiGLUMLP) -> None:
         fused.w2.copy_(ref.w2.weight.T.to(fused.w2.dtype))
         fused._fp8_dirty = True
 
+@torch.no_grad()
 def time_one(
     name: str,
     fn: Callable[[], torch.Tensor],
@@ -51,6 +52,8 @@ def time_one(
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.synchronize()
+    
+    torch._dynamo.reset()
 
     # Warmup
     for _ in range(cfg.warmup):
@@ -85,6 +88,18 @@ def maybe_compile(m: nn.Module, cfg: BenchCfg) -> nn.Module:
         dynamic=False,
     )
 
+def compile_and_warm(m: nn.Module, x: torch.Tensor, cfg: BenchCfg) -> nn.Module:
+    m_c = maybe_compile(m, cfg)
+    # Force compile outside timing
+    for _ in range(5):
+        m_c.zero_grad(set_to_none=True)
+        x.grad = None
+        with torch.autocast(device_type="cuda", dtype=cfg.dtype):
+            y = m_c(x)
+            loss = y.float().mean()
+        loss.backward()
+    torch.cuda.synchronize()
+    return m_c
 
 def main():
     cfg = BenchCfg(
@@ -137,7 +152,10 @@ def main():
         return loss
 
     # Compile models (optional)
-    ref_c = maybe_compile(ref, cfg)
+    # NOTE: compile outside the timed region
+    ref_c = compile_and_warm(ref, x, cfg)
+    # Compiling custom Triton autograd often gives no win and can break;
+    # keep fused eager for fair steady-state measurement.
     fused_c = fused
 
     def ref_c_step() -> torch.Tensor:
