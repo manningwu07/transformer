@@ -5,7 +5,6 @@ import torch.utils.checkpoint as ckpt
 import math
 from params import Config
 import inspect
-from fused_swiglu_mlp import FusedSwiGLUMLP
 
 USE_FUSED_CE = False
 _fused_ce = None
@@ -42,6 +41,17 @@ def apply_rope(x, cos, sin):
     y1 = x1 * cos - x2 * sin
     y2 = x1 * sin + x2 * cos
     return torch.cat([y1, y2], dim=-1)
+
+class SwiGLU_MLP(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.w1 = nn.Linear(args.d_model, args.hidden_size, bias=False)
+        self.w2 = nn.Linear(args.hidden_size, args.d_model, bias=False)
+        self.w3 = nn.Linear(args.d_model, args.hidden_size, bias=False)
+
+    def forward(self, x):
+        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+
 
 class MLA(nn.Module):
     """
@@ -209,11 +219,7 @@ class TransformerBlock(nn.Module):
         self.attn = MLA(args)
         self.norm2 = RMSNorm(args.d_model, eps=args.rms_norm_eps)
 
-        self.mlp = FusedSwiGLUMLP(
-            d_model=args.d_model,
-            hidden_size=args.hidden_size,
-            bias=False,
-        )
+        self.mlp = SwiGLU_MLP(args)
 
     def forward(self, x, kv_cache=None, use_cache=False, use_checkpoint=False):
         if use_checkpoint and self.training:
