@@ -138,7 +138,7 @@ def main():
 
     # Compile models (optional)
     ref_c = maybe_compile(ref, cfg)
-    fused_c = maybe_compile(fused, cfg)
+    fused_c = fused
 
     def ref_c_step() -> torch.Tensor:
         ref_c.zero_grad(set_to_none=True)

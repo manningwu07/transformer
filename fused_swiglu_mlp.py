@@ -40,7 +40,7 @@ from typing import Tuple, Optional
 # If you want max VRAM headroom, keep it 0.
 
 SAVE_GATE_UP = 1
-DOT_DTYPE = tl.float16
+DOT_DIM_TYPE = tl.float16
 
 # ============================================================================
 # FP8 Quantization Utilities
@@ -171,7 +171,7 @@ def _fused_gate_up_kernel(
             x_ptrs,
             mask=mask_m[:, None] & mask_k[None, :],
             other=0.0
-        ).to(DOT_DTYPE)
+        ).to(DOT_DIM_TYPE)
         
         # === Load W1 tile [BLOCK_K, BLOCK_N] ===
         w1_ptrs = W1_base + k_offs[:, None] * stride_w1k
@@ -191,16 +191,16 @@ def _fused_gate_up_kernel(
         
         # === Load row-wise scales [BLOCK_K] ===
         w1_scale = tl.load(W1_scale_ptr + k_offs, mask=mask_k, other=1.0).to(
-            DOT_DTYPE
+            DOT_DIM_TYPE
         )
         w3_scale = tl.load(W3_scale_ptr + k_offs, mask=mask_k, other=1.0).to(
-            DOT_DTYPE
+            DOT_DIM_TYPE
         )
         
         # === Dequantize FP8 -> BF16/FP16 for Tensor Cores ===
         # Accumulate in FP32, but DOT operands are FP16.
-        w1 = w1_tile_fp8.to(DOT_DTYPE) * w1_scale[:, None]
-        w3 = w3_tile_fp8.to(DOT_DTYPE) * w3_scale[:, None]
+        w1 = w1_tile_fp8.to(DOT_DIM_TYPE) * w1_scale[:, None]
+        w3 = w3_tile_fp8.to(DOT_DIM_TYPE) * w3_scale[:, None]
         
         # === Matrix multiply accumulate ===
         # Using tl.dot for tensor core utilization
@@ -291,7 +291,7 @@ def _down_proj_kernel(
             h_ptrs,
             mask=mask_m[:, None] & mask_k[None, :],
             other=0.0
-        ).to(DOT_DTYPE)
+        ).to(DOT_DIM_TYPE)
         
         # Load W2 tile [BLOCK_K, BLOCK_N]
         w2_ptrs = W2_base + k_offs[:, None] * stride_w2k
@@ -303,11 +303,11 @@ def _down_proj_kernel(
         
         # Load scales
         w2_scale = tl.load(W2_scale_ptr + k_offs, mask=mask_k, other=1.0).to(
-            DOT_DTYPE
+            DOT_DIM_TYPE
         )
         
         # Dequantize
-        w2 = w2_tile_fp8.to(DOT_DTYPE) * w2_scale[:, None]
+        w2 = w2_tile_fp8.to(DOT_DIM_TYPE) * w2_scale[:, None]
         
         # Accumulate
         acc = tl.dot(h_tile, w2, acc=acc)
@@ -432,21 +432,21 @@ def _gate_up_backward_dx_kernel(
         
         # Load scales and dequantize (broadcast over N)
         w1_scale = tl.load(W1_scale_ptr + offs_k, mask=mask_k, other=1.0).to(
-            DOT_DTYPE
+            DOT_DIM_TYPE
         )
         w3_scale = tl.load(W3_scale_ptr + offs_k, mask=mask_k, other=1.0).to(
-            DOT_DTYPE
+            DOT_DIM_TYPE
         )
         
         # Dequantize - note: scales are per K, weights are [N, K]
         # NOTE: weights are loaded as [N, K], scales are per K => scale[None, :]
-        w1_tile = w1_tile_fp8.to(DOT_DTYPE) * w1_scale[None, :]
-        w3_tile = w3_tile_fp8.to(DOT_DTYPE) * w3_scale[None, :]
+        w1_tile = w1_tile_fp8.to(DOT_DIM_TYPE) * w1_scale[None, :]
+        w3_tile = w3_tile_fp8.to(DOT_DIM_TYPE) * w3_scale[None, :]
         
         # Accumulate: dX += dGate @ W1.T + dUp @ W3.T
         # dGate: [M, N], W1.T: [N, K] -> [M, K]
-        dx_acc = tl.dot(dgate.to(DOT_DTYPE), w1_tile, acc=dx_acc)
-        dx_acc = tl.dot(dup.to(DOT_DTYPE), w3_tile, acc=dx_acc)
+        dx_acc = tl.dot(dgate.to(DOT_DIM_TYPE), w1_tile, acc=dx_acc)
+        dx_acc = tl.dot(dup.to(DOT_DIM_TYPE), w3_tile, acc=dx_acc)
     
     # Store dX
     dx_ptrs = dX_ptr + offs_m[:, None] * stride_dxm + offs_k[None, :] * stride_dxk
@@ -533,7 +533,7 @@ def _gate_up_backward_dw_kernel(
         
         # Load X.T: need X[m, k] -> access as [k, m] conceptually
         x_ptrs = X_ptr + m_offs[:, None] * stride_xm + offs_k[None, :] * stride_xk
-        x_tile = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(DOT_DTYPE)
+        x_tile = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(DOT_DIM_TYPE)
         
         # Load Gate, Up, dHidden
         gate_ptrs = Gate_ptr + m_offs[:, None] * stride_gm + offs_n[None, :] * stride_gn
@@ -557,8 +557,8 @@ def _gate_up_backward_dw_kernel(
         # We have x_tile as [M, K], need transpose
         x_t = tl.trans(x_tile)  # [BLOCK_K, BLOCK_M] fp16
         
-        dw1_acc = tl.dot(x_t, dgate.to(DOT_DTYPE), acc=dw1_acc)
-        dw3_acc = tl.dot(x_t, dup.to(DOT_DTYPE), acc=dw3_acc)
+        dw1_acc = tl.dot(x_t, dgate.to(DOT_DIM_TYPE), acc=dw1_acc)
+        dw3_acc = tl.dot(x_t, dup.to(DOT_DIM_TYPE), acc=dw3_acc)
     
     # Store weight gradients
     dw1_ptrs = dW1_ptr + offs_k[:, None] * stride_dw1k + offs_n[None, :] * stride_dw1n
@@ -621,7 +621,7 @@ def _down_proj_backward_dhidden_kernel(
         
         # Load dOut [BLOCK_M, BLOCK_N]
         do_ptrs = dOut_ptr + offs_m[:, None] * stride_dom + n_offs[None, :] * stride_don
-        do_tile = tl.load(do_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(DOT_DTYPE)
+        do_tile = tl.load(do_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(DOT_DIM_TYPE)
         
         # Load W2.T: W2[k, n] -> access [n, k]
         w2_ptrs = W2_ptr + n_offs[:, None] * stride_w2n + offs_k[None, :] * stride_w2k
@@ -629,9 +629,9 @@ def _down_proj_backward_dhidden_kernel(
         
         # Dequantize
         w2_scale = tl.load(W2_scale_ptr + offs_k, mask=mask_k, other=1.0).to(
-            DOT_DTYPE
+            DOT_DIM_TYPE
         )
-        w2_tile = w2_tile_fp8.to(DOT_DTYPE) * w2_scale[None, :]
+        w2_tile = w2_tile_fp8.to(DOT_DIM_TYPE) * w2_scale[None, :]
         
         # Accumulate
         acc = tl.dot(do_tile, w2_tile, acc=acc)
@@ -689,11 +689,11 @@ def _down_proj_backward_dw2_kernel(
         
         # Load Hidden [BLOCK_M, BLOCK_K]
         h_ptrs = Hidden_ptr + m_offs[:, None] * stride_hm + offs_k[None, :] * stride_hk
-        h_tile = tl.load(h_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(DOT_DTYPE)
+        h_tile = tl.load(h_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(DOT_DIM_TYPE)
         
         # Load dOut [BLOCK_M, BLOCK_N]
         do_ptrs = dOut_ptr + m_offs[:, None] * stride_dom + offs_n[None, :] * stride_don
-        do_tile = tl.load(do_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(DOT_DTYPE)
+        do_tile = tl.load(do_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(DOT_DIM_TYPE)
         
         # Accumulate: H.T @ dOut
         h_t = tl.trans(h_tile)  # fp16
@@ -824,16 +824,16 @@ def _fp8_mm_rowwise_kernel(
 
         x_ptrs = X_base + offs_k[None, :] * stride_xk
         x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(
-            DOT_DTYPE
+            DOT_DIM_TYPE
         )
 
         w_ptrs = W_base + offs_k[:, None] * stride_wk
         w_fp8 = tl.load(w_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
 
-        s = tl.load(W_scale_ptr + offs_k, mask=mask_k, other=1.0).to(DOT_DTYPE)
+        s = tl.load(W_scale_ptr + offs_k, mask=mask_k, other=1.0).to(DOT_DIM_TYPE)
 
         # weights are [K, N], scales per K => s[:, None]
-        w = w_fp8.to(DOT_DTYPE) * s[:, None]
+        w = w_fp8.to(DOT_DIM_TYPE) * s[:, None]
         acc += tl.dot(x, w, acc=acc)
 
     out_ptrs = Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
