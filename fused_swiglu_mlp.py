@@ -693,7 +693,7 @@ def _down_proj_backward_dw2_kernel(
         
         # Load dOut [BLOCK_M, BLOCK_N]
         do_ptrs = dOut_ptr + m_offs[:, None] * stride_dom + offs_n[None, :] * stride_don
-        do_tile = tl.load(do_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
+        do_tile = tl.load(do_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(DOT_DTYPE)
         
         # Accumulate: H.T @ dOut
         h_t = tl.trans(h_tile)  # fp16
@@ -969,7 +969,7 @@ class FusedSwiGLUMLPFunction(torch.autograd.Function):
             triton.cdiv(hidden_size, meta["BLOCK_K"]),
             triton.cdiv(N_out, meta["BLOCK_N"]),
         )
-        dW2 = dW2.to(dtype=w2.dtype)
+        
         _down_proj_backward_dw2_kernel[grid_dw2](
             hidden, grad_output_2d,
             dW2,
@@ -978,6 +978,8 @@ class FusedSwiGLUMLPFunction(torch.autograd.Function):
             grad_output_2d.stride(0), grad_output_2d.stride(1),
             dW2.stride(0), dW2.stride(1),
         )
+        
+        dW2 = dW2.to(dtype=w2.dtype)
         
         # === Recompute Gate and Up for backward ===
         if gate_saved.numel() > 0 and up_saved.numel() > 0:

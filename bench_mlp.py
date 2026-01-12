@@ -41,8 +41,7 @@ def clone_weights_ref_to_fused(ref: RefSwiGLU, fused: FusedSwiGLUMLP) -> None:
         fused.w1.copy_(ref.w1.weight.T.to(fused.w1.dtype))
         fused.w3.copy_(ref.w3.weight.T.to(fused.w3.dtype))
         fused.w2.copy_(ref.w2.weight.T.to(fused.w2.dtype))
-        fused.mark_fp8_dirty()
-
+        fused._fp8_dirty = True
 
 def time_one(
     name: str,
