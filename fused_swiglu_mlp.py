@@ -27,11 +27,20 @@ Register Budget (per thread, 128 threads/block):
 """
 
 import math
+import os
 import torch
 import triton
 import triton.language as tl
 from typing import Tuple, Optional
 
+# ============================================================================
+# Perf knobs
+# ============================================================================
+# If you want max TPS, set SAVE_GATE_UP=1 to avoid recompute in backward.
+# If you want max VRAM headroom, keep it 0.
+
+SAVE_GATE_UP = 1
+DOT_DTYPE = tl.float16
 
 # ============================================================================
 # FP8 Quantization Utilities
@@ -162,7 +171,7 @@ def _fused_gate_up_kernel(
             x_ptrs,
             mask=mask_m[:, None] & mask_k[None, :],
             other=0.0
-        )
+        ).to(DOT_DTYPE)
         
         # === Load W1 tile [BLOCK_K, BLOCK_N] ===
         w1_ptrs = W1_base + k_offs[:, None] * stride_w1k
@@ -181,18 +190,22 @@ def _fused_gate_up_kernel(
         )
         
         # === Load row-wise scales [BLOCK_K] ===
-        w1_scale = tl.load(W1_scale_ptr + k_offs, mask=mask_k, other=1.0)
-        w3_scale = tl.load(W3_scale_ptr + k_offs, mask=mask_k, other=1.0)
+        w1_scale = tl.load(W1_scale_ptr + k_offs, mask=mask_k, other=1.0).to(
+            DOT_DTYPE
+        )
+        w3_scale = tl.load(W3_scale_ptr + k_offs, mask=mask_k, other=1.0).to(
+            DOT_DTYPE
+        )
         
-        # === Dequantize FP8 -> FP32 (row-wise) ===
-        # w_dequant[k, n] = w_fp8[k, n] * scale[k]
-        w1_tile = w1_tile_fp8.to(tl.float32) * w1_scale[:, None]
-        w3_tile = w3_tile_fp8.to(tl.float32) * w3_scale[:, None]
+        # === Dequantize FP8 -> BF16/FP16 for Tensor Cores ===
+        # Accumulate in FP32, but DOT operands are FP16.
+        w1 = w1_tile_fp8.to(DOT_DTYPE) * w1_scale[:, None]
+        w3 = w3_tile_fp8.to(DOT_DTYPE) * w3_scale[:, None]
         
         # === Matrix multiply accumulate ===
         # Using tl.dot for tensor core utilization
-        gate_acc = tl.dot(x_tile.to(tl.float32), w1_tile, acc=gate_acc)
-        up_acc = tl.dot(x_tile.to(tl.float32), w3_tile, acc=up_acc)
+        gate_acc = tl.dot(x_tile, w1, acc=gate_acc)
+        up_acc = tl.dot(x_tile, w3, acc=up_acc)
     
     # === SiLU Gating (entirely in registers) ===
     # SiLU(x) = x * sigmoid(x)
@@ -278,7 +291,7 @@ def _down_proj_kernel(
             h_ptrs,
             mask=mask_m[:, None] & mask_k[None, :],
             other=0.0
-        )
+        ).to(DOT_DTYPE)
         
         # Load W2 tile [BLOCK_K, BLOCK_N]
         w2_ptrs = W2_base + k_offs[:, None] * stride_w2k
@@ -289,13 +302,15 @@ def _down_proj_kernel(
         )
         
         # Load scales
-        w2_scale = tl.load(W2_scale_ptr + k_offs, mask=mask_k, other=1.0)
+        w2_scale = tl.load(W2_scale_ptr + k_offs, mask=mask_k, other=1.0).to(
+            DOT_DTYPE
+        )
         
         # Dequantize
-        w2_tile = w2_tile_fp8.to(tl.float32) * w2_scale[:, None]
+        w2 = w2_tile_fp8.to(DOT_DTYPE) * w2_scale[:, None]
         
         # Accumulate
-        acc = tl.dot(h_tile.to(tl.float32), w2_tile, acc=acc)
+        acc = tl.dot(h_tile, w2, acc=acc)
     
     # Store output
     out_ptrs = Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
@@ -416,17 +431,22 @@ def _gate_up_backward_dx_kernel(
         )
         
         # Load scales and dequantize (broadcast over N)
-        w1_scale = tl.load(W1_scale_ptr + offs_k, mask=mask_k, other=1.0)
-        w3_scale = tl.load(W3_scale_ptr + offs_k, mask=mask_k, other=1.0)
+        w1_scale = tl.load(W1_scale_ptr + offs_k, mask=mask_k, other=1.0).to(
+            DOT_DTYPE
+        )
+        w3_scale = tl.load(W3_scale_ptr + offs_k, mask=mask_k, other=1.0).to(
+            DOT_DTYPE
+        )
         
         # Dequantize - note: scales are per K, weights are [N, K]
-        w1_tile = w1_tile_fp8.to(tl.float32) * w1_scale[None, :]
-        w3_tile = w3_tile_fp8.to(tl.float32) * w3_scale[None, :]
+        # NOTE: weights are loaded as [N, K], scales are per K => scale[None, :]
+        w1_tile = w1_tile_fp8.to(DOT_DTYPE) * w1_scale[None, :]
+        w3_tile = w3_tile_fp8.to(DOT_DTYPE) * w3_scale[None, :]
         
         # Accumulate: dX += dGate @ W1.T + dUp @ W3.T
         # dGate: [M, N], W1.T: [N, K] -> [M, K]
-        dx_acc = tl.dot(dgate, w1_tile, acc=dx_acc)
-        dx_acc = tl.dot(dup, w3_tile, acc=dx_acc)
+        dx_acc = tl.dot(dgate.to(DOT_DTYPE), w1_tile, acc=dx_acc)
+        dx_acc = tl.dot(dup.to(DOT_DTYPE), w3_tile, acc=dx_acc)
     
     # Store dX
     dx_ptrs = dX_ptr + offs_m[:, None] * stride_dxm + offs_k[None, :] * stride_dxk
@@ -513,8 +533,7 @@ def _gate_up_backward_dw_kernel(
         
         # Load X.T: need X[m, k] -> access as [k, m] conceptually
         x_ptrs = X_ptr + m_offs[:, None] * stride_xm + offs_k[None, :] * stride_xk
-        x_tile = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
-        x_tile = x_tile.to(tl.float32)
+        x_tile = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(DOT_DTYPE)
         
         # Load Gate, Up, dHidden
         gate_ptrs = Gate_ptr + m_offs[:, None] * stride_gm + offs_n[None, :] * stride_gn
@@ -536,10 +555,10 @@ def _gate_up_backward_dw_kernel(
         # Accumulate: dW = X.T @ dLocal
         # X.T: [K, M], dgate: [M, N] -> [K, N]
         # We have x_tile as [M, K], need transpose
-        x_t = tl.trans(x_tile)  # [BLOCK_K, BLOCK_M]
+        x_t = tl.trans(x_tile)  # [BLOCK_K, BLOCK_M] fp16
         
-        dw1_acc = tl.dot(x_t, dgate, acc=dw1_acc)
-        dw3_acc = tl.dot(x_t, dup, acc=dw3_acc)
+        dw1_acc = tl.dot(x_t, dgate.to(DOT_DTYPE), acc=dw1_acc)
+        dw3_acc = tl.dot(x_t, dup.to(DOT_DTYPE), acc=dw3_acc)
     
     # Store weight gradients
     dw1_ptrs = dW1_ptr + offs_k[:, None] * stride_dw1k + offs_n[None, :] * stride_dw1n
@@ -602,18 +621,20 @@ def _down_proj_backward_dhidden_kernel(
         
         # Load dOut [BLOCK_M, BLOCK_N]
         do_ptrs = dOut_ptr + offs_m[:, None] * stride_dom + n_offs[None, :] * stride_don
-        do_tile = tl.load(do_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
+        do_tile = tl.load(do_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0).to(DOT_DTYPE)
         
         # Load W2.T: W2[k, n] -> access [n, k]
         w2_ptrs = W2_ptr + n_offs[:, None] * stride_w2n + offs_k[None, :] * stride_w2k
         w2_tile_fp8 = tl.load(w2_ptrs, mask=mask_n[:, None] & mask_k[None, :], other=0.0)
         
         # Dequantize
-        w2_scale = tl.load(W2_scale_ptr + offs_k, mask=mask_k, other=1.0)
-        w2_tile = w2_tile_fp8.to(tl.float32) * w2_scale[None, :]
+        w2_scale = tl.load(W2_scale_ptr + offs_k, mask=mask_k, other=1.0).to(
+            DOT_DTYPE
+        )
+        w2_tile = w2_tile_fp8.to(DOT_DTYPE) * w2_scale[None, :]
         
         # Accumulate
-        acc = tl.dot(do_tile.to(tl.float32), w2_tile, acc=acc)
+        acc = tl.dot(do_tile, w2_tile, acc=acc)
     
     # Store
     dh_ptrs = dHidden_ptr + offs_m[:, None] * stride_dhm + offs_k[None, :] * stride_dhk
@@ -668,15 +689,15 @@ def _down_proj_backward_dw2_kernel(
         
         # Load Hidden [BLOCK_M, BLOCK_K]
         h_ptrs = Hidden_ptr + m_offs[:, None] * stride_hm + offs_k[None, :] * stride_hk
-        h_tile = tl.load(h_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0)
+        h_tile = tl.load(h_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(DOT_DTYPE)
         
         # Load dOut [BLOCK_M, BLOCK_N]
         do_ptrs = dOut_ptr + m_offs[:, None] * stride_dom + offs_n[None, :] * stride_don
         do_tile = tl.load(do_ptrs, mask=mask_m[:, None] & mask_n[None, :], other=0.0)
         
         # Accumulate: H.T @ dOut
-        h_t = tl.trans(h_tile.to(tl.float32))
-        acc = tl.dot(h_t, do_tile.to(tl.float32), acc=acc)
+        h_t = tl.trans(h_tile)  # fp16
+        acc = tl.dot(h_t, do_tile, acc=acc)
     
     # Store
     dw_ptrs = dW2_ptr + offs_k[:, None] * stride_dwk + offs_n[None, :] * stride_dwn
@@ -803,16 +824,17 @@ def _fp8_mm_rowwise_kernel(
 
         x_ptrs = X_base + offs_k[None, :] * stride_xk
         x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(
-            tl.bfloat16
+            DOT_DTYPE
         )
 
         w_ptrs = W_base + offs_k[:, None] * stride_wk
         w_fp8 = tl.load(w_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
 
-        s = tl.load(W_scale_ptr + offs_k, mask=mask_k, other=1.0).to(tl.float32)
+        s = tl.load(W_scale_ptr + offs_k, mask=mask_k, other=1.0).to(DOT_DTYPE)
 
-        w = w_fp8.to(tl.float32) * s[:, None]
-        acc += tl.dot(x.to(tl.float32), w)
+        # weights are [K, N], scales per K => s[:, None]
+        w = w_fp8.to(DOT_DTYPE) * s[:, None]
+        acc += tl.dot(x, w, acc=acc)
 
     out_ptrs = Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
     tl.store(out_ptrs, acc.to(tl.bfloat16), mask=mask_m[:, None] & mask_n[None, :])
@@ -873,6 +895,9 @@ class FusedSwiGLUMLPFunction(torch.autograd.Function):
         # === Fused Gate-Up (single X load) ===
         hidden = fused_gate_up_forward(x_2d, w1_fp8, w3_fp8, w1_scale, w3_scale)
         
+        gate = None
+        up = None
+        
         # === Down Projection ===
         out = down_proj_forward(hidden, w2_fp8, w2_scale)
         
@@ -880,11 +905,19 @@ class FusedSwiGLUMLPFunction(torch.autograd.Function):
         out = out.view(*orig_shape[:-1], -1)
         
         # For backward, we need to recompute gate/up or save them
-        # Saving is more memory but faster backward
-        # Here we choose to recompute in backward to save memory
+        
+        # Default: recompute in backward to save memory.
+        # Optional: save if FUSED_MLP_SAVE_GATE_UP=1
+        if SAVE_GATE_UP:
+            with torch.no_grad():
+                gate = fp8_mm_rowwise(x_2d, w1_fp8, w1_scale)
+                up = fp8_mm_rowwise(x_2d, w3_fp8, w3_scale)
+
         ctx.save_for_backward(
             x_2d,           # For dW1, dW3, dW2
             hidden,         # For dW2
+            gate if gate is not None else torch.empty(0, device=x_2d.device),
+            up if up is not None else torch.empty(0, device=x_2d.device),
             w1_fp8, w3_fp8, w2_fp8,
             w1_scale, w3_scale, w2_scale,
             w1, w3, w2,     # Master weights for gradient accumulation
@@ -901,6 +934,7 @@ class FusedSwiGLUMLPFunction(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         (
             x_2d, hidden,
+            gate_saved, up_saved,
             w1_fp8, w3_fp8, w2_fp8,
             w1_scale, w3_scale, w2_scale,
             w1, w3, w2,
@@ -930,11 +964,12 @@ class FusedSwiGLUMLPFunction(torch.autograd.Function):
         )
         
         # dW2 = Hidden.T @ dOut
-        dW2 = torch.zeros_like(w2)
+        dW2 = torch.empty(w2.shape, device=w2.device, dtype=torch.float32)
         grid_dw2 = lambda meta: (
             triton.cdiv(hidden_size, meta["BLOCK_K"]),
             triton.cdiv(N_out, meta["BLOCK_N"]),
         )
+        dW2 = dW2.to(dtype=w2.dtype)
         _down_proj_backward_dw2_kernel[grid_dw2](
             hidden, grad_output_2d,
             dW2,
@@ -945,16 +980,19 @@ class FusedSwiGLUMLPFunction(torch.autograd.Function):
         )
         
         # === Recompute Gate and Up for backward ===
-        # We need these for the SiLU gradient
-        # This is the memory/compute tradeoff - we recompute instead of saving
-        gate = torch.empty((M, hidden_size), device=x_2d.device, dtype=torch.bfloat16)
-        up = torch.empty((M, hidden_size), device=x_2d.device, dtype=torch.bfloat16)
-        
-        # Simple matmul for recomputation (could also use Triton)
-        # X @ W1 and X @ W3 with dequantization
-        with torch.no_grad():
-            gate = fp8_mm_rowwise(x_2d, w1_fp8, w1_scale)
-            up = fp8_mm_rowwise(x_2d, w3_fp8, w3_scale)
+        if gate_saved.numel() > 0 and up_saved.numel() > 0:
+            gate = gate_saved
+            up = up_saved
+        else:
+            gate = torch.empty(
+                (M, hidden_size), device=x_2d.device, dtype=torch.bfloat16
+            )
+            up = torch.empty(
+                (M, hidden_size), device=x_2d.device, dtype=torch.bfloat16
+            )
+            with torch.no_grad():
+                gate = fp8_mm_rowwise(x_2d, w1_fp8, w1_scale)
+                up = fp8_mm_rowwise(x_2d, w3_fp8, w3_scale)
         
         # === Backward through Gate-Up ===
         # dX = dGate @ W1.T + dUp @ W3.T
@@ -978,8 +1016,8 @@ class FusedSwiGLUMLPFunction(torch.autograd.Function):
         )
         
         # dW1, dW3
-        dW1 = torch.zeros_like(w1)
-        dW3 = torch.zeros_like(w3)
+        dW1 = torch.empty(w1.shape, device=w1.device, dtype=torch.float32)
+        dW3 = torch.empty(w3.shape, device=w3.device, dtype=torch.float32)
         
         grid_dw = lambda meta: (
             triton.cdiv(K, meta["BLOCK_K"]),
@@ -997,6 +1035,9 @@ class FusedSwiGLUMLPFunction(torch.autograd.Function):
             dW3.stride(0), dW3.stride(1),
         )
         
+        dW1 = dW1.to(dtype=w1.dtype)
+        dW3 = dW3.to(dtype=w3.dtype)
+
         # Reshape dX back to original shape
         dX = dX.view(*ctx.orig_shape)
         
@@ -1022,6 +1063,11 @@ class FusedSwiGLUMLP(torch.nn.Module):
         super().__init__()
         self.d_model = d_model
         self.hidden_size = hidden_size
+        
+         # If you want to refresh FP8 quantization only every N optimizer steps,
+        # set this > 1. Default: every optimizer step.
+        self.fp8_update_every = 1
+        self._opt_step_count = 0
         
         # Master weights in FP16 for optimizer
         master_dtype = torch.bfloat16
@@ -1061,12 +1107,15 @@ class FusedSwiGLUMLP(torch.nn.Module):
         self.w2_fp8, self.w2_scale = quantize_fp8_rowwise(self.w2.data)
         
         self._fp8_dirty = False
+        
+    @torch.no_grad()
+    def mark_step(self) -> None:
+        """Call this AFTER optimizer.step(). Marks FP8 weights dirty."""
+        self._opt_step_count += 1
+        if (self._opt_step_count % int(self.fp8_update_every)) == 0:
+            self._fp8_dirty = True
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Mark weights dirty after optimizer step
-        if self.training:
-            self._fp8_dirty = True
-        
         self._update_fp8_weights()
         
         # Ensure BF16

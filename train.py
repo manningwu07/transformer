@@ -1,10 +1,7 @@
 import argparse
 import os
 import random
-from sched import scheduler
 import signal
-import sys
-import threading
 import time
 import traceback
 
@@ -39,6 +36,25 @@ def safe_step(optimizer, scheduler):
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     scheduler.step()
+    
+@torch.no_grad()
+def _mark_fp8_dirty_after_step(model) -> None:
+    """
+    After optimizer.step(), mark FP8 buffers as dirty so they get re-quantized
+    once per optimizer update (NOT per micro-step).
+    Works for eager, compiled, and DDP-wrapped models.
+    """
+    # unwrap DDP
+    if isinstance(model, DDP):
+        model = model.module
+    # unwrap torch.compile
+    model = getattr(model, "_orig_mod", model)
+
+    # walk modules; call mark_step() if present (your fused MLP exposes it)
+    for m in model.modules():
+        mark = getattr(m, "mark_step", None)
+        if callable(mark):
+            mark()
 
 def main():
     
@@ -440,6 +456,7 @@ def main():
     
                 if torch.isfinite(total_norm):
                     safe_step(optimizer, scheduler)
+                    _mark_fp8_dirty_after_step(model)
                 else:
                     print(f"⚠️ Skip step {opt_step}: Gradient norm is {total_norm.item()}")
                     optimizer.zero_grad(set_to_none=True)

@@ -38,8 +38,8 @@ class ModelArgs:
     checkpoint_skip_every_n: int = 1 # 0 = no skipping, 1 = skip all, N = skip all but every Nth
     use_float8: bool = True
     
-    # Compilation options (mutually exclusive — pick one)
-    compile_mode: str = "model"  # "none" | "layers" | "model"
+    # Compilation options
+    compile_mode: str = "model"  # "none" | "model"
     
     # Experimental: compile autograd dispatcher (gradient accumulation, etc.)
     use_compiled_autograd: bool = False
@@ -72,7 +72,7 @@ if MODE == "pretrain_5080":
         grad_accum_steps=256,
         lr_start=1e-3,
         lr_end=1e-4,
-        warmup_steps=500,
+        warmup_steps=100,
     )
 
 elif MODE == "longctx_5090":
@@ -81,7 +81,7 @@ elif MODE == "longctx_5090":
         batch_size=1,
         seq_len=8192,
         grad_accum_steps=32,
-        lr_start=5e-5,
-        lr_end=1e-6,
-        warmup_steps=500,
+        lr_start=1e-4,
+        lr_end=1e-5,
+        warmup_steps=100,
     )
