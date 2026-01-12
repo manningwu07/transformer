@@ -8,7 +8,7 @@ import threading
 import time
 import traceback
 
-from fused_adafactor_2pass import FusedAdafactor2Pass
+from fused_adafactor import FusedAdafactor
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.expanduser("~/.inductor_cache")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
@@ -136,7 +136,7 @@ def main():
     model = LLM(Config).to(device)
 
     # === Optimizer / Scheduler ===
-    optimizer = FusedAdafactor2Pass(
+    optimizer = FusedAdafactor(
         model.parameters(),
         lr=float(TrainCfg.lr_start),
         eps=(1e-30, 1e-3),
