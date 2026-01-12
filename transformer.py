@@ -5,6 +5,7 @@ import torch.utils.checkpoint as ckpt
 import math
 from params import Config
 import inspect
+from fused_swiglu_mlp import FusedSwiGLUMLP
 
 class RMSNorm(nn.Module):
     """
@@ -197,23 +198,18 @@ class MLA(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, -1)
         return self.o_proj(out), None
 
-class SwiGLU_MLP(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.w1 = nn.Linear(args.d_model, args.hidden_size, bias=False)
-        self.w2 = nn.Linear(args.hidden_size, args.d_model, bias=False)
-        self.w3 = nn.Linear(args.d_model, args.hidden_size, bias=False)
-
-    def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
-
 class TransformerBlock(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.norm1 = RMSNorm(args.d_model, eps=args.rms_norm_eps)
         self.attn = MLA(args)
         self.norm2 = RMSNorm(args.d_model, eps=args.rms_norm_eps)
-        self.mlp = SwiGLU_MLP(args)
+
+        self.mlp = FusedSwiGLUMLP(
+            d_model=args.d_model,
+            hidden_size=args.hidden_size,
+            bias=False,
+        )
 
     def forward(self, x, kv_cache=None, use_cache=False, use_checkpoint=False):
         if use_checkpoint and self.training:

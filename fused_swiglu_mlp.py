@@ -753,6 +753,79 @@ def down_proj_forward(
     return out
 
 
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=3, num_warps=8),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=4, num_warps=4),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128}, num_stages=4, num_warps=4),
+    ],
+    key=["M", "K", "N"],
+)
+@triton.jit
+def _fp8_mm_rowwise_kernel(
+    X_ptr,              # [M, K] bf16
+    W_fp8_ptr,          # [K, N] fp8
+    W_scale_ptr,        # [K] fp32
+    Out_ptr,            # [M, N] bf16
+    M, K, N,
+    stride_xm, stride_xk,
+    stride_wk, stride_wn,
+    stride_om, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask_m = offs_m < M
+    mask_n = offs_n < N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    X_base = X_ptr + offs_m[:, None] * stride_xm
+    W_base = W_fp8_ptr + offs_n[None, :] * stride_wn
+
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        mask_k = offs_k < K
+
+        x_ptrs = X_base + offs_k[None, :] * stride_xk
+        x = tl.load(x_ptrs, mask=mask_m[:, None] & mask_k[None, :], other=0.0).to(
+            tl.bfloat16
+        )
+
+        w_ptrs = W_base + offs_k[:, None] * stride_wk
+        w_fp8 = tl.load(w_ptrs, mask=mask_k[:, None] & mask_n[None, :], other=0.0)
+
+        s = tl.load(W_scale_ptr + offs_k, mask=mask_k, other=1.0).to(tl.float32)
+
+        w = w_fp8.to(tl.float32) * s[:, None]
+        acc += tl.dot(x.to(tl.float32), w)
+
+    out_ptrs = Out_ptr + offs_m[:, None] * stride_om + offs_n[None, :] * stride_on
+    tl.store(out_ptrs, acc.to(tl.bfloat16), mask=mask_m[:, None] & mask_n[None, :])
+    
+def fp8_mm_rowwise(x: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
+    assert x.is_cuda and x.dtype == torch.bfloat16 and x.is_contiguous()
+    assert w_fp8.is_cuda and w_scale.is_cuda
+    K, N = w_fp8.shape
+    M = x.shape[0]
+    out = torch.empty((M, N), device=x.device, dtype=torch.bfloat16)
+
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]), triton.cdiv(N, meta["BLOCK_N"]))
+
+    _fp8_mm_rowwise_kernel[grid](
+        x, w_fp8, w_scale, out,
+        M, K, N,
+        x.stride(0), x.stride(1),
+        w_fp8.stride(0), w_fp8.stride(1),
+        out.stride(0), out.stride(1),
+    )
+    return out
+
 # ============================================================================
 # Autograd Function
 # ============================================================================
@@ -871,10 +944,8 @@ class FusedSwiGLUMLPFunction(torch.autograd.Function):
         # Simple matmul for recomputation (could also use Triton)
         # X @ W1 and X @ W3 with dequantization
         with torch.no_grad():
-            w1_dequant = w1_fp8.to(torch.float32) * w1_scale[:, None]
-            w3_dequant = w3_fp8.to(torch.float32) * w3_scale[:, None]
-            gate = (x_2d.float() @ w1_dequant).to(torch.bfloat16)
-            up = (x_2d.float() @ w3_dequant).to(torch.bfloat16)
+            gate = fp8_mm_rowwise(x_2d, w1_fp8, w1_scale)
+            up = fp8_mm_rowwise(x_2d, w3_fp8, w3_scale)
         
         # === Backward through Gate-Up ===
         # dX = dGate @ W1.T + dUp @ W3.T
@@ -943,10 +1014,18 @@ class FusedSwiGLUMLP(torch.nn.Module):
         self.d_model = d_model
         self.hidden_size = hidden_size
         
-        # Master weights in FP32 for optimizer
-        self.w1 = torch.nn.Parameter(torch.empty(d_model, hidden_size))
-        self.w3 = torch.nn.Parameter(torch.empty(d_model, hidden_size))
-        self.w2 = torch.nn.Parameter(torch.empty(hidden_size, d_model))
+        # Master weights in FP16 for optimizer
+        master_dtype = torch.bfloat16
+        
+        self.w1 = torch.nn.Parameter(
+            torch.empty(d_model, hidden_size, dtype=master_dtype)
+        )
+        self.w3 = torch.nn.Parameter(
+            torch.empty(d_model, hidden_size, dtype=master_dtype)
+        )
+        self.w2 = torch.nn.Parameter(
+            torch.empty(hidden_size, d_model, dtype=master_dtype)
+        )
         
         # Initialize
         torch.nn.init.normal_(self.w1, std=0.02)

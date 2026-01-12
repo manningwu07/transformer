@@ -387,6 +387,18 @@ def main():
 
     model.train()
     
+    m = model
+    if hasattr(m, "_orig_mod"):
+        m = m._orig_mod
+
+    print(type(m.layers[0].attn.q_down))
+    print(type(m.layers[0].mlp.w1))
+    
+    for name, p in m.named_parameters():
+        if "layers.0" in name and p.ndim == 2:
+            print(name, p.dtype)
+            break
+    
     # 1. Setup Profiler
     prof = torch.profiler.profile(
         activities=[
