@@ -10,7 +10,6 @@ import traceback
 from bench.fused_adafactor import FusedAdafactor
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.expanduser("~/.inductor_cache")
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
 
 import numpy as np
 import torch
@@ -386,6 +385,19 @@ def main():
     world_size = int(os.getenv("WORLD_SIZE", "1"))
 
     model.train()
+    
+    print("Before warmup allocated", torch.cuda.memory_allocated() / 1e9)
+    print("Before warmup reserved ", torch.cuda.memory_reserved() / 1e9)
+
+    x = torch.zeros((2, TrainCfg.seq_len), dtype=torch.long, device=device)
+    y = torch.zeros((2, TrainCfg.seq_len), dtype=torch.long, device=device)
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        _, loss, _ = model(x, targets=y)
+    (loss / TrainCfg.grad_accum_steps).backward()
+
+    torch.cuda.synchronize()
+    print("After warmup allocated", torch.cuda.memory_allocated() / 1e9)
+    print("After warmup reserved ", torch.cuda.memory_reserved() / 1e9)
     
     m = model
     if hasattr(m, "_orig_mod"):
