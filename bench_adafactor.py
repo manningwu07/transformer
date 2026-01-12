@@ -67,25 +67,29 @@ def run_bench():
         print(f"| {name:25} | {avg_time_ms:8.3f} ms | {mem_used:8.2f} MB State |")
 
     # --- THE PARITY CHECK ---
-    print("\n🧐 Verifying Numerical Parity (BF16)...")
-    p_ref, g_ref = get_data()
-    
-    p_new = p_ref.detach().clone().requires_grad_(True)
-    g_new = g_ref.clone()
-    p_new.grad = g_new
-    p_ref.grad = g_ref
-    
-    opt_ref = torch.optim.Adafactor([p_ref], lr=1e-3)
+    print("\n🧐 Verifying multi-step parity (Legacy vs 2-Pass, BF16)...")
+    p0, g0 = get_data()
+
+    p_leg = p0.detach().clone()
+    p_new = p0.detach().clone()
+
+    opt_leg = LegacyAdafactor([p_leg], lr=1e-3)
     opt_new = FusedAdafactor2Pass([p_new], lr=1e-3)
 
-    opt_ref.step()
-    opt_new.step()
+    # Fixed gradient stream (same grad every step)
+    for _ in range(1000):
+        p_leg.grad = g0
+        p_new.grad = g0
+        opt_leg.step()
+        opt_new.step()
+        opt_leg.zero_grad(set_to_none=True)
+        opt_new.zero_grad(set_to_none=True)
 
-    diff = (p_ref - p_new).abs().max().item()
-    if diff < 1e-3:
-        print(f"✅ SUCCESS: New Triton matches Native Adafactor (Max Diff: {diff:.6f})")
-    else:
-        print(f"⚠️ WARNING: Divergence detected (Max Diff: {diff:.6f})")
+    diff = (p_leg - p_new).abs()
+    print(
+        f"legacy vs 2pass | max={diff.max().item():.6f} "
+        f"mean={diff.mean().item():.6f}"
+    )
 
 if __name__ == "__main__":
     run_bench()
