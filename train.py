@@ -6,6 +6,7 @@ import time
 import traceback
 
 from fused_adafactor import FusedAdafactor
+from transformer import _ce_calls
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.expanduser("~/.inductor_cache")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
@@ -466,6 +467,8 @@ def main():
 
                 # 3. Log (Only on Boundary)
                 if opt_step % args.log_every_opt == 0 and is_main_process():
+                    print("CE calls:", dict(_ce_calls))
+                    assert _ce_calls["torch"] == 0, "Fell back to torch CE unexpectedly"
                     # Sync ONCE for logging (this will pull all needed scalars)
                     raw_loss = float(loss.detach().float().item())
                     norm_val = float(total_norm_t.float().item())

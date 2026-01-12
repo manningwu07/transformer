@@ -7,6 +7,10 @@ from params import Config
 import inspect
 from fused_swiglu_mlp import FusedSwiGLUMLP
 
+USE_FUSED_CE = False
+_fused_ce = None
+_ce_calls = {"liger": 0, "torch": 0}
+
 class RMSNorm(nn.Module):
     """
     Custom RMSNorm to avoid PyTorch's fused RMSNorm kernels that can produce
@@ -338,9 +342,11 @@ class LLM(nn.Module):
 
         if targets is not None:
             if USE_FUSED_CE:
+                _ce_calls["liger"] += 1
                 # Fused CE: doesn't materialize [B*T, V] intermediate
                 loss = _fused_ce(logits.view(-1, self.config.vocab_size), targets.view(-1))
             else:
+                _ce_calls["torch"] += 1
                 loss = F.cross_entropy(
                     logits.view(-1, self.config.vocab_size),
                     targets.view(-1),
