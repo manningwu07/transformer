@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
+from typing import Optional, Tuple
 import math
 from params import Config
 import inspect
@@ -42,6 +43,27 @@ def apply_rope(x, cos, sin):
     y2 = x1 * sin + x2 * cos
     return torch.cat([y1, y2], dim=-1)
 
+def _init_linear_from_two_linears(
+    fused: nn.Linear,
+    a: nn.Linear,
+    b: nn.Linear,
+) -> None:
+    """
+    Initialize `fused` to be equivalent to concatenating outputs of `a` and `b`:
+      fused(x) == cat([a(x), b(x)], dim=-1)
+    Assumes bias=False (as in your code).
+    """
+    assert isinstance(fused, nn.Linear)
+    assert isinstance(a, nn.Linear) and isinstance(b, nn.Linear)
+    assert fused.bias is None and a.bias is None and b.bias is None
+    assert fused.in_features == a.in_features == b.in_features
+    assert fused.out_features == a.out_features + b.out_features
+
+    with torch.no_grad():
+        fused.weight[: a.out_features].copy_(a.weight)
+        fused.weight[a.out_features :].copy_(b.weight)
+
+
 class SwiGLU_MLP(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -73,7 +95,11 @@ class MLA(nn.Module):
         self.q_down = nn.Linear(args.d_model, args.q_lora_rank, bias=False)
         self.q_up = nn.Linear(args.q_lora_rank, args.n_heads * self.content_dim, bias=False)
         # RoPE Part (Not Compressed)
-        self.q_rope = nn.Linear(args.d_model, args.n_heads * self.rope_dim, bias=False)
+        self.qk_rope = nn.Linear(
+            args.d_model,
+            2 * args.n_heads * self.rope_dim,
+            bias=False,
+        )
 
         # 2. KV Projections
         # Latent Content (The compressed part you cache)
@@ -82,9 +108,6 @@ class MLA(nn.Module):
         # Up-Projections (Reconstruct K and V from latent)
         self.k_up = nn.Linear(args.d_latent, args.n_heads * self.content_dim, bias=False)
         self.v_up = nn.Linear(args.d_latent, args.n_heads * args.head_dim, bias=False) # V is full head dim
-        
-        # RoPE Part for K (Not Compressed)
-        self.k_rope = nn.Linear(args.d_model, args.n_heads * self.rope_dim, bias=False)
 
         # 3. Output
         self.o_proj = nn.Linear(args.n_heads * args.head_dim, args.d_model, bias=False)
@@ -95,6 +118,36 @@ class MLA(nn.Module):
             theta=args.rope_theta,
         )
         self.scale = 1.0 / math.sqrt(self.head_dim)
+        
+        self._old_rope_keys = (
+            "q_rope.weight",
+            "k_rope.weight",
+        )
+
+    def _load_from_state_dict(
+        self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+    ):
+        # If old q_rope/k_rope exist, fuse them into qk_rope on the fly.
+        qk_key = prefix + "qk_rope.weight"
+        q_key = prefix + "q_rope.weight"
+        k_key = prefix + "k_rope.weight"
+        if qk_key not in state_dict and q_key in state_dict and k_key in state_dict:
+            Wq = state_dict[q_key]
+            Wk = state_dict[k_key]
+            state_dict[qk_key] = torch.cat([Wq, Wk], dim=0)
+            # Prevent strict-load failure due to unexpected old keys
+            state_dict.pop(q_key, None)
+            state_dict.pop(k_key, None)
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def forward(self, x, kv_cache=None, use_cache=False):
         B, T, C = x.shape
@@ -103,11 +156,11 @@ class MLA(nn.Module):
         
         # --- Q Processing ---
         q_content = self.q_up(self.q_down(x))       # [B, T, H * content_dim]
-        q_pos = self.q_rope(x)                      # [B, T, H * rope_dim]
+        qk_pos = self.qk_rope(x)                    # [B, T, 2 * H * rope_dim]
+        q_pos, k_pos_new = qk_pos.chunk(2, dim=-1)
         
          # --- KV Processing ---
         kv_latent_new = self.kv_down(x)  # [B, T, d_latent]
-        k_pos_new = self.k_rope(x)       # [B, T, H * rope_dim] (pre-RoPE)
 
         if kv_cache is not None:
             kv_latent = torch.cat([kv_cache["latent"], kv_latent_new], dim=1)
