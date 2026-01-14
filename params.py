@@ -38,6 +38,12 @@ class ModelArgs:
     checkpoint_skip_every_n: int = 1 # 0 = no skipping, 1 = skip all, N = skip all but every Nth
     use_float8: bool = True
     
+    
+	# CE memory saver (exact softmax, vocab-chunked)
+    use_chunked_ce: bool = True
+    # 2048-8192 are typical. Larger = faster, smaller = less VRAM.
+    vocab_chunk_size: int = 2048
+    
     # Compilation options
     compile_mode: str = "model"  # "none" | "model"
     

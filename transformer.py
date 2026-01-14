@@ -1,7 +1,9 @@
+from multiprocessing import reduction
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as ckpt
+from torch import Tensor
 from typing import Optional, Tuple
 import math
 from params import Config
@@ -30,11 +32,19 @@ class RotaryEmbedding(nn.Module):
         freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         t = torch.arange(max_seq_len)
         freqs = torch.outer(t, freqs).float()
-        self.register_buffer("cos_cached", freqs.cos())
-        self.register_buffer("sin_cached", freqs.sin())
+        self.register_buffer(
+            "cos_cached",
+            freqs.cos().to(torch.bfloat16),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin_cached",
+            freqs.sin().to(torch.bfloat16),
+            persistent=False,
+        )
 
     def forward(self, x, seq_len):
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len] if self.cos_cached[:seq_len].dtype == x.dtype else self.cos_cached[:seq_len].to(dtype = x.dtype), self.sin_cached[:seq_len].to(dtype = x.dtype)
 
 def apply_rope(x, cos, sin):
     d = x.shape[-1] // 2
@@ -43,26 +53,60 @@ def apply_rope(x, cos, sin):
     y2 = x1 * sin + x2 * cos
     return torch.cat([y1, y2], dim=-1)
 
-def _init_linear_from_two_linears(
-    fused: nn.Linear,
-    a: nn.Linear,
-    b: nn.Linear,
-) -> None:
-    """
-    Initialize `fused` to be equivalent to concatenating outputs of `a` and `b`:
-      fused(x) == cat([a(x), b(x)], dim=-1)
-    Assumes bias=False (as in your code).
-    """
-    assert isinstance(fused, nn.Linear)
-    assert isinstance(a, nn.Linear) and isinstance(b, nn.Linear)
-    assert fused.bias is None and a.bias is None and b.bias is None
-    assert fused.in_features == a.in_features == b.in_features
-    assert fused.out_features == a.out_features + b.out_features
+def chunked_linear_cross_entropy(
+        x: Tensor,              # [B, T, D] bf16
+        weight_tied: Tensor,    # [V, D] bf16 (embedding weight)
+        targets: Tensor,        # [B, T] long
+        vocab_chunk_size: int = 4096,
+        reduction: str = "mean",
+    ) -> Tensor:
+        """
+        Compute CE without materializing full logits [B,T,V].
+        Vocab-chunked exact softmax CE:
+        loss_i = logsumexp_j (x_i · W_j) - (x_i · W_{y_i})
+        Memory: O(B*T*vocab_chunk_size)
+        """
+        assert x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+        assert weight_tied.dim() == 2
+        assert targets.dtype == torch.long
 
-    with torch.no_grad():
-        fused.weight[: a.out_features].copy_(a.weight)
-        fused.weight[a.out_features :].copy_(b.weight)
+        B, T, D = x.shape
+        V, Dw = weight_tied.shape
+        assert D == Dw
 
+        xt = x.reshape(B * T, D)
+        yt = targets.reshape(B * T)
+
+        # logsumexp accumulator in fp32 for stability
+        lse = torch.full((B * T,), float("-inf"), device=x.device, dtype=torch.float32)
+        true_logit = torch.zeros((B * T,), device=x.device, dtype=torch.float32)
+
+        # Process vocab in chunks to cap activation size
+        for v0 in range(0, V, vocab_chunk_size):
+            v1 = min(V, v0 + vocab_chunk_size)
+            W = weight_tied[v0:v1]  # [Vc, D]
+
+            # logits_chunk: [N, Vc]
+            # matmul in autocast dtype, accumulate into fp32 via logsumexp
+            logits = xt @ W.t()
+            logits_f32 = logits.float()
+
+            # Update logsumexp: lse = logaddexp(lse, logsumexp(chunk))
+            lse = torch.logaddexp(lse, torch.logsumexp(logits_f32, dim=-1))
+
+            # Pull true-class logit if target is in this chunk
+            in_chunk = (yt >= v0) & (yt < v1)
+            if in_chunk.any():
+                idx = torch.nonzero(in_chunk, as_tuple=False).squeeze(-1)
+                cols = (yt[idx] - v0).to(torch.long)
+                true_logit[idx] = logits_f32[idx, cols]
+
+        loss = lse - true_logit
+        if reduction == "mean":
+            return loss.mean()
+        if reduction == "sum":
+            return loss.sum()
+        return loss.view(B, T)
 
 class SwiGLU_MLP(nn.Module):
     def __init__(self, args):
@@ -305,12 +349,48 @@ class TransformerBlock(nn.Module):
 
 
 # Fused cross-entropy (avoids materializing huge logit tensor)
-try:
-    from liger_kernel.ops.cross_entropy import LigerCrossEntropyLoss
-    _fused_ce = LigerCrossEntropyLoss()
-    USE_FUSED_CE = True
-except ImportError:
-    USE_FUSED_CE = False
+# Liger CE / Fused LinearCE (API varies across versions)
+USE_LIGER_CE = False
+USE_LIGER_FLCE = False
+_liger_ce = None
+_liger_flce = None
+
+def _try_init_liger():
+    global USE_LIGER_CE, USE_LIGER_FLCE, _liger_ce, _liger_flce
+
+    # 1) Fused Linear Cross Entropy (best: avoids materializing [B,T,V] logits)
+    try:
+        from liger_kernel.ops.fused_linear_cross_entropy import (
+            LigerFusedLinearCrossEntropyLoss,
+        )
+
+        _liger_flce = LigerFusedLinearCrossEntropyLoss()
+        USE_LIGER_FLCE = True
+    except Exception:
+        USE_LIGER_FLCE = False
+
+    # 2) Plain CE (still needs logits unless you integrate differently)
+    # Newer docs/issues show this path:
+    try:
+        from liger_kernel.transformers.cross_entropy import LigerCrossEntropyLoss
+
+        _liger_ce = LigerCrossEntropyLoss()
+        USE_LIGER_CE = True
+        return
+    except Exception:
+        pass
+
+    # Older/alternate path
+    try:
+        from liger_kernel.ops.cross_entropy import LigerCrossEntropyLoss
+
+        _liger_ce = LigerCrossEntropyLoss()
+        USE_LIGER_CE = True
+        return
+    except Exception:
+        USE_LIGER_CE = False
+
+_try_init_liger()
 
 class LLM(nn.Module):
     def __init__(self, config=None, **kwargs):
@@ -353,16 +433,6 @@ class LLM(nn.Module):
         if mode == "none":
             return
         
-        if mode == "layers":
-            print("⚡ Compiling TransformerBlock.forward_no_cache (per-layer)...")
-            for layer in self.layers:
-                layer.forward_no_cache = torch.compile(
-                    layer.forward_no_cache,
-                    mode="default",
-                    fullgraph=False,
-                )
-                layer.forward_train = layer.forward_no_cache
-        
         elif mode == "model":
             # NOTE: We don't compile here — we return self and let train.py wrap it
             # This is because compile should happen AFTER .to(device) and before DDP
@@ -400,10 +470,46 @@ class LLM(nn.Module):
         logits = self.output(x)
 
         if targets is not None:
-            if USE_FUSED_CE:
-                _ce_calls["liger"] += 1
-                # Fused CE: doesn't materialize [B*T, V] intermediate
-                loss = _fused_ce(logits.view(-1, self.config.vocab_size), targets.view(-1))
+            # Prefer: Liger Fused Linear Cross Entropy (avoids [B,T,V] logits)
+            if USE_LIGER_FLCE:
+                _ce_calls["liger_flce"] = _ce_calls.get("liger_flce", 0) + 1
+                # Liger FLCE expects:
+                #  - weight: [V, D] (tied embedding weight)
+                #  - hidden: [B*T, D] or [B, T, D] depending on version
+                #  - targets: [B*T] or [B, T]
+                # We'll pass flattened to be safe.
+                B, T, D = x.shape
+                loss = _liger_flce(
+                    self.tok_embeddings.weight,
+                    x.reshape(B * T, D),
+                    targets.reshape(B * T),
+                )
+                return None, loss, None
+
+            # Prefer chunked exact CE to avoid materializing [B,T,V] logits.
+            # This is the biggest VRAM lever for BS>1 at long seq.
+            use_chunked = bool(getattr(self.config, "use_chunked_ce", True))
+            chunk = int(getattr(self.config, "vocab_chunk_size", 4096))
+            if use_chunked:
+                _ce_calls["chunked"] = _ce_calls.get("chunked", 0) + 1
+                loss = chunked_linear_cross_entropy(
+                    x=x,
+                    weight_tied=self.tok_embeddings.weight,
+                    targets=targets,
+                    vocab_chunk_size=chunk,
+                    reduction="mean",
+                )
+                # For training, you usually don't need to return full logits.
+                return None, loss, None
+
+            # Fallback: materialize logits (higher VRAM)
+            logits = self.output(x)
+            if USE_LIGER_CE:
+                _ce_calls["liger_ce"] = _ce_calls.get("liger_ce", 0) + 1
+                loss = _liger_ce(
+                    logits.view(-1, self.config.vocab_size),
+                    targets.view(-1),
+                )
             else:
                 _ce_calls["torch"] += 1
                 loss = F.cross_entropy(
@@ -411,8 +517,9 @@ class LLM(nn.Module):
                     targets.view(-1),
                 )
             return logits, loss, None
-        
-        return logits, None, None
+
+        # Inference path needs logits
+        logits = self.output(x)
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=100, temperature=0.7, top_k=50, use_cache=True):

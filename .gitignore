@@ -25,3 +25,7 @@
 
 # hardware
 hardware_config.txt
+
+# Prompt testing IO
+/prompts/
+/eval_results/
