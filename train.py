@@ -5,7 +5,8 @@ import signal
 import time
 import traceback
 
-from bench.fused_adafactor import FusedAdafactor
+
+from fused_adafactor_2pass import FusedAdafactor2Pass
 from transformer import _ce_calls
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.expanduser("~/.inductor_cache")
@@ -153,7 +154,7 @@ def main():
     model = LLM(Config).to(device)
 
     # === Optimizer / Scheduler ===
-    optimizer = FusedAdafactor(
+    optimizer = FusedAdafactor2Pass(
         model.parameters(),
         lr=float(TrainCfg.lr_start),
         eps=(1e-30, 1e-3),
