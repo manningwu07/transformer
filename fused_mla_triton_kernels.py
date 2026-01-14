@@ -735,7 +735,7 @@ def test_fused_rmsnorm_down():
     x_f32 = x.float()
     rms = torch.sqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + eps)
     x_normed = (x_f32 / rms) * w_norm.float()
-    expected = (x_normed @ w_down.float()).bfloat16()
+    expected = (x_normed.to(torch.bfloat16) @ w_down).to(torch.bfloat16)
 
     # Triton kernel
     actual = fused_rmsnorm_down_proj(x, w_norm, w_down, eps)

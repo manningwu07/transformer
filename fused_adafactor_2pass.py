@@ -6,11 +6,50 @@ import torch
 import triton
 import triton.language as tl
 from torch.optim import Optimizer
-
+from torch.optim.optimizer import StateDict
 
 def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
+
+_TEMP_STATE_KEYS = {
+        "row_sum_buf",
+        "col_sum_buf",
+        "g2_sum_buf",
+        "scale_buf",
+        "r_mean_inv_buf",
+    }
+
+def state_dict(self) -> StateDict:  # type: ignore[override]
+    sd = super().state_dict()
+    # sd["state"] is a mapping: param_id -> state_dict
+    # Strip temp buffers so optimizer state is portable and smaller.
+    state: Dict[str, Dict[str, Any]] = sd.get("state", {})
+    for _, st in state.items():
+        for k in list(st.keys()):
+            if k in self._TEMP_STATE_KEYS:
+                st.pop(k, None)
+    return sd
+
+def load_state_dict(self, state_dict: StateDict) -> None:  # type: ignore[override]
+    """
+    Accepts checkpoints that:
+        - don't have our temp keys (expected)
+        - do have temp keys (older versions) -> we drop them
+    """
+    # Defensive copy: don't mutate caller's dict
+    sd = {
+        "state": dict(state_dict.get("state", {})),
+        "param_groups": state_dict.get("param_groups", []),
+    }
+    for pid, st in sd["state"].items():
+        st = dict(st)
+        for k in list(st.keys()):
+            if k in self._TEMP_STATE_KEYS:
+                st.pop(k, None)
+        sd["state"][pid] = st
+
+    super().load_state_dict(sd)  # type: ignore[arg-type]
 
 # -----------------------------------------------------------------------------
 # Pass 1: accumulate sum(g^2) by row and by col + total sum(g^2)
@@ -240,22 +279,26 @@ class FusedAdafactor2Pass(Optimizer):
                     )
 
                     # Temp buffers for this param (reuse each step)
+                if ("row_sum_buf" not in state) or state["row_sum_buf"].numel() != M:
                     state["row_sum_buf"] = torch.zeros(
                         (M,), device=p.device, dtype=torch.float32
                     )
+                if ("col_sum_buf" not in state) or state["col_sum_buf"].numel() != N:
                     state["col_sum_buf"] = torch.zeros(
                         (N,), device=p.device, dtype=torch.float32
                     )
+                if "g2_sum_buf" not in state:
                     state["g2_sum_buf"] = torch.zeros(
                         (), device=p.device, dtype=torch.float32
                     )
+                if "scale_buf" not in state:
                     state["scale_buf"] = torch.ones(
                         (), device=p.device, dtype=torch.float32
                     )
+                if "r_mean_inv_buf" not in state:
                     state["r_mean_inv_buf"] = torch.ones(
                         (), device=p.device, dtype=torch.float32
                     )
-
                 r = state["exp_avg_sq_row"]
                 c = state["exp_avg_sq_col"]
                 row_sum = state["row_sum_buf"]

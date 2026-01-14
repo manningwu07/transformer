@@ -8,7 +8,7 @@ TOKENIZER_PATH = os.path.join(DATA_DIR, "json", "tokenizer.json")
 VOCAB_PATH = os.path.join(DATA_DIR, "json", "vocab.json")
 SHARD_DIR = os.path.join(DATA_DIR, "shards")
 
-MODE = "pretrain_5080"  # or "longctx_5090"
+MODE = "longctx_5090"  # or "longctx_5090"
 
 
 @dataclass

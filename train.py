@@ -5,7 +5,7 @@ import signal
 import time
 import traceback
 
-from fused_adafactor import FusedAdafactor
+from bench.fused_adafactor import FusedAdafactor
 from transformer import _ce_calls
 
 os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.expanduser("~/.inductor_cache")

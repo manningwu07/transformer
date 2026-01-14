@@ -1,0 +1,7 @@
+hello
+---
+If a car travels 90 miles in 1.5 hours, what is its average speed in mph? Answer with just the number.
+---
+Write a Python function is_palindrome(s) ignoring case and non-alphanumeric. Include a few tests.
+---
+Return JSON only: {"title":..., "steps":[...], "risks":[...]} for "setup a python venv"
