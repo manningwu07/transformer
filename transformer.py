@@ -44,8 +44,14 @@ class RotaryEmbedding(nn.Module):
         )
 
     def forward(self, x, seq_len):
-        return self.cos_cached[:seq_len], self.sin_cached[:seq_len] if self.cos_cached[:seq_len].dtype == x.dtype else self.cos_cached[:seq_len].to(dtype = x.dtype), self.sin_cached[:seq_len].to(dtype = x.dtype)
 
+        cos = self.cos_cached[:seq_len]
+        sin = self.sin_cached[:seq_len]
+        if cos.dtype != x.dtype:
+            cos = cos.to(dtype=x.dtype)
+            sin = sin.to(dtype=x.dtype)
+        return cos, sin
+    
 def apply_rope(x, cos, sin):
     d = x.shape[-1] // 2
     x1, x2 = x[..., :d], x[..., d:]

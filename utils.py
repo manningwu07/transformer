@@ -140,6 +140,17 @@ class CheckpointManager:
             return {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
         return sd
 
+    def _strip_nonstrict_buffers(self, sd: dict):
+        # Older checkpoints may contain RoPE cached buffers which we now mark
+        # persistent=False. They are safe to drop.
+        drop_suffixes = ("attn.rope.cos_cached", "attn.rope.sin_cached")
+        out = {}
+        for k, v in sd.items():
+            if k.endswith(drop_suffixes):
+                continue
+            out[k] = v
+        return out
+
     def save(
         self,
         tag,
@@ -192,6 +203,7 @@ class CheckpointManager:
         )
         m = self._unwrap_model(model)
         sd = self._strip_orig_mod_prefix(ckpt["model"])
+        sd = self._strip_nonstrict_buffers(sd)
         m.load_state_dict(sd, strict=True)
         if opt and ckpt["optimizer"]: opt.load_state_dict(ckpt["optimizer"])
         if sched and ckpt["scheduler"]: sched.load_state_dict(ckpt["scheduler"])
