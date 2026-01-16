@@ -13,6 +13,7 @@ from tokenizers import Tokenizer
 
 from params import Config
 from transformer import LLM
+from utils import load_model_state_from_checkpoint
 
 _INTERRUPT_GENERATION = False
 
@@ -82,16 +83,8 @@ def load_model(ckpt_path: str, device: torch.device) -> LLM:
 
     model = LLM(Config).to(device)
 
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = ckpt.get("model", ckpt)
-
-    fixed = {}
-    for k, v in state_dict.items():
-        if k.startswith("_orig_mod."):
-            k = k.replace("_orig_mod.", "", 1)
-        fixed[k] = v
-
-    model.load_state_dict(fixed, strict=True)
+    sd = load_model_state_from_checkpoint(ckpt_path, key="model")
+    model.load_state_dict(sd, strict=False)
     model.eval()
     return model
 

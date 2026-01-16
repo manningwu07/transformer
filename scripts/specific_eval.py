@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from dataset import PackedBinDataset
 from params import Config, TrainCfg
 from transformer import LLM
-from utils import validate
+from utils import load_model_state_from_checkpoint, validate
 
 
 def load_model_from_ckpt(ckpt_path: str, device: torch.device) -> torch.nn.Module:
@@ -19,16 +19,8 @@ def load_model_from_ckpt(ckpt_path: str, device: torch.device) -> torch.nn.Modul
     Config.use_float8 = False
 
     model = LLM(Config).to(device)
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-
-    # Your CheckpointManager saves payload["model"].
-    sd = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
-
-    # Normalize compiled key prefix if present.
-    if any(k.startswith("_orig_mod.") for k in sd.keys()):
-        sd = {k.replace("_orig_mod.", "", 1): v for k, v in sd.items()}
-
-    model.load_state_dict(sd, strict=True)
+    sd = load_model_state_from_checkpoint(ckpt_path, key="model")
+    model.load_state_dict(sd, strict=False)
     model.eval()
     return model
 

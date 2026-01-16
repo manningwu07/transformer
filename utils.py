@@ -8,8 +8,64 @@ from typing import Any
 import torch.distributed as dist
 from typing import Dict, Tuple
 from torch.nn.parallel import DistributedDataParallel as DDP
+from typing import Dict, Any, Optional
 
 from params import TrainCfg
+
+def sanitize_state_dict_for_load(
+    sd: Dict[str, Any],
+    *,
+    strip_orig_mod: bool = True,
+    strip_rope_cache: bool = True,
+) -> Dict[str, Any]:
+    """
+    Make checkpoints portable across:
+      - torch.compile (keys prefixed with "_orig_mod.")
+      - RoPE cached buffers that may be present in older checkpoints but are
+        now non-persistent / recomputed (cos_cached, sin_cached).
+
+    Use this in CLI / eval scripts before model.load_state_dict(...).
+    """
+    if sd is None:
+        return sd
+
+    out: Dict[str, Any] = {}
+    for k, v in sd.items():
+        if strip_orig_mod and k.startswith("_orig_mod."):
+            k = k.replace("_orig_mod.", "", 1)
+
+        if strip_rope_cache:
+            # Drop any RoPE cached buffers anywhere in the module tree.
+            # Matches e.g. "layers.0.attn.rope.cos_cached"
+            if k.endswith("rope.cos_cached") or k.endswith("rope.sin_cached"):
+                continue
+            if k.endswith("cos_cached") or k.endswith("sin_cached"):
+                # Safety: if you ever have other caches named similarly.
+                # Comment these two lines out if you have non-RoPE buffers
+                # with these names.
+                continue
+
+        out[k] = v
+    return out
+
+
+def load_model_state_from_checkpoint(
+    ckpt_path: str,
+    *,
+    key: str = "model",
+) -> Dict[str, Any]:
+    """
+    Load checkpoint and return a sanitized model state_dict.
+    Works with:
+      - raw state_dict checkpoints
+      - CheckpointManager payloads {"model": ..., "optimizer": ..., ...}
+    """
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    sd = ckpt.get(key, ckpt) if isinstance(ckpt, dict) else ckpt
+    if not isinstance(sd, dict):
+        raise RuntimeError(f"Expected state_dict dict, got: {type(sd)}")
+    return sanitize_state_dict_for_load(sd)
+
 
 def is_distributed():
     return int(os.getenv("WORLD_SIZE", "1")) > 1
