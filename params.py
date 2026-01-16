@@ -42,7 +42,7 @@ class ModelArgs:
 	# CE memory saver (exact softmax, vocab-chunked)
     use_chunked_ce: bool = True
     # 2048-8192 are typical. Larger = faster, smaller = less VRAM.
-    vocab_chunk_size: int = 2048
+    vocab_chunk_size: int = 16384
     
     # Compilation options
     compile_mode: str = "model"  # "none" | "model"
@@ -55,7 +55,7 @@ class ModelArgs:
     # Float8 (torchao)
     # Converts Linear layers inside Transformer blocks to Float8Linear for training
     # Keep embeddings + lm_head in BF16 (weight-tying + stability).
-    use_float8: bool = True
+    use_float8: bool = False
     # Common recipe names in torchao docs: "rowwise" or "tensorwise"
     float8_recipe: Literal["rowwise", "tensorwise"] = "tensorwise"
 
@@ -84,10 +84,10 @@ if MODE == "pretrain_5080":
 elif MODE == "longctx_5090":
     Config = ModelArgs()
     TrainCfg = TrainingArgs(
-        batch_size=1,
+        batch_size=6,
         seq_len=8192,
         grad_accum_steps=32,
-        lr_start=1e-4,
-        lr_end=1e-5,
+        lr_start=1.5e-4,
+        lr_end=1.5e-5,
         warmup_steps=100,
     )
